@@ -13,6 +13,8 @@ Uses the private AIDP data plane APIs:
   PATCH /workspaces/{ws}/clusters/{key}/libraries    — install libraries
 """
 
+from __future__ import annotations
+
 from typing import Optional
 import asyncio
 import os

@@ -16,6 +16,8 @@ Usage:
     python3 scripts/fuse_package_analyzer.py --packages pandas --output /tmp/pandas_risk.json
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import os
