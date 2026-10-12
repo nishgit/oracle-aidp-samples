@@ -60,12 +60,14 @@ Two pieces:
    reading source data through variables is the normal migration case, and
    object-storage / catalog reads are never path-checked; ``<object>.open(p)``
    on a receiver that is neither the builtin nor a ``Path`` is recorded the
-   same way, while ``open(path_var)`` itself stays refused in every mode), a
-   ``spark.sql`` statement whose literal head is a read keyword
-   (``unverified_sql_read``; Spark runs one statement per call, so it cannot
-   become a write) and ``DataFrame.pipe(name)`` with a bare name the gate
-   cannot type on a non-Spark receiver (``unverified_pipe_callable``;
-   ``RDD.pipe(cmd)`` and a string-typed argument are refused).
+   same way when the receiver is a name the notebook bound, while
+   ``open(path_var)`` itself stays refused in every mode and so does
+   ``thing.open(p)`` on a receiver the run never bound), a ``spark.sql``
+   statement whose literal head is a read keyword (``unverified_sql_read``;
+   Spark runs one statement per call, so it cannot become a write) and
+   ``DataFrame.pipe(name)`` with a bare name the gate cannot type on a bound,
+   non-Spark receiver (``unverified_pipe_callable``; ``RDD.pipe(cmd)``, a
+   string-typed argument and a receiver the run never bound are refused).
 
    Routes are closed as classes, not spellings: a gated module or Spark
    object handed around as a value (``[os][0]``, ``run(os)``, ``return os``,
@@ -77,7 +79,17 @@ Two pieces:
    deserialisers (the pickle family except the dump side, ``torch.load`` at
    any depth, ``numpy`` ``allow_pickle``, every unsafe yaml loader /
    constructor / hook / subclass), ``globals()[k]`` with a tainted key or a
-   dereferenced result, and ``open(*a, **kw)``.
+   dereferenced result, and ``open(*a, **kw)``. A list literal is folded into
+   a path only while its name is used for nothing but ``sep.join(name)`` (an
+   in-place mutation, alias or helper call makes the join dynamic); loaders
+   gated on a keyword fail closed when the switch is positional or hidden in
+   ``*args`` / ``**kwargs`` (``np.load(p, None, True)``, ``torch.load(p,
+   pickle_module=..)``); the state of a gated module is read-only
+   (``yaml.SafeLoader.yaml_constructors[..] = h``, ``.update(..)``,
+   ``setattr``; ``sys.path`` and ``torch`` flags excepted); a process sink
+   name or a ``_private`` attribute on an imported module the gate has no
+   rules for is refused (``mymod.system``, ``mymod._run``); ``site`` / ``pip``
+   load code from paths and are refused like ``addPyFile``.
 
 The gate is a static check of the forms listed in SUPPORTED_OPERATIONS.md
 section 8; it is not a Python sandbox, and a static gate over a full Python
@@ -166,6 +178,17 @@ _GC_INDIRECT_ATTRS = frozenset({"get_objects", "get_referrers", "get_referents"}
 # Modules whose purpose is to run code handed to them as a string / docstring / frame.
 _EXEC_MODULES = frozenset({"pdb", "bdb", "code", "codeop", "runpy", "doctest", "timeit", "cProfile",
                            "profile", "trace"})
+# Modules that load code from a path while processing it: ``site.addsitedir``
+# executes every ``.pth`` file in the directory, ``pip`` installs and imports
+# arbitrary distributions, ``sitecustomize`` / ``usercustomize`` run on import.
+# The same class as ``sc.addPyFile`` / ``addJar``. (``sys.path.insert`` is NOT in
+# this class: the migrator itself puts its module mirror on ``sys.path``.)
+_CODE_LOAD_MODULES = frozenset({"site", "pip", "ensurepip", "sitecustomize", "usercustomize"})
+# ``site`` is a plausible variable name (``site = row["site"]``), so only its
+# code-loading attributes are refused when the import is out of view; the
+# other code-load modules are refused at any attribute.
+_SITE_CODE_LOAD_ATTRS = frozenset({"addsitedir", "addpackage", "execsitecustomize", "execusercustomize"})
+_CODE_LOAD_ROOT_REFUSED = _CODE_LOAD_MODULES - frozenset({"site"})
 _JVM_BRIDGE_MODULES = frozenset({"py4j"})
 _IPYTHON_MODULES = frozenset({"IPython", "ipykernel"})
 _OS_ENV_ATTRS = frozenset({"environ", "getenv", "putenv", "unsetenv", "environb", "getenvb"})
@@ -183,6 +206,21 @@ _SINK_ATTRS = frozenset({
     "spawnl", "spawnle", "spawnlp", "spawnlpe", "spawnv", "spawnve", "spawnvp", "spawnvpe",
     "pipepager", "tempfilepager", "getattr_static", "getmembers",
 })
+# A plain ``import m`` of a module the gate has no rules for does not vouch
+# for its attributes: ``mymod.system(..)`` may be ``os`` re-exported or
+# shadowed, so a sink name on such a module is refused too. The stdlib
+# homonyms with a documented benign meaning are the only exception.
+_SINK_HOMONYMS = frozenset({("platform", "system")})
+# Methods that mutate a registry (dict / list) in place. On a chain rooted at
+# a gated module (``yaml.SafeLoader.yaml_constructors.update(..)``) they
+# rewrite the module's state the gate reasons about and are refused.
+_REGISTRY_MUTATORS = frozenset({"update", "setdefault", "pop", "popitem", "clear", "append", "insert", "extend",
+                                "__setitem__", "__delitem__", "__ior__", "__iadd__"})
+# ``sys.path`` is the one gated-module list notebook code may mutate: the
+# migrator itself puts its module mirror on ``sys.path`` (``sys.path.insert``).
+_MUTABLE_GATED_CHAINS = frozenset({("sys", "path")})
+# ``torch.serialization`` hooks that widen what ``weights_only=True`` may unpickle.
+_TORCH_HOOK_ATTRS = frozenset({"add_safe_globals", "safe_globals", "clear_safe_globals"})
 # Callees that may take a gated module / Spark object as an argument: the
 # call is judged (getattr / setattr / delattr / vars) or cannot hand the
 # object back (print, repr, type, isinstance, ...).
@@ -244,7 +282,7 @@ _DESERIALIZE_MODULES = _PICKLE_MODULES | frozenset(_DESERIALIZE_ATTRS) | frozens
 _YAML_SAFE_LOADERS = frozenset({"SafeLoader", "CSafeLoader", "BaseLoader", "CBaseLoader"})
 # Star imports that would bind the gated API under unqualified names the scanner cannot see.
 _STAR_IMPORT_REFUSED = frozenset({"sys", "shutil", "inspect", "types", "asyncio", "concurrent"}) \
-    | _IO_MODULES | _DESERIALIZE_MODULES | _INDIRECT_MODULES | _EXEC_MODULES
+    | _IO_MODULES | _DESERIALIZE_MODULES | _INDIRECT_MODULES | _EXEC_MODULES | _CODE_LOAD_MODULES
 _OS_FS_ATTRS = frozenset({"remove", "unlink", "rmdir", "removedirs", "rename", "renames", "replace",
                           "truncate", "mkdir", "makedirs", "link", "symlink"})
 _OS_FS_TWO_ARG = frozenset({"rename", "renames", "replace", "link", "symlink"})
@@ -353,6 +391,7 @@ _PROTECTED_ROOTS = frozenset({"os", "sys", "builtins", "__builtins__", "importli
 # the gate cannot resolve, every later use of the name is refused (fail closed).
 _WATCHED_MODULES = _PROCESS_MODULES | _NETWORK_MODULES | _INDIRECT_MODULES | _EXEC_MODULES | _JVM_BRIDGE_MODULES \
     | _IPYTHON_MODULES | _IO_MODULES | _DESERIALIZE_MODULES | _PROTECTED_ROOTS | _OS_EQUIVALENT_MODULES \
+    | _CODE_LOAD_MODULES \
     | frozenset({"asyncio", "concurrent", "yaml", "aidp_compat", "operator", "functools"})
 # A chain segment that names one of these after any root re-roots the chain
 # there (``shutil.os.system``, ``pd.io.common.os.environ``, ``self.spark._jvm``):
@@ -867,14 +906,27 @@ class ScanContext:
     functions: Set[str] = field(default_factory=set)
     # Names bound once to an RDD-producing chain (``rdd = sc.parallelize(..)``).
     rdd_names: Set[str] = field(default_factory=set)
+    # Every name bound anywhere in the run (assignment, import, def, parameter,
+    # loop / with / except target). A receiver the run never bound is a name
+    # the gate cannot account for (``thing.open(p)``, ``thing.pipe(fn)``).
+    bound: Set[str] = field(default_factory=set)
+    # Resolved roots of the imported modules the gate has no rules for
+    # (``import helpers as h`` -> ``helpers``): their ``_private`` attributes
+    # are refused like those of a gated module.
+    modules: Set[str] = field(default_factory=set)
 
     def forget(self, name: str) -> None:
+        """``name`` is (re)bound in the current cell: drop what it stood for."""
+        self.bound.add(name)
         self.aliases.pop(name, None)
         self.identities.discard(name)
         self.imported.discard(name)
         self.functions.discard(name)
         self.rdd_names.discard(name)
         self.constants[name] = None
+
+    def is_bound(self, name: str) -> bool:
+        return name in self.bound or name in self.aliases or name in self.identities or name in self.imported
 
     def is_unresolved_taint(self, name: str) -> bool:
         return name in self.tainted and name not in self.aliases and name not in self.identities
@@ -1079,7 +1131,7 @@ def _is_prohibited_module(name: str, policy: SandboxPolicy) -> Optional[Tuple[st
         return RULE_IMPORT_PROCESS, root if root in _PROCESS_MODULES else "concurrent.futures.process"
     if root in _INDIRECT_MODULES:
         return RULE_INDIRECT, root
-    if root in _EXEC_MODULES:
+    if root in _EXEC_MODULES or root in _CODE_LOAD_MODULES:
         return RULE_BUILTIN_EXEC, root
     if root in _JVM_BRIDGE_MODULES:
         return RULE_POLICY_TAMPER, root
@@ -1155,6 +1207,16 @@ _REM_SINK = ("A process / environment / introspection method name on an object t
              "refused; call it on the module directly so the gate can judge it, or rename your own method.")
 _REM_PIPE = ("RDD.pipe(cmd) runs a shell command on the executors and is not available inside the sandbox; "
              "DataFrame.pipe(func) is fine when the argument is a function, not a string.")
+_REM_CODE_LOAD = "Dependencies are installed as cluster libraries; do not load code from paths at run time."
+_REM_PRIVATE = ("Private (_name) attributes of an imported module are not its public API and may re-export the "
+                "interpreter modules the gate refuses; use the module's public API.")
+_REM_MUTATE = ("The state of a gated module (a deserialiser's constructor registry, an interpreter table, a Spark "
+               "object) is read-only for notebook code; configure it through the public API or the run's "
+               "AIDP_* settings after review.")
+_REM_LOADER_ARGS = ("Pass the loader's safety switch as a literal keyword the gate can see (allow_pickle=False, "
+                    "weights_only=True, Loader=yaml.SafeLoader) instead of positionally or through *args / **kwargs.")
+_REM_RECEIVER = ("The receiver of this call was never bound in the notebook, so the gate cannot tell what it is; "
+                 "bind it in the notebook (import the library, assign the object) so the call can be judged.")
 
 
 class _PolicyScanner(ast.NodeVisitor):
@@ -1221,11 +1283,18 @@ class _PolicyScanner(ast.NodeVisitor):
                         self.ctx.tainted.add(elt.id)
 
         defined: Set[str] = set()
+        # Names read in any position other than the operand of ``sep.join(name)``:
+        # a list literal bound to such a name may have been mutated in place
+        # (``p[0] = ..``, ``p.append(..)``, ``p.insert(..)``, ``mutate(p)``,
+        # ``q = p; q[0] = ..``), so it is no longer the literal it was bound to.
+        loaded_elsewhere: Set[str] = set()
         for node in ast.walk(tree):
             for child in ast.iter_child_nodes(node):
                 self._parents[id(child)] = node
             if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
                 bind(node.id)
+            elif isinstance(node, ast.Name) and not self._is_join_operand(node):
+                loaded_elsewhere.add(node.id)
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 bind(node.name)
                 if not isinstance(node, ast.ClassDef):
@@ -1267,6 +1336,7 @@ class _PolicyScanner(ast.NodeVisitor):
                     chain = _import_chain(alias.name)
                     if chain[0] not in _WATCHED_MODULES:
                         self.ctx.imported.add(local)            # import platform / import pandas as pd
+                        self.ctx.modules.add(chain[0])
                     if alias.asname:
                         self.ctx.aliases[local] = chain
                     elif chain[0] != local:
@@ -1276,6 +1346,8 @@ class _PolicyScanner(ast.NodeVisitor):
             elif isinstance(node, ast.ImportFrom) and node.module:
                 if _module_root(node.module) == "aidp_compat":
                     continue  # helpers keep their own names (dbutils, translate_path, safe_*)
+                if _import_chain(node.module)[0] not in _WATCHED_MODULES:
+                    self.ctx.modules.add(_import_chain(node.module)[0])
                 for alias in node.names:
                     if alias.name == "*":
                         continue
@@ -1305,6 +1377,19 @@ class _PolicyScanner(ast.NodeVisitor):
                     vchain = self._chain(node.value.func)
                     if vchain and (vchain[0] in _SPARK_ROOTS or any(p in _RDD_CHAIN_ATTRS for p in vchain)):
                         self.ctx.rdd_names.add(name)         # rdd = sc.parallelize(..).map(..)
+        for name in loaded_elsewhere:
+            # A mutable literal is folded only while its name is used for nothing
+            # but ``sep.join(name)``; any other use (this or an earlier cell's
+            # binding) may have changed it, and the stale literal must not be
+            # what the sandbox check sees (fail closed: the join is then dynamic).
+            if isinstance(self.ctx.constants.get(name), (ast.List, ast.Set, ast.Dict)):
+                self.ctx.constants[name] = None
+
+    def _is_join_operand(self, node: ast.Name) -> bool:
+        """``sep.join(node)``: the one read of a list literal that cannot mutate it."""
+        parent = self._parents.get(id(node))
+        return isinstance(parent, ast.Call) and isinstance(parent.func, ast.Attribute) \
+            and parent.func.attr == "join" and len(parent.args) == 1 and parent.args[0] is node
 
     def _resolve_value(self, node: Optional[ast.AST]) -> Optional[ast.AST]:
         """Follow a plain name to the string node it was bound to, if known."""
@@ -1479,6 +1564,9 @@ class _PolicyScanner(ast.NodeVisitor):
         if root in _PROCESS_ROOT_REFUSED:
             target = f"{root}.{chain[1]}"
             return RULE_OS_PROCESS, target, f"access to the process module attribute {target}", _REM_PROC
+        if root in _CODE_LOAD_ROOT_REFUSED or (root == "site" and chain[1] in _SITE_CODE_LOAD_ATTRS):
+            target = f"{root}.{chain[1]}"
+            return RULE_BUILTIN_EXEC, target, f"{target}() loads code from a path at run time", _REM_CODE_LOAD
         if root == "os":
             if chain[1] in _OS_ENV_ATTRS:
                 return RULE_OS_ENVIRON, f"os.{chain[1]}", f"access to os.{chain[1]}", _REM_ENV
@@ -1499,8 +1587,7 @@ class _PolicyScanner(ast.NodeVisitor):
             return RULE_POLICY_TAMPER, target, f"attribute access on the aidp_compat package ({target})", _REM_TAMPER
         if root in _SPARK_ROOTS and chain[-1] in _SPARK_CODE_LOAD_ATTRS:
             target = ".".join(chain)
-            return RULE_BUILTIN_EXEC, target, f"{target}() loads code into the session", \
-                "Dependencies are installed as cluster libraries; do not load code from paths at run time."
+            return RULE_BUILTIN_EXEC, target, f"{target}() loads code into the session", _REM_CODE_LOAD
         if root in _SPARK_ROOTS and chain[-1] in _SPARK_JVM_UDF_ATTRS:
             target = ".".join(chain)
             return RULE_POLICY_TAMPER, target, f"{target}() registers a JVM class", _REM_JVM
@@ -1536,6 +1623,9 @@ class _PolicyScanner(ast.NodeVisitor):
                 _REM_DESERIALIZE
         if root == "yaml" and chain[1] == "load":
             return RULE_DESERIALIZE, "yaml.load", "yaml.load without a safe Loader", _REM_DESERIALIZE
+        if root == "torch" and any(part in _TORCH_HOOK_ATTRS for part in chain[1:]):
+            target = ".".join(chain)
+            return RULE_DESERIALIZE, target, f"{target}() widens what weights_only=True may unpickle", _REM_DESERIALIZE
         if root == "torch" and "load" in chain[1:]:
             target = ".".join(chain)
             return RULE_DESERIALIZE, target, f"{target} without weights_only=True", _REM_DESERIALIZE
@@ -1596,8 +1686,12 @@ class _PolicyScanner(ast.NodeVisitor):
             for name in sorted(names - {"*"}):
                 if (mod, name) in (("yaml", "load"), ("torch", "load")):
                     continue  # judged at the call (Loader= / weights_only=)
-                if chain:
-                    self._add_rule(node, self._attr_rule(chain + [name]))
+                if chain and not self._add_rule(node, self._attr_rule(chain + [name])) \
+                        and name.startswith("_") and not _is_dunder(name) and chain[0] != "__future__":
+                    # from tempfile import _os / from mymod import _helper: a private name of
+                    # any module is not its public API (the gated modules are judged above)
+                    self._add(RULE_INDIRECT, node, f"import of the private name {mod}.{name}",
+                              target=f"{mod}.{name}", remediation=_REM_PRIVATE)
             if "*" in names and chain != ["os"] and _module_root(mod) in _STAR_IMPORT_REFUSED:
                 self._add(RULE_INDIRECT, node, f"star import of {mod} binds its API under unqualified names",
                           target=mod + ".*", remediation=_REM_INDIRECT)
@@ -1643,15 +1737,39 @@ class _PolicyScanner(ast.NodeVisitor):
             if not self._receiver_resolved(node):
                 self._check_sink_attr(node, "<expr>")
         else:
-            self._add_rule(node, self._attr_rule(chain))
-            if not self._receiver_resolved(node):
-                self._check_sink_attr(node, ".".join(chain[:-1]))
+            if not self._add_rule(node, self._attr_rule(chain)):
+                # the rule table did not judge the chain: the private-attribute and
+                # sink rules on receivers the gate cannot vouch for apply
+                self._check_private_module_attr(node, chain)
+                if not self._receiver_resolved(node):
+                    self._check_sink_attr(node, ".".join(chain[:-1]))
         self.generic_visit(node)
+
+    def _check_private_module_attr(self, node: ast.AST, chain: Sequence[str]) -> None:
+        """``mymod._run(..)`` / ``np._core``: a ``_private`` (non-dunder) attribute of
+        an imported module the gate has no rules for. The gated modules' private
+        attributes are refused by the rule table; a module the gate does not know
+        may re-export the same interpreter internals under a private name, so the
+        same rule applies to every imported module."""
+        if chain[0] not in self.ctx.modules:
+            return
+        for i, part in enumerate(chain[1:], start=1):
+            if part.lstrip("_") in _REROOT_NAMES:
+                return      # tempfile._os / mymod._subprocess: the re-rooting rule judges the chain
+            if part.startswith("_") and not _is_dunder(part):
+                target = ".".join(chain[:i + 1])
+                self._add(RULE_INDIRECT, node, f"access to a private attribute of the imported module {chain[0]} "
+                          f"({target})", target=target, remediation=_REM_PRIVATE)
+                return
 
     def _receiver_resolved(self, node: ast.Attribute) -> bool:
         """True when the receiver of ``node`` is a plain name chain the gate knows:
-        a module it has rules for, an import / shim alias, an imported module or
-        a Spark root. Call results, subscripts and unknown names are not."""
+        a module it has rules for, an import / shim alias, a Spark root, or an
+        imported module the gate has no rules for when the attribute is not a
+        process sink (``import mymod; mymod.system(..)`` is refused like
+        ``obj.system(..)``: the module may re-export ``os``; the stdlib homonyms
+        in ``_SINK_HOMONYMS`` are the exception). Call results, subscripts,
+        unknown names and chains through a ``_private`` segment are not."""
         chain = self._chain(node.value)      # calls skipped: spark.sparkContext.getConf().x is still spark's
         if not chain:
             if isinstance(node.value, ast.Subscript):
@@ -1660,11 +1778,18 @@ class _PolicyScanner(ast.NodeVisitor):
                 return bool(inner) and inner[0] in _VALUE_GUARDED
             return False                     # lambda / conditional / literal receiver
         root = chain[0]
+        if any(part.startswith("_") and not _is_dunder(part) for part in chain[1:]):
+            return False                     # mod._private.system: the private segment is opaque
         if root in _VALUE_GUARDED or root in _IPYTHON_NAMES or root in _PY4J_NAMES or root in _DATAFRAME_LIB_ROOTS:
             return True                      # the rule table judges the chain
         if _pure_chain(node.value) is None:
             return False                     # call result on an unknown root: helper().system
-        return root in self.ctx.aliases or root in self.ctx.identities or root in self.ctx.imported
+        if root in self.ctx.aliases or root in self.ctx.identities:
+            if root in self.ctx.imported:
+                # import mymod: a module the gate has no rules for vouches for nothing
+                return (root, node.attr) in _SINK_HOMONYMS or node.attr not in _SINK_ATTRS
+            return True
+        return False
 
     def _check_sink_attr(self, node: ast.Attribute, shown: str) -> None:
         """A process / environment / introspection sink name on a receiver the
@@ -1730,12 +1855,37 @@ class _PolicyScanner(ast.NodeVisitor):
             self._add(RULE_POLICY_TAMPER, target, f"{what} to an item of {chain[0]}",
                       target=".".join(chain), remediation=_REM_TAMPER)
             return
-        if not isinstance(base, ast.Attribute):
+        if isinstance(base, ast.Call) and self._call_name(base.func) == "getattr" and len(base.args) >= 2 \
+                and _literal_str(base.args[1]) is not None and isinstance(base.args[0], (ast.Name, ast.Attribute)):
+            # getattr(yaml.SafeLoader, "yaml_constructors")["!x"] = h: judged as the chain it names
+            chain = self._chain(base.args[0]) + [_literal_str(base.args[1])]
+        elif isinstance(base, ast.Attribute):
+            chain = self._chain(base)
+        else:
             return
-        chain = self._chain(base)
         if self._is_protected_root(chain) or (chain and chain[0] in _SPARK_ROOTS):
             self._add(RULE_POLICY_TAMPER, target, f"{what} to an attribute of {chain[0]} ({'.'.join(chain)})",
                       target=".".join(chain), remediation=_REM_TAMPER)
+        elif self._is_gated_mutation(chain, item=bool(keys)):
+            # yaml.SafeLoader.yaml_constructors["!x"] = h / L.yaml_constructors[..] = h (alias followed) /
+            # yaml.SafeLoader.yaml_constructors = {..}: the registry a safe loader consults is rewritten
+            rule = RULE_DESERIALIZE if chain[0] in _DESERIALIZE_MODULES else RULE_POLICY_TAMPER
+            self._add(rule, target, f"{what} to the state of the gated module {chain[0]} ({'.'.join(chain)})",
+                      target=".".join(chain), remediation=_REM_MUTATE)
+
+    @staticmethod
+    def _is_gated_mutation(chain: Sequence[str], item: bool) -> bool:
+        """A store into the state of a gated module: an item of any attribute of
+        it (``yaml.SafeLoader.yaml_constructors[k]``), or an attribute of it
+        (``yaml.SafeLoader.yaml_constructors = ..``). ``torch`` is the one gated
+        module whose public flag attributes notebooks set as everyday
+        configuration (``torch.backends.cudnn.benchmark = True``); its
+        serialisation namespace and its registries (item stores) stay refused."""
+        if len(chain) < 2 or chain[0] not in _WATCHED_MODULES:
+            return False
+        if chain[0] == "torch" and not item and "serialization" not in chain:
+            return False
+        return True
 
     def visit_Assign(self, node: ast.Assign):
         for t in node.targets:
@@ -1986,6 +2136,21 @@ class _PolicyScanner(ast.NodeVisitor):
             self._add(RULE_INDIRECT, node, "inspect.getmembers() enumerates every attribute of an object, "
                       "private and dunder names included", target="inspect.getmembers", remediation=_REM_INDIRECT)
             return
+        if attr in _REGISTRY_MUTATORS and len(chain) >= 3 and chain[0] in _WATCHED_MODULES \
+                and tuple(chain[:2]) not in _MUTABLE_GATED_CHAINS:
+            # yaml.SafeLoader.yaml_constructors.update({..}) / .setdefault / .pop / sys.meta_path.append:
+            # the registry a gated module consults is rewritten in place (sys.path is the exception)
+            shown = ".".join(chain)
+            rule = RULE_DESERIALIZE if chain[0] in _DESERIALIZE_MODULES else RULE_POLICY_TAMPER
+            self._add(rule, node, f"{shown}() mutates the state of the gated module {chain[0]}",
+                      target=shown, remediation=_REM_MUTATE)
+            return
+        if attr == "load" and isinstance(node.func, ast.Attribute) and not self._receiver_resolved(node.func) \
+                and not any(part in _SPARK_IO_CHAIN for part in chain[:-1]):
+            # <unresolved>.load(p, **kw) / .load(p, None, True): the receiver may be numpy / torch /
+            # any keyword-gated loader, and the switch is hidden in the splat or passed positionally
+            if self._refuse_loader_args(node, ".".join(chain), positional_switch=2):
+                return
         for k in node.keywords:
             # numpy / torch loader switches, keyed on the keyword so the receiver does not matter
             if k.arg == "allow_pickle" and not (isinstance(k.value, ast.Constant) and k.value.value is False):
@@ -2095,6 +2260,12 @@ class _PolicyScanner(ast.NodeVisitor):
                       target=f"{shown}()", remediation=_REM_PIPE)
             return
         if isinstance(arg, ast.Name) and arg.id not in self.ctx.functions and arg.id not in self.ctx.aliases:
+            if not self._receiver_accounted(chain):
+                # thing.pipe(cmd): the receiver was never bound in the notebook, so it cannot be
+                # typed as a DataFrame at all, and the argument may be a command string
+                self._add(RULE_OS_PROCESS, node, f"{shown}() on a receiver the notebook never bound, with an "
+                          "argument the gate cannot type", target=f"{shown}()", remediation=_REM_RECEIVER)
+                return
             self._note(NOTE_UNVERIFIED_PIPE, node,
                        f"{shown}({arg.id}) with an argument the gate cannot type; allowed as DataFrame.pipe(func) "
                        "and unverified", target=f"{shown}({arg.id})")
@@ -2145,9 +2316,23 @@ class _PolicyScanner(ast.NodeVisitor):
             self._add(RULE_OPEN_PATH, node, f"{shown}() on a path under a local prefix outside the sandbox",
                       target=head, remediation=_REM_READ_PATH)
             return
+        if not self._receiver_accounted(chain):
+            # thing.open(path_var): neither the receiver nor the path is anything the notebook
+            # bound; the gate cannot tell it from the builtin or a Path, so it is judged as one
+            self._add(RULE_OPEN_DYNAMIC, node, f"{shown}() on a receiver the notebook never bound, with a path "
+                      "that cannot be resolved statically", target=f"{shown}(<dynamic>)",
+                      remediation=_REM_RECEIVER)
+            return
         self._note(NOTE_UNVERIFIED_READ_PATH, node,
                    f"{shown}() with a path that cannot be resolved statically; the open is allowed and unverified "
                    "(the cluster's IAM scope is the control)", target=f"{shown}(<dynamic>)")
+
+    def _receiver_accounted(self, chain: Sequence[str]) -> bool:
+        """The root of a receiver chain is something the run bound (an import, an
+        assignment, a parameter, a loop / with target) or a library root the gate
+        knows. An unbound bare name is a value the gate never saw come into being."""
+        return bool(chain) and (self.ctx.is_bound(chain[0]) or chain[0] in _DATAFRAME_LIB_ROOTS
+                                or chain[0] in _VALUE_GUARDED)
 
     def _literal_head(self, arg: ast.AST) -> Optional[str]:
         resolved = self._resolve_value(arg)
@@ -2169,8 +2354,11 @@ class _PolicyScanner(ast.NodeVisitor):
         spark_refused = spark_obj and (mutate or builtin == "vars" or name is None or name.startswith("_"))
         # vars(<any gated module>) dumps its namespace: refused. getattr(<gated module>, "literal")
         # is judged by the rule table below (getattr(pickle, "loads") is pickle.loads).
+        # setattr / delattr on any gated module (setattr(yaml.SafeLoader, "yaml_constructors", {..}))
+        # rewrites state the gate reasons about: refused like an attribute assignment.
         protected = (self._is_protected_root(chain)
-                     or (builtin == "vars" and bool(chain) and chain[0] in _WATCHED_MODULES)) and not spark_obj
+                     or ((builtin == "vars" or mutate) and bool(chain) and chain[0] in _WATCHED_MODULES)) \
+            and not spark_obj
         if protected or spark_refused or self._is_builtins_namespace(arg):
             rule = RULE_POLICY_TAMPER if mutate else RULE_INDIRECT
             shown = ".".join(chain) if chain else "__builtins__"
@@ -2217,19 +2405,45 @@ class _PolicyScanner(ast.NodeVisitor):
                 self._consumed.add(id(node.func))
             return True
         if root == "torch" and attr == "load":
-            # torch.load / torch.serialization.load / torch.jit.load: any depth under torch
+            # torch.load / torch.serialization.load / torch.jit.load: any depth under torch.
+            # Safe only with the literal weights_only=True AND no pickle_module (keyword or the
+            # third positional): an explicit unpickler is honoured for the non-tensor payload.
             target = ".".join(chain)
+            self._consumed.add(id(node.func))
+            if self._refuse_loader_args(node, target, positional_switch=2):
+                return True
             safe = any(k.arg == "weights_only" and isinstance(k.value, ast.Constant) and k.value.value is True
                        for k in node.keywords)
             if not safe:
                 self._add(RULE_DESERIALIZE, node, f"{target}() without weights_only=True", target=target,
                           remediation=_REM_DESERIALIZE)
-            self._consumed.add(id(node.func))
+            elif any(k.arg == "pickle_module" for k in node.keywords):
+                self._add(RULE_DESERIALIZE, node, f"{target}() with an explicit pickle_module", target=target,
+                          remediation=_REM_DESERIALIZE)
             return True
         if root == "numpy" and attr == "load" and len(chain) == 2:
-            # allow_pickle must be absent or the literal False (the generic keyword
-            # rule in _check_attribute_call has already refused every other value)
+            # allow_pickle must be absent or the literal False: as a keyword (the generic
+            # keyword rule in _check_attribute_call refuses every other value), as the
+            # third positional argument, or hidden in *args / **kwargs (refused).
+            self._refuse_loader_args(node, ".".join(chain), positional_switch=2)
             return True
+        return False
+
+    def _refuse_loader_args(self, node: ast.Call, shown: str, positional_switch: int) -> bool:
+        """Loader arguments the gate cannot judge: ``*args`` / ``**kwargs`` (the
+        safety switch may be inside) or the switch passed positionally with
+        anything but the literal ``False`` / ``None`` (``np.load(p, None, True)``,
+        ``torch.load(p, None, custom_pickle)``). Returns True when refused."""
+        if any(isinstance(a, ast.Starred) for a in node.args) or any(k.arg is None for k in node.keywords):
+            self._add(RULE_DESERIALIZE, node, f"{shown}() with *args / **kwargs hides the loader's safety switch",
+                      target=f"{shown}(<dynamic>)", remediation=_REM_LOADER_ARGS)
+            return True
+        if len(node.args) > positional_switch:
+            switch = node.args[positional_switch]
+            if not (isinstance(switch, ast.Constant) and switch.value in (False, None)):
+                self._add(RULE_DESERIALIZE, node, f"{shown}() with the loader's safety switch passed positionally",
+                          target=f"{shown}(<positional>)", remediation=_REM_LOADER_ARGS)
+                return True
         return False
 
     def _check_open(self, node: ast.Call, call_name: str = "open()"):

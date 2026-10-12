@@ -1685,6 +1685,185 @@ def test_review_gap_cell_count():
     assert len(REVIEW_GAP_CELLS) == 100
 
 
+# Coverage round 1 on the d44b776 gate: the tester's ten gap cells verbatim (first
+# entry of each block) and the rest of the class each one belongs to. Every cell
+# passed the gate at d44b776.
+REVIEW_GAP_CELLS_3 = [
+    # J: a list literal mutated in place is no longer the literal it was bound to
+    #    (subscript store, append / insert / extend / pop, aliasing, a helper call, *parts)
+    ("p=['oci://bucket@ns/sandbox','a']\np[0]='/etc'\ndf.write.parquet('/'.join(p))",
+     "NBP-PATH-WRITE-DYNAMIC", "<dynamic>"),
+    ("parts=['oci://bucket@ns/sandbox']\nparts.insert(1,'..')\nopen('/'.join(parts)).read()",
+     "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("parts = ['oci://bucket@ns/sandbox', 'x.txt']\nparts[0] = '/etc'\nparts[1] = 'passwd'\n"
+     "open('/'.join(parts)).read()", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("parts = ['oci://bucket@ns/sandbox']\nparts.append('..')\nparts.append('..')\nparts.append('etc')\n"
+     "parts.append('passwd')\nopen('/'.join(parts)).read()", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("parts = ['oci://bucket@ns/sandbox']\nparts.extend(['..', '..', 'etc', 'passwd'])\nopen('/'.join(parts)).read()",
+     "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("parts = ['oci://bucket@ns/sandbox', 'a', 'b']\nparts.pop()\nparts[1] = '..'\nopen('/'.join(parts))",
+     "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("parts = ['oci://bucket@ns/sandbox', 'a']\ndel parts[0]\nopen('/'.join(parts))", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("parts = ['oci://bucket@ns/sandbox', 'a']\nq = parts\nq[0] = '/etc'\nopen('/'.join(parts))",
+     "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("parts = ['oci://bucket@ns/sandbox', 'a']\nrewrite(parts)\nopen('/'.join(parts))", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("parts = ['oci://bucket@ns/sandbox', 'a']\nparts.__setitem__(0, '/etc')\nopen('/'.join(parts))",
+     "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("parts = ['oci://bucket@ns/sandbox', 'a']\nfor i in range(2):\n    parts[i] = '/etc'\nopen('/'.join(parts))",
+     "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("import os\nparts = ['oci://bucket@ns/sandbox', 'a']\nparts[0] = '/etc'\nopen(os.path.join(*parts))",
+     "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("p = ['oci://bucket@ns/sandbox', 'a']\np[0] = '/etc'\ndbutils.fs.rm('/'.join(p))", "NBP-DBFS-DYNAMIC", "<dynamic>"),
+    ("import shutil\np = ['oci://bucket@ns/sandbox', 'a']\np[0] = '/etc'\nshutil.move('a.txt', '/'.join(p))",
+     "NBP-FS-DYNAMIC", "<dynamic>"),
+    ("p = ['oci://bucket@ns/sandbox', 'a']\np[0] = '/etc'\ndf.write.option('path', '/'.join(p)).save()",
+     "NBP-PATH-WRITE-DYNAMIC", "<dynamic>"),
+    # K: keyword-gated loaders with the switch passed positionally or hidden in a splat
+    ("import numpy as np\nnp.load(p, None, True)", "NBP-DESERIALIZE", "numpy.load(<positional>)"),
+    ("import numpy as np\nnp.load(p, **kw)", "NBP-DESERIALIZE", "numpy.load(<dynamic>)"),
+    ("import numpy as np\nnp.load(p, None, flag)", "NBP-DESERIALIZE", "numpy.load(<positional>)"),
+    ("import numpy as np\nnp.load(p, *rest)", "NBP-DESERIALIZE", "numpy.load(<dynamic>)"),
+    ("import numpy\nnumpy.load(p, None, 1)", "NBP-DESERIALIZE", "numpy.load(<positional>)"),
+    ("from numpy import load\nload(p, None, True)", "NBP-DESERIALIZE", "numpy.load(<positional>)"),
+    ("np.load(p, None, True)", "NBP-DESERIALIZE", "np.load(<positional>)"),          # no import in view
+    ("np.load(p, **kw)", "NBP-DESERIALIZE", "np.load(<dynamic>)"),
+    ("loader.load(p, **kw)", "NBP-DESERIALIZE", "loader.load(<dynamic>)"),            # receiver never bound
+    ("import torch\ntorch.load(p, pickle_module=evil, weights_only=True)", "NBP-DESERIALIZE", "torch.load"),
+    ("import torch\ntorch.load(p, None, evil, weights_only=True)", "NBP-DESERIALIZE", "torch.load(<positional>)"),
+    ("import torch\ntorch.load(p, weights_only=True, **kw)", "NBP-DESERIALIZE", "torch.load(<dynamic>)"),
+    ("import torch\ntorch.load(p, **kw)", "NBP-DESERIALIZE", "torch.load(<dynamic>)"),
+    ("import torch\ntorch.serialization.add_safe_globals([evil])", "NBP-DESERIALIZE", "torch.serialization.add_safe_globals"),
+    ("from torch.serialization import add_safe_globals", "NBP-DESERIALIZE", "torch.serialization.add_safe_globals"),
+    ("import torch\nwith torch.serialization.safe_globals([evil]):\n    m = torch.load(p, weights_only=True)",
+     "NBP-DESERIALIZE", "torch.serialization.safe_globals"),
+    # L: the state of a gated module is read-only (a deserialiser's constructor registry first)
+    ("import yaml\nyaml.SafeLoader.yaml_constructors['!x']=handler\nyaml.safe_load(s)",
+     "NBP-DESERIALIZE", "yaml.SafeLoader.yaml_constructors"),
+    ("yaml.SafeLoader.yaml_multi_constructors[''] = handler\nyaml.safe_load(s)",
+     "NBP-DESERIALIZE", "yaml.SafeLoader.yaml_multi_constructors"),
+    ("import yaml\nL = yaml.SafeLoader\nL.yaml_constructors['!x'] = handler",
+     "NBP-DESERIALIZE", "yaml.SafeLoader.yaml_constructors"),
+    ("import yaml\nyaml.SafeLoader.yaml_constructors.update({'!x': handler})",
+     "NBP-DESERIALIZE", "yaml.SafeLoader.yaml_constructors.update"),
+    ("import yaml\nyaml.SafeLoader.yaml_constructors.setdefault('!x', handler)",
+     "NBP-DESERIALIZE", "yaml.SafeLoader.yaml_constructors.setdefault"),
+    ("import yaml\nyaml.SafeLoader.yaml_implicit_resolvers.pop('!')",
+     "NBP-DESERIALIZE", "yaml.SafeLoader.yaml_implicit_resolvers.pop"),
+    ("import yaml\nyaml.SafeLoader.yaml_constructors = {'!x': handler}", "NBP-DESERIALIZE", "yaml.SafeLoader.yaml_constructors"),
+    ("import yaml\ndel yaml.SafeLoader.yaml_constructors['!x']", "NBP-DESERIALIZE", "yaml.SafeLoader.yaml_constructors"),
+    ("import yaml\nsetattr(yaml.SafeLoader, 'yaml_constructors', {})", "NBP-POLICY-TAMPER", "yaml.SafeLoader"),
+    ("import yaml\ngetattr(yaml.SafeLoader, 'yaml_constructors')['!x'] = handler",
+     "NBP-DESERIALIZE", "yaml.SafeLoader.yaml_constructors"),
+    ("import yaml\nyaml.safe_load = yaml.unsafe_load", "NBP-DESERIALIZE", "yaml.safe_load"),
+    ("import torch\ntorch.serialization.DEFAULT_PROTOCOL = 0", "NBP-DESERIALIZE", "torch.serialization.DEFAULT_PROTOCOL"),
+    ("import torch\ntorch.backends.registry['x'] = evil", "NBP-DESERIALIZE", "torch.backends.registry"),
+    ("import operator\noperator.attrgetter = evil", "NBP-POLICY-TAMPER", "operator.attrgetter"),
+    ("import asyncio\nasyncio.events._event_loop_policy = evil", "NBP-INDIRECT", "asyncio.events._event_loop_policy"),
+    ("import functools\nfunctools.WRAPPER_ASSIGNMENTS = ()", "NBP-POLICY-TAMPER", "functools.WRAPPER_ASSIGNMENTS"),
+    # M: a sink name on an imported module the gate has no rules for (it may re-export os)
+    ("import mymod\nmymod.popen('id')", "NBP-INDIRECT", "mymod.popen"),
+    ("import mymod\nmymod.system('id')", "NBP-INDIRECT", "mymod.system"),
+    ("import helpers\nhelpers.fork()", "NBP-INDIRECT", "helpers.fork"),
+    ("import mymod\nmymod.sub.popen('id')", "NBP-INDIRECT", "mymod.sub.popen"),
+    ("import mymod\nmymod.execvp('id', ['id'])", "NBP-INDIRECT", "mymod.execvp"),
+    ("import mymod\nmymod.putenv('A', 'b')", "NBP-INDIRECT", "mymod.putenv"),
+    # N: private attributes of ANY imported module, and a private segment makes the receiver opaque
+    ("import mymod\nmymod._run('id')", "NBP-INDIRECT", "mymod._run"),
+    ("import numpy as np\nnp._core.multiarray", "NBP-INDIRECT", "numpy._core"),
+    ("from mymod import _helper", "NBP-INDIRECT", "mymod._helper"),
+    ("import mymod\nmymod.sub._impl.system('id')", "NBP-INDIRECT", "mymod.sub._impl"),
+    ("import pandas as pd\npd._libs.system('id')", "NBP-INDIRECT", "pandas._libs"),
+    ("import tempfile\ntempfile._os.system('id')", "NBP-OS-PROCESS", "os.system"),       # re-rooted, still os
+    ("import mymod\nmymod._sys.modules", "NBP-INDIRECT", "sys.modules"),
+    ("import mymod\nmymod._subprocess.run('id')", "NBP-OS-PROCESS", "subprocess.run"),
+    # O: code loaded from a path at run time (site .pth processing, pip)
+    ("import site\nsite.addsitedir('/tmp/evil')", "NBP-BUILTIN-EXEC", "site"),
+    ("site.addsitedir(d)", "NBP-BUILTIN-EXEC", "site.addsitedir"),                     # import out of view
+    ("from site import addsitedir", "NBP-BUILTIN-EXEC", "site"),
+    ("import site as s\ns.addsitedir(d)", "NBP-BUILTIN-EXEC", "site"),
+    ("import pip\npip.main(['install', 'evil'])", "NBP-BUILTIN-EXEC", "pip"),
+    ("pip.main(['install', 'evil'])", "NBP-BUILTIN-EXEC", "pip.main"),
+    ("import ensurepip\nensurepip.bootstrap()", "NBP-BUILTIN-EXEC", "ensurepip"),
+    ("import sitecustomize", "NBP-BUILTIN-EXEC", "sitecustomize"),
+    # P: a receiver the notebook never bound, with an argument the gate cannot type
+    ("thing.open(path_var).read()", "NBP-OPEN-DYNAMIC", "thing.open(<dynamic>)"),
+    ("result = thing.pipe(cmd)", "NBP-OS-PROCESS", "thing.pipe()"),
+    ("cfg.fs.open(name)", "NBP-OPEN-DYNAMIC", "cfg.fs.open(<dynamic>)"),
+    ("with fs.open(object_path, 'rb') as fh:\n    payload = fh.read()", "NBP-OPEN-DYNAMIC", "fs.open(<dynamic>)"),
+]
+
+
+@pytest.mark.parametrize("source,rule,target", REVIEW_GAP_CELLS_3,
+                         ids=[c[1] + ":" + c[0][:30] for c in REVIEW_GAP_CELLS_3])
+def test_coverage_round1_gap_cells_are_refused(tmp_path, sandbox_env, source, rule, target):
+    _assert_refused(tmp_path, [source], rule, target)
+
+
+def test_list_literal_mutated_in_an_earlier_cell_is_not_folded(sandbox_env):
+    ctx = npol.ScanContext()
+    assert npol.scan_source("parts = ['oci://bucket@ns/sandbox', 'a']", context=ctx) == []
+    assert npol.scan_source("parts.insert(1, '..')", context=ctx) == []
+    assert [v.rule for v in npol.scan_source("open('/'.join(parts)).read()", context=ctx)] == ["NBP-OPEN-DYNAMIC"]
+    ctx = npol.ScanContext()
+    assert npol.scan_source("parts = ['oci://b@ns/sbx', 'a']", context=ctx) == []
+    assert npol.scan_source("df.write.parquet('/'.join(parts))", context=ctx) == []      # join-only use: folded
+    assert npol.scan_source("parts.append('..')", context=ctx) == []
+    assert [v.rule for v in npol.scan_source("df.write.parquet('/'.join(parts))", context=ctx)] \
+        == ["NBP-PATH-WRITE-DYNAMIC"]
+
+
+def test_sink_on_an_imported_module_is_refused_across_cells(sandbox_env):
+    ctx = npol.ScanContext()
+    assert npol.scan_source("import mymod", context=ctx) == []
+    assert [(v.rule, v.target) for v in npol.scan_source("mymod.system('id')", context=ctx)] \
+        == [("NBP-INDIRECT", "mymod.system")]
+    assert npol.scan_source("mymod.run('id')", context=ctx) == []
+    assert [(v.rule, v.target) for v in npol.scan_source("mymod._run('id')", context=ctx)] \
+        == [("NBP-INDIRECT", "mymod._run")]
+
+
+# Everyday code next to each round-1 class that must not become a false refusal.
+CLEAN_CELLS_6 = [
+    # J: list literals used only for the join still fold; mutation without a path sink is fine
+    "parts = ['oci://bucket@ns/sandbox', 'a']\ndf.write.parquet('/'.join(parts))",
+    "parts = ['data', 'in.csv']\nrows = open('/'.join(parts)).read()",
+    "items = []\nitems.append(1)\nitems.insert(0, 2)\nitems[0] = 3\nitems.extend([4])\nprint(len(items))",
+    "cols = ['a', 'b']\ncols.append('c')\nout = df.select(*cols)",
+    # K: loaders with their switch as a literal keyword, or positional False / None
+    "import numpy as np\narr = np.load(array_path, None, False)",
+    "import numpy as np\narr = np.load(array_path, 'r')",
+    "import numpy as np\narr = np.load(array_path, mmap_mode='r', allow_pickle=False)",
+    "import torch\nm = torch.load('m.pt', map_location='cpu', weights_only=True)",
+    "import json\ncfg = json.load(fh, **opts)",
+    "spark.read.format('csv').load(src_path, **options)",
+    "spark.read.load(src_path, 'parquet')",
+    # L: reading a gated module's state, torch configuration flags, pandas options
+    "import yaml\ntags = list(yaml.SafeLoader.yaml_constructors)",
+    "import torch\ntorch.backends.cudnn.benchmark = True\ntorch.set_grad_enabled(False)",
+    "import pandas as pd\npd.options.display.max_columns = 50",
+    "import sys\nsys.path.insert(0, '/Workspace/Repos/x')\nsys.path.append(lib_dir)",
+    # M / N: public names on imported modules, homonyms
+    "import platform\nosname = platform.system()",
+    "import mymod\nmymod.run('id')\nresult = mymod.process(df)",
+    "import helpers as h\nout = h.clean(df)",
+    "from mymod import helper\nhelper(df)",
+    # O: a variable that happens to be called site
+    "site = row['site']\nname = site.lower()\nprint(site)",
+    # P: receivers the notebook bound
+    "import fsspec\nfs = fsspec.filesystem('oci')\nwith fs.open(object_path, 'rb') as fh:\n    payload = fh.read()",
+    "fs = get_filesystem()\ndata = fs.open(object_path).read()",
+    "import zipfile\nwith zipfile.ZipFile('rel.zip') as zf:\n    data = zf.open(member).read()",
+    "def transform(frame):\n    return frame.pipe(step)",
+    "import pandas as pd\ndf = pd.read_parquet(src_path)\nout = df.pipe(clean_frame).pipe(add_keys, keys=['id'])",
+    "for frame in frames:\n    out = frame.pipe(step)",
+]
+
+
+@pytest.mark.parametrize("source", CLEAN_CELLS_6, ids=[c[:40] for c in CLEAN_CELLS_6])
+def test_coverage_round1_adjacent_everyday_code_passes_the_gate(source):
+    assert npol.scan_source(source, policy=REVIEW_POLICY) == []
+
+
 # The 19 ordinary notebook cells from the same review, which must stay allowed
 # (scanned with the review's sandbox: catalog sbx / schema mig / prefix oci://bucket@ns/sandbox/).
 REVIEW_POLICY = SandboxPolicy(catalog="sbx", schema="mig", prefix="oci://bucket@ns/sandbox/")
@@ -1704,7 +1883,7 @@ CLEAN_CELLS_4 = [
     ".save('oci://bucket@ns/sandbox/orders_pos')",
     'from dataclasses import dataclass\nfrom typing import Optional\n@dataclass\nclass Row:\n    id: int\n'
     '    name: Optional[str] = None\n    def __repr__(self):\n        return f"Row({self.id})"',
-    "with fs.open(object_path, 'rb') as fh:\n    payload = fh.read()",
+    "import fsspec\nfs = fsspec.filesystem('oci')\nwith fs.open(object_path, 'rb') as fh:\n    payload = fh.read()",
     "import matplotlib.pyplot as plt\nplt.plot(df['x'], df['y']); plt.show()",
     'rdd = sc.parallelize(range(10)).map(lambda x: x * 2)\nprint(rdd.collect())',
     'result = spark.sql("SHOW TABLES IN sbx.mig")',
@@ -1729,7 +1908,7 @@ CLEAN_CELLS_5 = [
     "import pyarrow as pa\nok = pa.types.is_string(t)",
     "from scipy import signal\nb, a = signal.butter(1, 0.5)",
     "code = resp.code\nprofile = user.profile.name",
-    "with fs.open(object_path, 'wb') as fh:\n    fh.write(payload)",
+    "fs = get_filesystem()\nwith fs.open(object_path, 'wb') as fh:\n    fh.write(payload)",
     "import zipfile\nwith zipfile.ZipFile('rel.zip') as z:\n    data = z.open('member.txt').read()",
     # C: DataFrame.pipe with a callable
     "import pandas as pd\nout = df.pipe(lambda d: d.dropna())",
@@ -1777,25 +1956,48 @@ def test_dynamic_open_is_refused_in_every_mode(sandbox_env):
         assert [v.rule for v in npol.scan_source(src)] == ["NBP-OPEN-DYNAMIC"], src
 
 
-def test_open_on_an_unknown_receiver_is_recorded_not_refused(sandbox_env):
-    # <object-store fs>.open(path): not the builtin, not a Path; a literal local path is still
-    # checked, a dynamic one is allowed and recorded (the receiver is not the local filesystem).
-    src = "with fs.open(object_path, 'rb') as fh:\n    payload = fh.read()"
+def test_open_on_a_bound_receiver_is_recorded_not_refused(sandbox_env):
+    # <object-store fs>.open(path) on a receiver the notebook bound: not the builtin, not a
+    # Path; a literal local path is still checked, a dynamic one is allowed and recorded
+    # (the receiver is not the local filesystem).
+    src = "import fsspec\nfs = fsspec.filesystem('oci')\nwith fs.open(object_path, 'rb') as fh:\n    payload = fh.read()"
     assert npol.scan_source(src) == []
     assert npol.enforce_cell_policy(src, notebook_path="nb", cell_index=2) == []
     notes = [e for e in npol.get_policy_log() if e["event"] == "unverified_read_path"]
-    assert [(e["target"], e["detail"]["line"], e["cell_index"]) for e in notes] == [("fs.open(<dynamic>)", 1, 2)]
+    assert [(e["target"], e["detail"]["line"], e["cell_index"]) for e in notes] == [("fs.open(<dynamic>)", 3, 2)]
+    ctx = npol.ScanContext()
+    assert npol.scan_source("fs = get_filesystem()", context=ctx) == []       # bound in an earlier cell
+    assert npol.scan_source("data = fs.open(object_path).read()", context=ctx) == []
     assert [(v.rule, v.target) for v in npol.scan_source("fs.open('/etc/passwd')")] == [("NBP-OPEN-PATH", "/etc/passwd")]
-    assert [(v.rule, v.target) for v in npol.scan_source("fs.open(**kw)")] == [("NBP-OPEN-DYNAMIC", "<dynamic>")]
+    assert [(v.rule, v.target) for v in npol.scan_source("fs = get_filesystem()\nfs.open(**kw)")] \
+        == [("NBP-OPEN-DYNAMIC", "<dynamic>")]
+
+
+def test_open_on_a_receiver_the_notebook_never_bound_is_refused(sandbox_env):
+    # thing.open(path_var): the receiver is a name the run never bound, so the gate cannot
+    # tell it from the builtin or a Path and the dynamic path is refused as for open().
+    for src in ("thing.open(path_var).read()", "with fs.open(object_path, 'rb') as fh:\n    payload = fh.read()",
+                "cfg.fs.open(name)"):
+        assert [v.rule for v in npol.scan_source(src)] == ["NBP-OPEN-DYNAMIC"], src
+        assert not [e for e in npol.get_policy_log() if e["event"] == "unverified_read_path"]
 
 
 def test_pipe_residual_is_recorded(sandbox_env):
-    src = "import pandas as pd\nout = df.pipe(clean_frame)"
+    src = "import pandas as pd\ndf = pd.read_parquet(src_path)\nout = df.pipe(clean_frame)"
     assert npol.scan_source(src) == []
     npol.enforce_cell_policy(src, notebook_path="nb", cell_index=1)
     notes = [e for e in npol.get_policy_log() if e["event"] == "unverified_pipe_callable"]
-    assert [(e["target"], e["detail"]["line"]) for e in notes] == [("df.pipe(clean_frame)", 2)]
+    assert [(e["target"], e["detail"]["line"]) for e in notes] == [("df.pipe(clean_frame)", 3)]
     assert "unverified_pipe_callable" in npol.POLICY_NOTES
+
+
+def test_pipe_on_a_receiver_the_notebook_never_bound_is_refused(sandbox_env):
+    # thing.pipe(cmd): neither the receiver nor the argument can be typed; RDD.pipe(cmd) is a shell
+    assert [(v.rule, v.target) for v in npol.scan_source("result = thing.pipe(cmd)")] \
+        == [("NBP-OS-PROCESS", "thing.pipe()")]
+    ctx = npol.ScanContext()
+    assert npol.scan_source("frame = load_frame()", context=ctx) == []
+    assert npol.scan_source("out = frame.pipe(step)", context=ctx) == []        # bound earlier: recorded
 
 
 def test_module_value_rule_follows_aliases_across_cells(sandbox_env):

@@ -162,6 +162,46 @@ All notable changes to this plugin are documented here. Format loosely follows [
   the process modules. Every probe cell is in the test suite verbatim (first refusal as the
   runner reports it) and the legitimate cells of the same review stay allowed; the new tests
   fail against the edcb186 scanner.
+- **Sandbox gate: coverage round 1 on d44b776 closed as classes** (an analyzer coverage test
+  found ten gaps and no false refusals; 11 of 119 probe cells passed the gate at d44b776). (J)
+  A list literal bound to a name is folded into a path (`"/".join(parts)`) only while the name
+  is used for nothing but the join: an in-place mutation (`p[0] = '/etc'`, `.insert` /
+  `.append` / `.extend` / `.pop`, `del p[0]`, an alias `q = p`, a helper call `mutate(p)`,
+  `*p`) in this or an earlier cell makes the join dynamic and the sink fails closed
+  (`NBP-OPEN-DYNAMIC`, `NBP-PATH-WRITE-DYNAMIC`, `NBP-DBFS-DYNAMIC`, `NBP-FS-DYNAMIC`). (K)
+  Keyword-gated loaders fail closed when their switch is positional or hidden: `np.load(p,
+  None, True)`, `np.load(p, **kw)` / `*args`, `torch.load(.., pickle_module=..)` also with
+  `weights_only=True`, `torch.load(p, None, custom)`, `torch.load(p, weights_only=True, **kw)`,
+  `torch.serialization.add_safe_globals` / `safe_globals` / `clear_safe_globals`, and
+  `.load(p, **kw)` / three positionals on a receiver the gate cannot resolve (`np.load` with
+  the import out of view, `loader.load`); Spark reader chains and resolved modules
+  (`json.load(fh, **kw)`) are untouched. (L) The state of a gated module is read-only: item or
+  attribute assignment, `del`, `setattr`, `getattr(..)[k] =` and the registry methods `update`
+  / `setdefault` / `pop` / `popitem` / `clear` / `append` / `insert` / `extend` on a chain
+  rooted at a gated module (`yaml.SafeLoader.yaml_constructors['!x'] = h`, also through an
+  alias `L = yaml.SafeLoader`, `yaml.SafeLoader.yaml_constructors.update(..)`,
+  `yaml.safe_load = yaml.unsafe_load`, `operator.attrgetter = x`) are `NBP-DESERIALIZE` for
+  deserialiser modules and `NBP-POLICY-TAMPER` otherwise; `sys.path.insert` / `append` (the
+  migrator's own module mirror) and `torch` flag attributes outside `torch.serialization`
+  (`torch.backends.cudnn.benchmark = True`) stay allowed. (M) A plain `import mymod` no longer
+  vouches for the module's attributes: a process sink name on it (`mymod.system(..)`,
+  `mymod.popen(..)`, `helpers.fork()`) is `NBP-INDIRECT` like `obj.popen(..)`, with
+  `platform.system()` the documented stdlib homonym. (N) `_private` attributes of ANY imported
+  module (`mymod._run`, `np._core`, `from mymod import _helper`) are `NBP-INDIRECT`; a
+  `_private` segment makes a receiver opaque for the sink rule (`pd._libs.system`), and the
+  re-rooting rule keeps judging `tempfile._os` / `mymod._subprocess` / `glob.os` by the module
+  they name. (O) `site` (`addsitedir` executes `.pth` files), `pip`, `ensurepip`,
+  `sitecustomize` are code-load modules refused at import and as `site.addsitedir(..)` /
+  `pip.main(..)` chains (`NBP-BUILTIN-EXEC`, the `addPyFile` class; `sys.path.insert` is
+  deliberately not in it). (P) `<object>.open(path_var)` and `<object>.pipe(name)` are allowed
+  and recorded only when the receiver is a name the notebook bound (an import, an assignment,
+  a parameter, a loop / with target, in this or an earlier cell); a receiver the notebook
+  never bound (`thing.open(p)`, `cfg.fs.open(name)`, `thing.pipe(cmd)`) is refused
+  (`NBP-OPEN-DYNAMIC` / `NBP-OS-PROCESS`): the gate cannot tell it from the builtin or an RDD.
+  `open()` and its stdlib / pathlib twins with a dynamic path stay refused in every mode (no
+  read allowance). The ten gap cells are in the test suite verbatim with per-class refused and
+  allowed cells; the new tests fail against the d44b776 scanner, and the 146-cell / 31-cell
+  probe files are green.
 - Python 3.9 floor: `cluster_lifecycle.py` and `fuse_package_analyzer.py` used PEP 604
   `X | None` annotations evaluated at import time; `from __future__ import annotations` added.
 - **Secrets shim is Vault-only by default** (`engine/aidp_compat/secrets.py`,
