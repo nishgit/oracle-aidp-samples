@@ -55,12 +55,29 @@ Two pieces:
    ``spark.read.csv``, ``np.load``, ``sc.textFile``, ...) with a literal
    local-filesystem path outside the sandbox are refused like ``open()``.
 
-   Two scope decisions are allowed and recorded in the policy log instead of
+   Three scope decisions are allowed and recorded in the policy log instead of
    refused: a reader path the gate cannot resolve (``unverified_read_path``;
    reading source data through variables is the normal migration case, and
-   object-storage / catalog reads are never path-checked) and a ``spark.sql``
-   statement whose literal head is a read keyword (``unverified_sql_read``;
-   Spark runs one statement per call, so it cannot become a write).
+   object-storage / catalog reads are never path-checked; ``<object>.open(p)``
+   on a receiver that is neither the builtin nor a ``Path`` is recorded the
+   same way, while ``open(path_var)`` itself stays refused in every mode), a
+   ``spark.sql`` statement whose literal head is a read keyword
+   (``unverified_sql_read``; Spark runs one statement per call, so it cannot
+   become a write) and ``DataFrame.pipe(name)`` with a bare name the gate
+   cannot type on a non-Spark receiver (``unverified_pipe_callable``;
+   ``RDD.pipe(cmd)`` and a string-typed argument are refused).
+
+   Routes are closed as classes, not spellings: a gated module or Spark
+   object handed around as a value (``[os][0]``, ``run(os)``, ``return os``,
+   ``lambda: os``), a process sink name on a receiver the gate cannot resolve
+   (``helper().system``, ``obj.popen``), string-keyed accessors
+   (``operator.attrgetter`` / ``methodcaller``, ``functools.reduce(getattr)``,
+   ``inspect.getattr_static`` / ``getmembers``), re-rooting at a module named
+   mid-chain (``shutil.os.system``, ``pd.io.common.os.environ``), deny-by-default
+   deserialisers (the pickle family except the dump side, ``torch.load`` at
+   any depth, ``numpy`` ``allow_pickle``, every unsafe yaml loader /
+   constructor / hook / subclass), ``globals()[k]`` with a tainted key or a
+   dereferenced result, and ``open(*a, **kw)``.
 
 The gate is a static check of the forms listed in SUPPORTED_OPERATIONS.md
 section 8; it is not a Python sandbox, and a static gate over a full Python
@@ -135,7 +152,7 @@ ALL_RULES = (
 _PROCESS_MODULES = frozenset({
     "subprocess", "ctypes", "pty", "multiprocessing", "cffi", "signal", "resource",
     "webbrowser", "antigravity", "pexpect", "sh", "plumbum", "fabric", "invoke", "psutil",
-    "_posixsubprocess",
+    "_posixsubprocess", "pydoc",
 })
 _NETWORK_MODULES = frozenset({
     "socket", "requests", "urllib", "paramiko", "http.client",
@@ -155,6 +172,29 @@ _OS_ENV_ATTRS = frozenset({"environ", "getenv", "putenv", "unsetenv", "environb"
 _OS_PROCESS_ATTRS = frozenset({"system", "popen", "posix_spawn", "posix_spawnp", "startfile",
                                "fork", "forkpty", "kill", "killpg", "abort"})
 _OS_PROCESS_PREFIXES = ("exec", "spawn")
+# Process / environment / introspection sinks whose names have no benign
+# homonym in notebook code. On a receiver the gate cannot resolve (a call
+# result, a subscript, an unknown name) these are refused outright (fail
+# closed); ``load`` / ``remove`` / ``mkdir`` / ``open`` are deliberately NOT
+# here (``list.remove``, ``Path.mkdir``, ``loader.load`` are everyday code).
+_SINK_ATTRS = frozenset({
+    "system", "popen", "posix_spawn", "posix_spawnp", "startfile", "fork", "forkpty", "putenv", "unsetenv",
+    "execl", "execle", "execlp", "execlpe", "execv", "execve", "execvp", "execvpe",
+    "spawnl", "spawnle", "spawnlp", "spawnlpe", "spawnv", "spawnve", "spawnvp", "spawnvpe",
+    "pipepager", "tempfilepager", "getattr_static", "getmembers",
+})
+# Callees that may take a gated module / Spark object as an argument: the
+# call is judged (getattr / setattr / delattr / vars) or cannot hand the
+# object back (print, repr, type, isinstance, ...).
+_VALUE_SAFE_CALLEES = frozenset({"getattr", "setattr", "delattr", "hasattr", "vars", "dir", "isinstance",
+                                 "issubclass", "type", "id", "repr", "str", "print", "help", "callable",
+                                 "display"})
+# String-keyed attribute accessors: judged like getattr with a literal name.
+_ATTR_ACCESSOR_CALLS = frozenset({("operator", "attrgetter"), ("operator", "methodcaller")})
+_ATTR_RESOLVING_NAMES = frozenset({"getattr", "setattr", "delattr", "vars"})
+# RDD-producing steps: ``.pipe(cmd)`` on such a chain runs a shell command on the executors.
+_RDD_CHAIN_ATTRS = frozenset({"parallelize", "rdd", "emptyRDD", "textFile", "wholeTextFiles", "binaryFiles",
+                              "binaryRecords", "sequenceFile", "hadoopFile", "newAPIHadoopFile", "pickleFile"})
 # The platform modules ``os`` re-exports: ``posix.system`` is ``os.system``. An
 # import of either is tracked as an alias of ``os`` so every os rule applies.
 _OS_EQUIVALENT_MODULES = frozenset({"posix", "nt"})
@@ -182,16 +222,25 @@ _IO_MODULES = frozenset(m for m, _ in _IO_OPEN_CALLS)
 # Deserialisers that construct arbitrary objects (and therefore run code) from bytes.
 # The gate refuses the *load* side only; pickle.dump / safe_io.safe_pickle_dump stay allowed.
 _PICKLE_MODULES = frozenset({"pickle", "_pickle", "cPickle", "dill", "cloudpickle"})
-_PICKLE_LOAD_ATTRS = frozenset({"load", "loads", "Unpickler", "load_session", "load_module"})
+# The pickle family is deny-by-default: only the dump side is allowed.
+_PICKLE_DUMP_ALLOW = frozenset({"dump", "dumps", "Pickler", "HIGHEST_PROTOCOL", "DEFAULT_PROTOCOL",
+                                "PickleError", "PicklingError", "UnpicklingError", "PickleBuffer"})
 _DESERIALIZE_ATTRS = {
     "marshal": frozenset({"load", "loads"}),
-    "shelve": frozenset({"open", "Shelf", "DbfilenameShelf"}),
+    "shelve": frozenset({"open", "Shelf", "DbfilenameShelf", "BsdDbShelf"}),
     "joblib": frozenset({"load"}),
     "jsonpickle": frozenset({"decode", "loads"}),
-    "yaml": frozenset({"unsafe_load", "unsafe_load_all", "full_load", "full_load_all",
-                       "Loader", "UnsafeLoader", "FullLoader"}),
 }
-_DESERIALIZE_MODULES = _PICKLE_MODULES | frozenset(_DESERIALIZE_ATTRS) | frozenset({"torch"})
+# yaml: refused outright at any depth. ``load`` / ``load_all`` are judged at the
+# call (``Loader=`` must resolve to a safe loader; ``load_all`` is refused).
+_YAML_REFUSED_ATTRS = frozenset({"unsafe_load", "unsafe_load_all", "full_load", "full_load_all", "load_all",
+                                 "Loader", "UnsafeLoader", "FullLoader", "Constructor", "FullConstructor",
+                                 "UnsafeConstructor", "loader", "constructor", "add_constructor",
+                                 "add_multi_constructor"})
+_YAML_REFUSED_PREFIXES = ("Full", "Unsafe")
+# ``add_constructor`` on any receiver registers code that runs while parsing.
+_YAML_HOOK_ATTRS = frozenset({"add_constructor", "add_multi_constructor"})
+_DESERIALIZE_MODULES = _PICKLE_MODULES | frozenset(_DESERIALIZE_ATTRS) | frozenset({"torch", "yaml"})
 _YAML_SAFE_LOADERS = frozenset({"SafeLoader", "CSafeLoader", "BaseLoader", "CBaseLoader"})
 # Star imports that would bind the gated API under unqualified names the scanner cannot see.
 _STAR_IMPORT_REFUSED = frozenset({"sys", "shutil", "inspect", "types", "asyncio", "concurrent"}) \
@@ -291,7 +340,8 @@ _STR_PRESERVING_CALLS = frozenset({("textwrap", "dedent"), ("inspect", "cleandoc
 # Informational policy-log events (not refusals, not rule ids).
 NOTE_UNVERIFIED_READ_PATH = "unverified_read_path"      # library reader with a path the gate cannot resolve
 NOTE_UNVERIFIED_SQL_READ = "unverified_sql_read"        # spark.sql read statement with run-time fragments
-POLICY_NOTES = (NOTE_UNVERIFIED_READ_PATH, NOTE_UNVERIFIED_SQL_READ)
+NOTE_UNVERIFIED_PIPE = "unverified_pipe_callable"       # <non-Spark>.pipe(name) with a name the gate cannot type
+POLICY_NOTES = (NOTE_UNVERIFIED_READ_PATH, NOTE_UNVERIFIED_SQL_READ, NOTE_UNVERIFIED_PIPE)
 
 # Names whose attributes notebook code must not rebind or introspect: the
 # interpreter and the compat shims the sandbox is built from.
@@ -303,7 +353,28 @@ _PROTECTED_ROOTS = frozenset({"os", "sys", "builtins", "__builtins__", "importli
 # the gate cannot resolve, every later use of the name is refused (fail closed).
 _WATCHED_MODULES = _PROCESS_MODULES | _NETWORK_MODULES | _INDIRECT_MODULES | _EXEC_MODULES | _JVM_BRIDGE_MODULES \
     | _IPYTHON_MODULES | _IO_MODULES | _DESERIALIZE_MODULES | _PROTECTED_ROOTS | _OS_EQUIVALENT_MODULES \
-    | frozenset({"asyncio", "concurrent", "yaml", "aidp_compat"})
+    | frozenset({"asyncio", "concurrent", "yaml", "aidp_compat", "operator", "functools"})
+# A chain segment that names one of these after any root re-roots the chain
+# there (``shutil.os.system``, ``pd.io.common.os.environ``, ``self.spark._jvm``):
+# the module rules apply from that segment on. Modules whose names are common
+# attribute names with no module rules of their own (``signal``, ``code``,
+# ``trace``, ``profile``, ``resource``, ``types``, ...) are left out.
+_REROOT_NAMES = frozenset({
+    "os", "posix", "nt", "sys", "shutil", "subprocess", "importlib", "builtins", "__builtins__", "ctypes",
+    "socket", "asyncio", "operator", "inspect", "functools", "pydoc", "io", "pathlib", "gc", "marshal", "shelve",
+    "yaml", "torch", "aidp_compat", "dbutils", "get_ipython",
+}) | _PICKLE_MODULES | frozenset({"joblib", "jsonpickle"}) | (_SPARK_ROOTS - frozenset({"pyspark"}))
+# Process modules whose name is not a plausible variable name: an attribute
+# chain rooted there is refused even when the import is out of view.
+_PROCESS_ROOT_REFUSED = _PROCESS_MODULES - frozenset({"signal", "resource", "sh", "invoke", "fabric", "plumbum",
+                                                      "antigravity"})
+# Names that must not be handed around as a value (list / dict / tuple element,
+# argument, default, return value, lambda body, conditional, walrus, ...): a
+# gated module, a protected root or a Spark object. The tolerated positions
+# are the root of an attribute chain the gate judges, the whole right-hand
+# side of a plain name assignment (tainted) and the object argument of the
+# introspection builtins (judged).
+_VALUE_GUARDED = _WATCHED_MODULES | _SPARK_ROOTS | _PROTECTED_ROOTS
 # Single names that may be aliased (``sp = spark``, ``f = getattr``, ``b = __builtins__``)
 # and that taint the alias for the rest of the run.
 _ALIASABLE_SINGLETONS = _PROTECTED_ROOTS | _SPARK_ROOTS | _DANGEROUS_BUILTINS | _PY4J_NAMES | _IPYTHON_NAMES \
@@ -789,10 +860,20 @@ class ScanContext:
     constants: Dict[str, Optional[ast.AST]] = field(default_factory=dict)
     identities: Set[str] = field(default_factory=set)
     tainted: Set[str] = field(default_factory=set)
+    # Names bound by ``import m`` of a module the gate has no rules for
+    # (``platform``, ``numpy``): a receiver the gate counts as resolved.
+    imported: Set[str] = field(default_factory=set)
+    # Names bound by ``def`` in any cell (a callable ``.pipe()`` argument).
+    functions: Set[str] = field(default_factory=set)
+    # Names bound once to an RDD-producing chain (``rdd = sc.parallelize(..)``).
+    rdd_names: Set[str] = field(default_factory=set)
 
     def forget(self, name: str) -> None:
         self.aliases.pop(name, None)
         self.identities.discard(name)
+        self.imported.discard(name)
+        self.functions.discard(name)
+        self.rdd_names.discard(name)
         self.constants[name] = None
 
     def is_unresolved_taint(self, name: str) -> bool:
@@ -829,6 +910,12 @@ def _joined_literal_head(node: ast.AST) -> Optional[str]:
 
 def _is_stringish(node: ast.AST) -> bool:
     return _literal_str(node) is not None or _joined_literal_head(node) is not None
+
+
+def _is_str_sequence(node: ast.AST) -> bool:
+    """``["/etc", "passwd"]`` / ``("a", "b")``: a literal sequence of strings (``sep.join(parts)`` folds)."""
+    return isinstance(node, (ast.List, ast.Tuple)) and bool(node.elts) \
+        and all(_literal_str(e) is not None for e in node.elts)
 
 
 def _attr_chain(node: ast.AST) -> List[str]:
@@ -1060,6 +1147,14 @@ _REM_DESERIALIZE = ("Deserialising bytes with pickle / marshal / shelve / dill /
                     "SafeLoader or torch.load without weights_only=True executes code; use a data format "
                     "(parquet, json, yaml.safe_load, weights_only=True) or list NBP-DESERIALIZE in "
                     "AIDP_NOTEBOOK_POLICY_ALLOW after review.")
+_REM_VALUE = ("A gated module, interpreter root or Spark object may only be the root of an attribute chain, the "
+              "whole right-hand side of a plain name assignment or the object argument of getattr / setattr / "
+              "vars; handing it around as a value (list / dict element, argument, default, return value, lambda, "
+              "conditional, walrus, with-item, loop iterable) hides the chain from the gate and is refused.")
+_REM_SINK = ("A process / environment / introspection method name on an object the gate cannot resolve is "
+             "refused; call it on the module directly so the gate can judge it, or rename your own method.")
+_REM_PIPE = ("RDD.pipe(cmd) runs a shell command on the executors and is not available inside the sandbox; "
+             "DataFrame.pipe(func) is fine when the argument is a function, not a string.")
 
 
 class _PolicyScanner(ast.NodeVisitor):
@@ -1076,6 +1171,8 @@ class _PolicyScanner(ast.NodeVisitor):
         self._consumed: Set[int] = set()
         # Name nodes that are the callee of a direct call (``open(p)`` vs ``map(open, ps)``).
         self._call_funcs: Set[int] = set()
+        # Parent of every node in the cell (``prepare``), for position checks.
+        self._parents: Dict[int, ast.AST] = {}
 
     def _add(self, rule: str, node: ast.AST, detail: str, target: str = "", remediation: str = ""):
         lineno = getattr(node, "lineno", 0)
@@ -1123,11 +1220,16 @@ class _PolicyScanner(ast.NodeVisitor):
                     if isinstance(elt, ast.Name):
                         self.ctx.tainted.add(elt.id)
 
+        defined: Set[str] = set()
         for node in ast.walk(tree):
+            for child in ast.iter_child_nodes(node):
+                self._parents[id(child)] = node
             if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
                 bind(node.id)
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 bind(node.name)
+                if not isinstance(node, ast.ClassDef):
+                    defined.add(node.name)
             elif isinstance(node, ast.arg):
                 bind(node.arg)
             elif isinstance(node, ast.Import):
@@ -1155,6 +1257,7 @@ class _PolicyScanner(ast.NodeVisitor):
                 taint_assignment([node.target], node.value)
         for name in bound:
             self.ctx.forget(name)
+        self.ctx.functions.update(n for n in defined if bound.get(n, 0) == 1)
         for node in _module_level_statements(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
@@ -1162,6 +1265,8 @@ class _PolicyScanner(ast.NodeVisitor):
                     if bound.get(local, 0) != 1:
                         continue
                     chain = _import_chain(alias.name)
+                    if chain[0] not in _WATCHED_MODULES:
+                        self.ctx.imported.add(local)            # import platform / import pandas as pd
                     if alias.asname:
                         self.ctx.aliases[local] = chain
                     elif chain[0] != local:
@@ -1192,8 +1297,14 @@ class _PolicyScanner(ast.NodeVisitor):
                         # ``f = open`` is followed as an alias; the bare reference
                         # on the right-hand side is not also a loose builtin.
                         self._consumed.add(id(node.value))
-                elif _is_stringish(node.value) or self._path_ctor_arg(node.value) is not None:
+                elif _is_stringish(node.value) or self._path_ctor_arg(node.value) is not None \
+                        or _is_str_sequence(node.value) or self._fold_literal(node.value) is not None:
+                    # a literal, f-string / concat, Path("x"), ["a", "b"], "/".join([..]) or os.path.join(..)
                     self.ctx.constants[name] = node.value
+                if isinstance(node.value, ast.Call):
+                    vchain = self._chain(node.value.func)
+                    if vchain and (vchain[0] in _SPARK_ROOTS or any(p in _RDD_CHAIN_ATTRS for p in vchain)):
+                        self.ctx.rdd_names.add(name)         # rdd = sc.parallelize(..).map(..)
 
     def _resolve_value(self, node: Optional[ast.AST]) -> Optional[ast.AST]:
         """Follow a plain name to the string node it was bound to, if known."""
@@ -1202,13 +1313,15 @@ class _PolicyScanner(ast.NodeVisitor):
         return node
 
     def _resolve_literal(self, node: Optional[ast.AST]) -> Optional[str]:
+        """Literal text behind ``node``: a constant, a name bound once, ``Path("x")``,
+        ``"a" + "b"``, ``"/".join(["a", "b"])`` or ``os.path.join("a", "b")`` over literals."""
         node = self._resolve_value(node)
         if node is None:
             return None
         arg = self._path_ctor_arg(node)
         if arg is not None:
             node = self._resolve_value(arg)
-        return _literal_str(node)
+        return self._fold_literal(node)
 
     def _chain(self, node: ast.AST) -> List[str]:
         return self.ctx.resolve(_attr_chain(node))
@@ -1340,9 +1453,32 @@ class _PolicyScanner(ast.NodeVisitor):
             if root in _PROTECTED_ROOTS and part.startswith("_"):
                 target = ".".join(chain[:i + 1])
                 return RULE_POLICY_TAMPER, target, f"access to a private attribute of {root} ({target})", _REM_TAMPER
+            if root in _WATCHED_MODULES and part.startswith("_") and not _is_dunder(part):
+                # pickle._loads, torch.serialization._load, yaml._x: the unguarded twin of the public API.
+                target = ".".join(chain[:i + 1])
+                rule = RULE_DESERIALIZE if root in _DESERIALIZE_MODULES else RULE_INDIRECT
+                return rule, target, f"access to a private attribute of {root} ({target})", \
+                    _REM_DESERIALIZE if rule == RULE_DESERIALIZE else _REM_INDIRECT
+            if part in _YAML_HOOK_ATTRS:
+                target = ".".join(chain[:i + 1])
+                return RULE_DESERIALIZE, target, f"{target}() registers a constructor that runs while parsing", \
+                    _REM_DESERIALIZE
+            if part in ("Unpickler", "_Unpickler"):
+                target = ".".join(chain[:i + 1])
+                return RULE_DESERIALIZE, target, f"deserialisation via {target}", _REM_DESERIALIZE
+            reroot = part.lstrip("_") if not _is_dunder(part) else part
+            if reroot in _REROOT_NAMES and reroot != root and not (root in _SPARK_ROOTS and reroot in _SPARK_ROOTS):
+                # shutil.os.system / pd.io.common.os.environ / self.spark._jvm, and the private
+                # re-exports tempfile._os / random._os: the chain is re-rooted at the module it
+                # names and the module rules apply from there (pyspark.sql.SparkSession is
+                # already judged by the Spark rules).
+                return self._attr_rule([reroot] + list(chain[i + 1:]))
         # Module rules. One table for every entry point: a direct attribute
         # chain, an alias that stands for one (``from os import system``,
         # ``import posix as p``), ``getattr(mod, "literal")`` and an import.
+        if root in _PROCESS_ROOT_REFUSED:
+            target = f"{root}.{chain[1]}"
+            return RULE_OS_PROCESS, target, f"access to the process module attribute {target}", _REM_PROC
         if root == "os":
             if chain[1] in _OS_ENV_ATTRS:
                 return RULE_OS_ENVIRON, f"os.{chain[1]}", f"access to os.{chain[1]}", _REM_ENV
@@ -1389,14 +1525,20 @@ class _PolicyScanner(ast.NodeVisitor):
         if root == "asyncio" and chain[1] in _ASYNCIO_NETWORK_ATTRS and not self.policy.allow_network:
             return RULE_IMPORT_NETWORK, f"asyncio.{chain[1]}", f"network access via asyncio.{chain[1]}", \
                 self._import_remediation(RULE_IMPORT_NETWORK)
-        if root in _PICKLE_MODULES and chain[1] in _PICKLE_LOAD_ATTRS:
+        if root in _PICKLE_MODULES and chain[1] not in _PICKLE_DUMP_ALLOW:
+            # deny-by-default: everything but the dump side constructs objects from bytes
             return RULE_DESERIALIZE, f"{root}.{chain[1]}", f"deserialisation via {root}.{chain[1]}", _REM_DESERIALIZE
         if root in _DESERIALIZE_ATTRS and chain[1] in _DESERIALIZE_ATTRS[root]:
             return RULE_DESERIALIZE, f"{root}.{chain[1]}", f"deserialisation via {root}.{chain[1]}", _REM_DESERIALIZE
-        if root == "yaml" and chain[1] in ("load", "load_all"):
-            return RULE_DESERIALIZE, f"yaml.{chain[1]}", f"yaml.{chain[1]} without a safe Loader", _REM_DESERIALIZE
-        if root == "torch" and len(chain) == 2 and chain[1] == "load":
-            return RULE_DESERIALIZE, "torch.load", "torch.load without weights_only=True", _REM_DESERIALIZE
+        if root == "yaml" and (chain[1] in _YAML_REFUSED_ATTRS or chain[1].startswith(_YAML_REFUSED_PREFIXES)):
+            target = f"yaml.{chain[1]}"
+            return RULE_DESERIALIZE, target, f"{target} is an unsafe yaml loader / constructor entry point", \
+                _REM_DESERIALIZE
+        if root == "yaml" and chain[1] == "load":
+            return RULE_DESERIALIZE, "yaml.load", "yaml.load without a safe Loader", _REM_DESERIALIZE
+        if root == "torch" and "load" in chain[1:]:
+            target = ".".join(chain)
+            return RULE_DESERIALIZE, target, f"{target} without weights_only=True", _REM_DESERIALIZE
         if chain[-1] == "read_pickle":
             target = ".".join(chain)
             return RULE_DESERIALIZE, target, f"deserialisation via {target}", _REM_DESERIALIZE
@@ -1452,7 +1594,7 @@ class _PolicyScanner(ast.NodeVisitor):
             # ``from concurrent.futures import ProcessPoolExecutor``) is judged
             # as that chain at import time, by the same table as attribute access.
             for name in sorted(names - {"*"}):
-                if (mod, name) in (("yaml", "load"), ("yaml", "load_all"), ("torch", "load")):
+                if (mod, name) in (("yaml", "load"), ("torch", "load")):
                     continue  # judged at the call (Loader= / weights_only=)
                 if chain:
                     self._add_rule(node, self._attr_rule(chain + [name]))
@@ -1498,8 +1640,67 @@ class _PolicyScanner(ast.NodeVisitor):
             # Attribute on an expression the chain cannot name (``().__class__``,
             # ``x[0].__dict__``): the attribute itself is still judged.
             self._add_rule(node, self._attr_rule(["<expr>", node.attr]))
+            if not self._receiver_resolved(node):
+                self._check_sink_attr(node, "<expr>")
         else:
             self._add_rule(node, self._attr_rule(chain))
+            if not self._receiver_resolved(node):
+                self._check_sink_attr(node, ".".join(chain[:-1]))
+        self.generic_visit(node)
+
+    def _receiver_resolved(self, node: ast.Attribute) -> bool:
+        """True when the receiver of ``node`` is a plain name chain the gate knows:
+        a module it has rules for, an import / shim alias, an imported module or
+        a Spark root. Call results, subscripts and unknown names are not."""
+        chain = self._chain(node.value)      # calls skipped: spark.sparkContext.getConf().x is still spark's
+        if not chain:
+            if isinstance(node.value, ast.Subscript):
+                # sys.modules[k].x / __builtins__[k].x: the subscript itself is judged by the table
+                inner = self._chain(node.value.value)
+                return bool(inner) and inner[0] in _VALUE_GUARDED
+            return False                     # lambda / conditional / literal receiver
+        root = chain[0]
+        if root in _VALUE_GUARDED or root in _IPYTHON_NAMES or root in _PY4J_NAMES or root in _DATAFRAME_LIB_ROOTS:
+            return True                      # the rule table judges the chain
+        if _pure_chain(node.value) is None:
+            return False                     # call result on an unknown root: helper().system
+        return root in self.ctx.aliases or root in self.ctx.identities or root in self.ctx.imported
+
+    def _check_sink_attr(self, node: ast.Attribute, shown: str) -> None:
+        """A process / environment / introspection sink name on a receiver the
+        gate cannot resolve (``helper().system``, ``obj.popen``, ``x[0].fork``)
+        is refused: the receiver may be any of the gated modules."""
+        if node.attr in _SINK_ATTRS:
+            self._add(RULE_INDIRECT, node, f"{node.attr}() on a receiver the gate cannot resolve ({shown})",
+                      target=f"{shown}.{node.attr}", remediation=_REM_SINK)
+
+    def _value_position_ok(self, node: ast.Name) -> bool:
+        """Positions in which a gated module / Spark object may appear: the root
+        of an attribute chain, the callee of a call, the whole right-hand side of
+        a plain name assignment, an argument of an introspection / display
+        builtin, or a bare expression statement."""
+        parent = self._parents.get(id(node))
+        if parent is None or isinstance(parent, ast.Expr):
+            return True
+        if isinstance(parent, ast.Attribute):
+            return parent.value is node
+        if isinstance(parent, ast.Call):
+            return parent.func is node or self._call_name(parent.func) in _VALUE_SAFE_CALLEES \
+                or self._chain(parent.func) == ["inspect", "getattr_static"]      # judged like getattr
+        if isinstance(parent, ast.Assign):
+            return parent.value is node and all(isinstance(t, ast.Name) for t in parent.targets)
+        if isinstance(parent, ast.AnnAssign):
+            return parent.value is node and isinstance(parent.target, ast.Name)
+        return False
+
+    def visit_ClassDef(self, node: ast.ClassDef):
+        for base in node.bases:
+            chain = self._chain(base) if isinstance(base, (ast.Name, ast.Attribute)) else []
+            if chain and chain[0] == "yaml" and len(chain) >= 2 and (
+                    chain[-1].endswith(("Loader", "Constructor")) or chain[1] in ("loader", "constructor")):
+                self._add(RULE_DESERIALIZE, node, f"class {node.name} subclasses the yaml loader {'.'.join(chain)}; "
+                          "a subclass can register constructors that run while parsing",
+                          target=".".join(chain), remediation=_REM_DESERIALIZE)
         self.generic_visit(node)
 
     # -- assignments to module / shim attributes ------------------------
@@ -1585,6 +1786,22 @@ class _PolicyScanner(ast.NodeVisitor):
             elif root in _DANGEROUS_BUILTINS and id(node) not in self._call_funcs:
                 self._add(RULE_INDIRECT, node, f"builtin {root} referenced without being called directly",
                           target=root, remediation=_REM_INDIRECT)
+            if len(resolved) == 1 and root in _VALUE_GUARDED and root != "get_ipython" \
+                    and not self.ctx.is_unresolved_taint(name) and not self._value_position_ok(node):
+                # [os][0].system(..), run(os), (os if c else sys), {'a': os}['a'], return os,
+                # lambda: os, dict(m=os), for m in (os,), with os as m, f(m=os), (m := os), *[os]
+                self._add(RULE_INDIRECT, node, f"module / protected object '{root}' passed as a value",
+                          target=root, remediation=_REM_VALUE)
+        self.generic_visit(node)
+
+    def visit_Compare(self, node: ast.Compare):
+        # 'my_var' in globals(): a membership test on the frame namespace with a
+        # literal, non-protected key returns a bool and exposes nothing.
+        key = _literal_str(node.left)
+        if key is not None and len(node.comparators) == 1 and isinstance(node.ops[0], (ast.In, ast.NotIn)) \
+                and self._is_namespace_call(node.comparators[0]) and not _is_dunder(key) \
+                and key not in _VALUE_GUARDED and key not in _DANGEROUS_BUILTINS:
+            self._consume(self._route_nodes(node.comparators[0]))
         self.generic_visit(node)
 
     def visit_Subscript(self, node: ast.Subscript):
@@ -1599,9 +1816,15 @@ class _PolicyScanner(ast.NodeVisitor):
                 self._consume(self._route_nodes(node.value))
             elif self._is_namespace_call(node.value):
                 key = _literal_str(node.slice)
-                if key is not None and not _is_dunder(key) and key not in _PROTECTED_ROOTS \
-                        and key not in _SPARK_ROOTS and key not in _DANGEROUS_BUILTINS:
-                    # globals()["my_var"]: the one tolerated use of the frame namespace.
+                parent = self._parents.get(id(node))
+                dereferenced = (isinstance(parent, (ast.Attribute, ast.Subscript)) and parent.value is node) \
+                    or (isinstance(parent, ast.Call) and parent.func is node)
+                if key is not None and not _is_dunder(key) and key not in _VALUE_GUARDED \
+                        and key not in _DANGEROUS_BUILTINS and key not in self.ctx.tainted \
+                        and key not in self.ctx.aliases and key not in self.ctx.identities and not dereferenced:
+                    # globals()["my_var"]: the one tolerated use of the frame namespace, a plain
+                    # read of a literal key that is not a protected / tainted / alias name and
+                    # whose result is not dereferenced (globals()["o"].x is unresolvable: refused).
                     self._consume(self._route_nodes(node.value))
         self.generic_visit(node)
 
@@ -1670,6 +1893,17 @@ class _PolicyScanner(ast.NodeVisitor):
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
             left, right = self._fold_literal(node.left), self._fold_literal(node.right)
             return None if left is None or right is None else left + right
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr == "join" and len(node.args) == 1 and not node.keywords:
+                # "/".join(["/etc", "passwd"]) / "/".join(parts) with parts bound once to a literal list
+                sep = self._fold_literal(node.func.value)
+                seq = self._resolve_value(node.args[0])
+                if sep is not None and seq is not None and _is_str_sequence(seq):
+                    return sep.join(_literal_str(e) for e in seq.elts)
+            elif self._chain(node.func) == ["os", "path", "join"] and node.args and not node.keywords:
+                parts = [self._fold_literal(a) for a in node.args]
+                if all(p is not None for p in parts):
+                    return posixpath.join(*parts)
         return _literal_str(node)
 
     def _resolve_template(self, node: Optional[ast.AST]) -> Optional[str]:
@@ -1730,10 +1964,51 @@ class _PolicyScanner(ast.NodeVisitor):
             self._add_rule(node, self._attr_rule(chain))
             self._consume_base(node.func)
             return
+        if attr == "pipe":
+            self._check_pipe(node, chain)
+        if len(chain) == 2 and tuple(chain) in _ATTR_ACCESSOR_CALLS:
+            self._check_attr_accessor(node, chain)
+            return
+        if chain == ["functools", "reduce"] and node.args:
+            fn = node.args[0]
+            fn_name = self._call_name(fn) if isinstance(fn, ast.Name) else None
+            fn_chain = tuple(self._chain(fn)) if isinstance(fn, (ast.Attribute, ast.Name)) else ()
+            if fn_name in _ATTR_RESOLVING_NAMES or fn_chain in _ATTR_ACCESSOR_CALLS:
+                self._add(RULE_INDIRECT, node, "functools.reduce() with an attribute-resolving function walks a "
+                          "dotted path the gate cannot see", target="functools.reduce(getattr, ...)",
+                          remediation=_REM_INDIRECT)
+                return
+        if chain[:1] == ["inspect"] and attr == "getattr_static":
+            self._check_introspection(node, "getattr")
+            self._consume_base(node.func)
+            return
+        if chain[:1] == ["inspect"] and attr == "getmembers":
+            self._add(RULE_INDIRECT, node, "inspect.getmembers() enumerates every attribute of an object, "
+                      "private and dunder names included", target="inspect.getmembers", remediation=_REM_INDIRECT)
+            return
+        for k in node.keywords:
+            # numpy / torch loader switches, keyed on the keyword so the receiver does not matter
+            if k.arg == "allow_pickle" and not (isinstance(k.value, ast.Constant) and k.value.value is False):
+                literal_true = isinstance(k.value, ast.Constant) and k.value.value is True
+                self._add(RULE_DESERIALIZE, node, f"{'.'.join(chain)}(allow_pickle=...) not the literal False",
+                          target="numpy.load(allow_pickle=True)" if literal_true
+                          else f"{'.'.join(chain)}(allow_pickle=<dynamic>)", remediation=_REM_DESERIALIZE)
+                return
+            if k.arg == "weights_only" and attr == "load" \
+                    and not (isinstance(k.value, ast.Constant) and k.value.value is True):
+                self._add(RULE_DESERIALIZE, node, f"{'.'.join(chain)}(weights_only=...) not the literal True",
+                          target=".".join(chain), remediation=_REM_DESERIALIZE)
+                return
         if len(chain) == 2 and (chain[0], attr) in _IO_OPEN_CALLS:
+            call_name = f"{chain[0]}.{attr}()"
+            if (chain[0], attr) in (("io", "open"), ("codecs", "open")):
+                self._check_open(node, call_name)       # mode-aware, like builtin open()
+                return
+            if self._refuse_splat(node, call_name):
+                return
             arg = _first_arg(node, ("file", "filename", "name", "path", "database", "files"))
             if arg is not None:
-                self._check_io_target(node, arg, f"{chain[0]}.{attr}()")
+                self._check_io_target(node, arg, call_name)
             return
         reader = self._reader_call_name(chain, attr)
         if reader is not None:
@@ -1773,7 +2048,110 @@ class _PolicyScanner(ast.NodeVisitor):
         elif chain[:1] == ["shutil"] and attr in _SHUTIL_FS_ATTRS:
             self._check_fs_call(node, f"shutil.{attr}", two_arg=True, dst_only=attr != "move")
         elif attr in _PATHLIB_IO_ATTRS or attr in _PATHLIB_FS_ATTRS or attr in _PATHLIB_RESOLVED_ONLY_ATTRS:
-            self._check_pathlib(node, attr)
+            handled = self._check_pathlib(node, attr)
+            if not handled and attr == "open" and chain[0] not in _WATCHED_MODULES:
+                # <anything>.open(path): a literal local path is checked, a dynamic one recorded
+                self._check_receiver_open(node, chain)
+
+    def _refuse_splat(self, node: ast.Call, call_name: str) -> bool:
+        """``open(*args)`` / ``open(**kw)``: path and mode are invisible; refused (fail closed)."""
+        if any(isinstance(a, ast.Starred) for a in node.args) or any(k.arg is None for k in node.keywords):
+            self._add(RULE_OPEN_DYNAMIC, node, f"{call_name} with *args / **kwargs hides the path and mode",
+                      target="<dynamic>", remediation="Pass the path (and mode) as plain arguments the gate can see.")
+            return True
+        return False
+
+    def _is_string_typed(self, node: ast.AST) -> bool:
+        """A string-valued argument: literal, f-string, concatenation / ``%`` with a literal,
+        ``.format(..)`` / ``.join(..)`` result, or a name bound once to one of these."""
+        node = self._resolve_value(node)
+        if node is None:
+            return False
+        if _is_stringish(node):
+            return True
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in ("format", "join"):
+            return True
+        return isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod) and _is_stringish(node.left)
+
+    def _check_pipe(self, node: ast.Call, chain: List[str]) -> None:
+        """``.pipe(cmd)`` on an RDD runs ``cmd`` in a shell on every executor.
+
+        Refused when the receiver chain is rooted at a Spark object or passes
+        through an RDD-producing step (``parallelize``, ``textFile``, ``.rdd``,
+        a name bound to one), or when the argument is string-typed on any
+        receiver. A callable-looking argument (lambda, a ``def`` in the run, an
+        attribute chain) on a non-Spark receiver is ``DataFrame.pipe(func)``.
+        Residual: a bare name the gate cannot type on an unknown receiver is
+        allowed and recorded (``unverified_pipe_callable``).
+        """
+        shown = ".".join(chain)
+        arg = _first_arg(node, ("command", "func"))
+        if arg is None:
+            return
+        spark_receiver = chain[0] in _SPARK_ROOTS or chain[0] in self.ctx.rdd_names or "sparkContext" in chain \
+            or any(part in _RDD_CHAIN_ATTRS for part in chain[:-1])
+        if spark_receiver or self._is_string_typed(arg):
+            self._add(RULE_OS_PROCESS, node, f"{shown}() pipes data through a shell command on the executors",
+                      target=f"{shown}()", remediation=_REM_PIPE)
+            return
+        if isinstance(arg, ast.Name) and arg.id not in self.ctx.functions and arg.id not in self.ctx.aliases:
+            self._note(NOTE_UNVERIFIED_PIPE, node,
+                       f"{shown}({arg.id}) with an argument the gate cannot type; allowed as DataFrame.pipe(func) "
+                       "and unverified", target=f"{shown}({arg.id})")
+
+    def _check_attr_accessor(self, node: ast.Call, chain: List[str]) -> None:
+        """``operator.attrgetter("a.b")`` / ``operator.methodcaller("name", ..)``:
+        judged like ``getattr`` with a literal name. A non-literal name is
+        refused; every dotted segment of a literal one is run through the
+        dunder / frame / private / JVM-bridge / sink rules. The object the
+        getter is applied to is judged where it appears (a gated module or
+        Spark object handed to the getter is a value, refused there)."""
+        shown = ".".join(chain)
+        names = node.args if chain[1] == "attrgetter" else node.args[:1]
+        if not names:
+            return
+        for name_node in names:
+            lit = _literal_str(name_node)
+            if lit is None:
+                self._add(RULE_INDIRECT, node, f"{shown}() with an attribute name that is not a literal",
+                          target=f"{shown}(<dynamic>)", remediation=_REM_INDIRECT)
+                return
+            for seg in lit.split("."):
+                if self._add_rule(node, self._attr_rule(["<expr>", seg])):
+                    return
+                if seg in _SINK_ATTRS or (seg.startswith("_") and not _is_dunder(seg)):
+                    self._add(RULE_INDIRECT, node, f"{shown}({lit!r}) reaches a process sink / private attribute",
+                              target=f"{shown}({lit!r})", remediation=_REM_INDIRECT)
+                    return
+
+    def _check_receiver_open(self, node: ast.Call, chain: List[str]) -> None:
+        """``<receiver>.open(path, ..)`` on a receiver that is not a Path / stdlib
+        module: a literal local path outside the sandbox is refused, a dynamic
+        one is allowed and recorded (object-store filesystems, zip members)."""
+        shown = ".".join(chain)
+        if self._refuse_splat(node, f"{shown}()"):
+            return
+        arg = _first_arg(node, ("file", "path", "name"))
+        if arg is None:
+            return
+        lit = self._resolve_literal(arg)
+        if lit is not None:
+            if _is_local_path(lit) and not self.policy.path_in_sandbox(_local_path_for_check(lit)):
+                self._add(RULE_OPEN_PATH, node, f"{shown}() on a local path outside the sandbox prefix", target=lit,
+                          remediation=_REM_READ_PATH)
+            return
+        head = self._literal_head(arg)
+        if head and _is_local_path(head) and not self.policy.path_in_sandbox(_local_path_for_check(head)):
+            self._add(RULE_OPEN_PATH, node, f"{shown}() on a path under a local prefix outside the sandbox",
+                      target=head, remediation=_REM_READ_PATH)
+            return
+        self._note(NOTE_UNVERIFIED_READ_PATH, node,
+                   f"{shown}() with a path that cannot be resolved statically; the open is allowed and unverified "
+                   "(the cluster's IAM scope is the control)", target=f"{shown}(<dynamic>)")
+
+    def _literal_head(self, arg: ast.AST) -> Optional[str]:
+        resolved = self._resolve_value(arg)
+        return _joined_literal_head(resolved) if resolved is not None else None
 
     def _check_introspection(self, node: ast.Call, builtin: str) -> None:
         arg = node.args[0] if node.args else None
@@ -1789,7 +2167,10 @@ class _PolicyScanner(ast.NodeVisitor):
         # no legitimate reflective use in a notebook: refused whatever the name.
         spark_obj = bool(chain) and chain[0] in _SPARK_ROOTS
         spark_refused = spark_obj and (mutate or builtin == "vars" or name is None or name.startswith("_"))
-        protected = self._is_protected_root(chain) and not spark_obj
+        # vars(<any gated module>) dumps its namespace: refused. getattr(<gated module>, "literal")
+        # is judged by the rule table below (getattr(pickle, "loads") is pickle.loads).
+        protected = (self._is_protected_root(chain)
+                     or (builtin == "vars" and bool(chain) and chain[0] in _WATCHED_MODULES)) and not spark_obj
         if protected or spark_refused or self._is_builtins_namespace(arg):
             rule = RULE_POLICY_TAMPER if mutate else RULE_INDIRECT
             shown = ".".join(chain) if chain else "__builtins__"
@@ -1818,40 +2199,56 @@ class _PolicyScanner(ast.NodeVisitor):
         Returns True when the call was judged here (safe or refused).
         """
         root = chain[0]
-        if root == "yaml" and attr in ("load", "load_all") and len(chain) == 2:
+        if root == "yaml" and attr == "load" and len(chain) == 2:
+            # Safe only when the Loader resolves, through aliases and from-imports, to
+            # exactly yaml.SafeLoader / CSafeLoader / BaseLoader / CBaseLoader. A bare
+            # name the gate cannot resolve (``from yaml import Loader as SafeLoader``
+            # resolves to yaml.Loader) is not safe. ``load_all`` is refused outright.
             loader = node.args[1] if len(node.args) >= 2 else None
             for k in node.keywords:
                 if k.arg == "Loader":
                     loader = k.value
             lchain = self._chain(loader) if isinstance(loader, (ast.Name, ast.Attribute)) else []
-            if lchain and lchain[-1] in _YAML_SAFE_LOADERS:
+            if len(lchain) == 2 and lchain[0] == "yaml" and lchain[1] in _YAML_SAFE_LOADERS:
                 self._consumed.add(id(node.func))
             else:
-                self._add(RULE_DESERIALIZE, node, f"yaml.{attr}() without a safe Loader", target=f"yaml.{attr}",
+                self._add(RULE_DESERIALIZE, node, "yaml.load() without a safe Loader", target="yaml.load",
                           remediation=_REM_DESERIALIZE)
                 self._consumed.add(id(node.func))
             return True
-        if root == "torch" and attr == "load" and len(chain) == 2:
+        if root == "torch" and attr == "load":
+            # torch.load / torch.serialization.load / torch.jit.load: any depth under torch
+            target = ".".join(chain)
             safe = any(k.arg == "weights_only" and isinstance(k.value, ast.Constant) and k.value.value is True
                        for k in node.keywords)
             if not safe:
-                self._add(RULE_DESERIALIZE, node, "torch.load() without weights_only=True", target="torch.load",
+                self._add(RULE_DESERIALIZE, node, f"{target}() without weights_only=True", target=target,
                           remediation=_REM_DESERIALIZE)
             self._consumed.add(id(node.func))
             return True
         if root == "numpy" and attr == "load" and len(chain) == 2:
-            if any(k.arg == "allow_pickle" and isinstance(k.value, ast.Constant) and k.value.value is True
-                   for k in node.keywords):
-                self._add(RULE_DESERIALIZE, node, "numpy.load() with allow_pickle=True",
-                          target="numpy.load(allow_pickle=True)", remediation=_REM_DESERIALIZE)
+            # allow_pickle must be absent or the literal False (the generic keyword
+            # rule in _check_attribute_call has already refused every other value)
             return True
         return False
 
-    def _check_open(self, node: ast.Call):
+    def _check_open(self, node: ast.Call, call_name: str = "open()"):
+        """``open(file, ..)`` and its twins ``io.open`` / ``codecs.open``.
+
+        ``*args`` / ``**kwargs`` are refused (the path is invisible). A literal
+        or foldable path (``"a" + "b"``, ``"/".join([..])``, ``os.path.join(..)``,
+        a name bound once) is checked against the sandbox, the literal head of
+        an f-string / concatenation is checked as a directory, and a path the
+        gate cannot resolve is refused in every mode (``NBP-OPEN-DYNAMIC``): a
+        read of an arbitrary local file leaves the sandbox as much as a write,
+        and the library-reader scope decision does not extend to ``open()``.
+        """
+        if self._refuse_splat(node, call_name):
+            return
         arg = _first_arg(node, ("file",))
         if arg is None:
             return
-        self._check_io_target(node, arg, "open()")
+        self._check_io_target(node, arg, call_name)
 
     # -- library readers: local path literals ------------------------------
     @staticmethod
@@ -1908,37 +2305,49 @@ class _PolicyScanner(ast.NodeVisitor):
                           remediation=f"Read/write under the sandbox prefix {self.policy.prefix} "
                                       "or use a relative path.")
             return
+        head = self._literal_head(arg)
+        if head and _is_local_path(head) and not self.policy.path_in_sandbox(_local_path_for_check(head)):
+            # open(f"/etc/{name}") / open("/Volumes/prod/" + x): the literal head fixes the directory
+            self._add(RULE_OPEN_PATH, node, f"{call_name} on a path under a local prefix outside the sandbox",
+                      target=head,
+                      remediation=f"Read/write under the sandbox prefix {self.policy.prefix} "
+                                  "or use a relative path.")
+            return
         self._add(RULE_OPEN_DYNAMIC, node, f"{call_name} with a path that cannot be resolved statically",
                   target="<dynamic>",
                   remediation="Use a literal sandbox path (or a name bound once to one), or list "
                               "NBP-OPEN-DYNAMIC in AIDP_NOTEBOOK_POLICY_ALLOW after review.")
 
-    def _check_pathlib(self, node: ast.Call, attr: str) -> None:
+    def _check_pathlib(self, node: ast.Call, attr: str) -> bool:
+        """Returns True when the call was judged as a ``pathlib`` operation."""
         receiver = node.func.value if isinstance(node.func, ast.Attribute) else None
         if receiver is None:
-            return
+            return False
         path_arg = self._path_ctor_arg(receiver)
         if path_arg is None and isinstance(receiver, ast.Name):
             bound = self.ctx.constants.get(receiver.id)
             path_arg = self._path_ctor_arg(bound) if bound is not None else None
         resolved_receiver = path_arg is not None
         if attr in _PATHLIB_RESOLVED_ONLY_ATTRS and not resolved_receiver:
-            return  # str.replace / df.rename / zipfile.open ... not a path operation
+            return False  # str.replace / df.rename / zipfile.open ... not a path operation
         call_name = f"Path.{attr}()"
         if attr in _PATHLIB_IO_ATTRS or attr == "open":
             if resolved_receiver:
+                if self._refuse_splat(node, call_name):
+                    return True
                 self._check_io_target(node, path_arg, call_name)
             else:
                 self._add(RULE_OPEN_DYNAMIC, node, f"{call_name} on a path that cannot be resolved statically",
                           target="<dynamic>",
                           remediation="Build the Path from a literal sandbox path, or list NBP-OPEN-DYNAMIC "
                                       "in AIDP_NOTEBOOK_POLICY_ALLOW after review.")
-            return
+            return True
         targets: List[Optional[ast.AST]] = [path_arg]
         if attr in ("rename", "replace", "symlink_to", "hardlink_to") and node.args:
             targets.append(node.args[0])
         for t in targets:
             self._check_fs_target(node, t, call_name)
+        return True
 
     def _check_fs_call(self, node: ast.Call, call_name: str, two_arg: bool = False, dst_only: bool = False) -> None:
         args = list(node.args)

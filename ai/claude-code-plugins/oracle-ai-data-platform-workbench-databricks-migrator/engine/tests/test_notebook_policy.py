@@ -393,7 +393,7 @@ def test_clean_notebook_runs_and_returns_exit_value(tmp_path, sandbox_env):
 def test_allowlisted_rule_is_logged_as_exception_and_executes(tmp_path, sandbox_env, monkeypatch):
     monkeypatch.setenv("AIDP_NOTEBOOK_POLICY_ALLOW", "NBP-TABLE-DYNAMIC")
     path = write_notebook(tmp_path, "child", [
-        "TARGET = ''.join(['sbx', '.t'])",      # not statically resolvable -> needs the exception
+        "TARGET = ''.join(['sbx', '.t']).strip()",      # a call the gate does not fold -> needs the exception
         "df.write.saveAsTable(TARGET)",
     ])
     globals()["df"] = _FakeDF()
@@ -1448,3 +1448,373 @@ def test_verified_reads_are_not_recorded(sandbox_env):
     npol.enforce_cell_policy("x = spark.read.parquet('oci://b@ns/prod/in')\ny = spark.sql('SELECT 1')",
                              notebook_path="nb", cell_index=0)
     assert [e for e in npol.get_policy_log() if e["event"] in npol.POLICY_NOTES] == []
+
+
+# (11) Review-derived gap classes (automated review of the round-2 commits plus
+#      a probe run against edcb186), each closed as a CLASS of route:
+#      A  a gated module / Spark object handed around as a value;
+#      B  a process / introspection sink name on a receiver the gate cannot resolve;
+#      C  RDD.pipe(cmd) and string-typed .pipe() arguments;
+#      D  string-keyed attribute accessors (attrgetter / methodcaller / reduce(getattr) /
+#         inspect.getattr_static / getmembers);
+#      E  re-rooting at a module named mid-chain (shutil.os, pd.io.common.os, self.spark);
+#      F  deserialisers: pickle deny-by-default, private attributes of gated modules,
+#         torch.load at any depth, numpy allow_pickle, yaml loaders / constructors / hooks;
+#      G  globals()[k] with a tainted / alias / protected key or a dereferenced result;
+#      H  open() with *args / **kwargs; I  pydoc joins the process modules.
+#      The 100 probe cells below are the acceptance test, verbatim, with the first
+#      refusal the runner reports; every entry passed the gate at edcb186 or was
+#      refused for the wrong reason there.
+REVIEW_GAP_CELLS = [
+    ("f = os\nf.system('id')", 'NBP-OS-PROCESS', 'os.system'),
+    ("[os][0].system('id')", 'NBP-INDIRECT', '<expr>.system'),
+    ("(os if True else sys).system('id')", 'NBP-INDIRECT', '<expr>.system'),
+    ("def run(m):\n    m.system('id')\nrun(os)", 'NBP-INDIRECT', 'm.system'),
+    ("m = {'a': os}['a']\nm.system('id')", 'NBP-INDIRECT', 'os'),
+    ("def get():\n    return os\nget().system('id')", 'NBP-INDIRECT', 'os'),
+    ("(lambda: os)().system('id')", 'NBP-INDIRECT', '<expr>.system'),
+    ("import os as _o\nd = dict(m=_o)\nd['m'].system('id')", 'NBP-INDIRECT', 'os'),
+    ("for m in (os,):\n    m.system('id')", 'NBP-INDIRECT', 'os'),
+    ("mods = [os]\nmods[0].popen('id')", 'NBP-INDIRECT', 'os'),
+    ("helper().system('id')", 'NBP-INDIRECT', 'helper.system'),
+    ("obj.popen('id')", 'NBP-INDIRECT', 'obj.popen'),
+    ("thing.open('/etc/passwd').read()", 'NBP-OPEN-PATH', '/etc/passwd'),
+    ('pickle._loads(b)', 'NBP-DESERIALIZE', 'pickle._loads'),
+    ('pickle._load(f)', 'NBP-DESERIALIZE', 'pickle._load'),
+    ('pickle._Unpickler(f).load()', 'NBP-DESERIALIZE', 'pickle._Unpickler'),
+    ('pickle.Unpickler(f).load()', 'NBP-DESERIALIZE', 'pickle.Unpickler'),
+    ('import yaml\nL = yaml.Loader\nyaml.load(s, Loader=L)', 'NBP-DESERIALIZE', 'yaml.Loader'),
+    ("yaml.load(s, Loader=getattr(yaml, 'Loader'))", 'NBP-DESERIALIZE', 'yaml.load'),
+    ('yaml.load(s, yaml.UnsafeLoader)', 'NBP-DESERIALIZE', 'yaml.load'),
+    ('yaml.full_load(s)', 'NBP-DESERIALIZE', 'yaml.full_load'),
+    ('yaml.unsafe_load(s)', 'NBP-DESERIALIZE', 'yaml.unsafe_load'),
+    ('yaml.load_all(s)', 'NBP-DESERIALIZE', 'yaml.load_all'),
+    ('yaml.full_load_all(s)', 'NBP-DESERIALIZE', 'yaml.full_load_all'),
+    ('torch.load(p)', 'NBP-DESERIALIZE', 'torch.load'),
+    ('torch.load(p, weights_only=flag)', 'NBP-DESERIALIZE', 'torch.load'),
+    ('torch.serialization.load(p)', 'NBP-DESERIALIZE', 'torch.serialization.load'),
+    ('torch.jit.load(p)', 'NBP-DESERIALIZE', 'torch.jit.load'),
+    ('np.load(p, allow_pickle=flag)', 'NBP-DESERIALIZE', 'np.load(allow_pickle=<dynamic>)'),
+    ('np.load(p, allow_pickle=not False)', 'NBP-DESERIALIZE', 'np.load(allow_pickle=<dynamic>)'),
+    ('marshal.loads(b)', 'NBP-DESERIALIZE', 'marshal.loads'),
+    ('shelve.open(p)', 'NBP-DESERIALIZE', 'shelve.open'),
+    ('dill.loads(b)', 'NBP-DESERIALIZE', 'dill.loads'),
+    ('cloudpickle.loads(b)', 'NBP-DESERIALIZE', 'cloudpickle.loads'),
+    ('jsonpickle.decode(s)', 'NBP-DESERIALIZE', 'jsonpickle.decode'),
+    ('pd.read_pickle(p)', 'NBP-DESERIALIZE', 'pd.read_pickle'),
+    ('joblib.load(p)', 'NBP-DESERIALIZE', 'joblib.load'),
+    ("sc.parallelize(['x']).pipe('id').collect()", 'NBP-OS-PROCESS', 'sc.parallelize.pipe()'),
+    ("rdd.pipe('id')", 'NBP-OS-PROCESS', 'rdd.pipe()'),
+    ("spark.sparkContext.textFile('/tmp/x').pipe('id')", 'NBP-OPEN-PATH', '/tmp/x'),
+    ("import pydoc\npydoc.pipepager('x', 'id')", 'NBP-IMPORT-PROCESS', 'pydoc'),
+    ("pydoc.tempfilepager('x', 'id')", 'NBP-OS-PROCESS', 'pydoc.tempfilepager'),
+    ("pydoc.pager('x')", 'NBP-OS-PROCESS', 'pydoc.pager'),
+    ("o = os\nglobals()['o'].system('id')", 'NBP-INDIRECT', '<expr>.system'),
+    ("s = spark\nglobals()['s']._jvm", 'NBP-INDIRECT', 'globals()'),
+    ("import importlib as il\nglobals()['il'].import_module('os').system('id')", 'NBP-INDIRECT', 'importlib'),
+    ("b = __builtins__\nglobals()['b']['open']('/etc/passwd')", 'NBP-INDIRECT', 'globals()'),
+    ('from yaml import Loader\nyaml.load(s, Loader)', 'NBP-DESERIALIZE', 'yaml.Loader'),
+    ('from yaml import Loader as SafeLoader\nyaml.load(s, Loader=SafeLoader)', 'NBP-DESERIALIZE', 'yaml.Loader'),
+    ('yaml.load(s, Loader=yaml.loader.Loader)', 'NBP-DESERIALIZE', 'yaml.load'),
+    ('yaml.load(s, Loader=yaml.loader.UnsafeLoader)', 'NBP-DESERIALIZE', 'yaml.load'),
+    ("class L(yaml.SafeLoader):\n    pass\nL.add_constructor('!x', lambda l, n: __import__('os').system('id'))\n"
+     "yaml.load(s, Loader=L)", 'NBP-DESERIALIZE', 'yaml.SafeLoader'),
+    ('class C(yaml.constructor.UnsafeConstructor):\n    pass', 'NBP-DESERIALIZE', 'yaml.constructor.UnsafeConstructor'),
+    ('yaml.constructor.FullConstructor', 'NBP-DESERIALIZE', 'yaml.constructor'),
+    ("getattr(pickle, 'loads')(b)", 'NBP-DESERIALIZE', 'pickle.loads'),
+    ('torch.serialization._load(p)', 'NBP-DESERIALIZE', 'torch.serialization._load'),
+    ("import operator\noperator.attrgetter('_jvm')(spark).java.lang.Runtime.getRuntime().exec('id')",
+     'NBP-INDIRECT', 'spark'),
+    ("operator.attrgetter('__class__.__base__.__subclasses__')(())()", 'NBP-DUNDER-ESCAPE', '<expr>.__base__'),
+    ("operator.methodcaller('system', 'id')(os)", 'NBP-INDIRECT', "operator.methodcaller('system')"),
+    ("from operator import attrgetter\nattrgetter('system')(os)('id')", 'NBP-INDIRECT', "operator.attrgetter('system')"),
+    ("ag = operator.attrgetter\nag('_gateway')(sc)", 'NBP-INDIRECT', 'sc'),
+    ("import shutil\nshutil.os.system('id')", 'NBP-OS-PROCESS', 'os.system'),
+    ("import subprocess\nsubprocess.os.system('id')", 'NBP-IMPORT-PROCESS', 'subprocess'),
+    ("import pathlib\npathlib.os.system('id')", 'NBP-OS-PROCESS', 'os.system'),
+    ("import pandas as pd\npd.io.common.os.system('id')", 'NBP-OS-PROCESS', 'os.system'),
+    ("import numpy\nnumpy.os.system('id')", 'NBP-OS-PROCESS', 'os.system'),
+    ("vars(os)['system']('id')", 'NBP-INDIRECT', 'os'),
+    ("vars(shutil)['os'].system('id')", 'NBP-INDIRECT', '<expr>.system'),
+    ("kw = {'file': '/etc/passwd'}\nopen(**kw).read()", 'NBP-OPEN-DYNAMIC', '<dynamic>'),
+    ("args = ['/etc/passwd']\nopen(*args).read()", 'NBP-OPEN-DYNAMIC', '<dynamic>'),
+    ('io.open(**kw)', 'NBP-OPEN-DYNAMIC', '<dynamic>'),
+    ("for m in [os]:\n    m.system('id')", 'NBP-INDIRECT', 'os'),
+    ("with os as m:\n    m.system('id')", 'NBP-INDIRECT', 'os'),
+    ("[m.system('id') for m in (os,)]", 'NBP-INDIRECT', 'm.system'),
+    ("def f(m=os):\n    m.system('id')\nf()", 'NBP-INDIRECT', 'os'),
+    ("(m := os).system('id')", 'NBP-INDIRECT', '<expr>.system'),
+    ("import functools\nfunctools.reduce(getattr, ['_jvm', 'java', 'lang', 'Runtime'], spark).getRuntime().exec('id')",
+     'NBP-INDIRECT', 'functools.reduce(getattr, ...)'),
+    ("import inspect\ninspect.getattr_static(spark, '_jvm')", 'NBP-INDIRECT', 'spark'),
+    ("dict(inspect.getmembers(spark))['_jvm']", 'NBP-INDIRECT', 'inspect.getmembers'),
+    ('inspect.getmembers(os)', 'NBP-INDIRECT', 'inspect.getmembers'),
+    ("open(p, 'w').write(data)", 'NBP-OPEN-DYNAMIC', '<dynamic>'),
+    ('open(p, mode).write(data)', 'NBP-OPEN-DYNAMIC', '<dynamic>'),
+    ('with open(f"{work_dir}/out.txt", \'a\') as fh:\n    fh.write(data)', 'NBP-OPEN-DYNAMIC', '<dynamic>'),
+    ("p = '/etc/' + 'passwd'\nopen(p).read()", 'NBP-OPEN-PATH', '/etc/passwd'),
+    ("parts = ['/etc', 'passwd']\nopen('/'.join(parts)).read()", 'NBP-OPEN-PATH', '/etc/passwd'),
+    ("open('/etc/passwd', 'r').read()", 'NBP-OPEN-PATH', '/etc/passwd'),
+    ("io.open(path_var, 'wb').write(data)", 'NBP-OPEN-DYNAMIC', '<dynamic>'),
+    # open() with a path the gate cannot resolve is refused in EVERY mode: a read of an
+    # arbitrary local file leaves the sandbox as much as a write (the library-reader
+    # scope decision does not extend to open() and its stdlib / pathlib twins)
+    ('open(path_var).read()', 'NBP-OPEN-DYNAMIC', '<dynamic>'),
+    ('import json\nwith open(f"{work_dir}/manifest.json") as fh:\n    manifest = json.load(fh)',
+     'NBP-OPEN-DYNAMIC', '<dynamic>'),
+    ("open(path_var, 'r').read()", 'NBP-OPEN-DYNAMIC', '<dynamic>'),
+    ('io.open(path_var).read()', 'NBP-OPEN-DYNAMIC', '<dynamic>'),
+    ("import codecs\ncodecs.open(path_var, encoding='utf-8').read()", 'NBP-OPEN-DYNAMIC', '<dynamic>'),
+    ('from pathlib import Path\nPath(path_var).open().read()', 'NBP-OPEN-DYNAMIC', '<dynamic>'),
+    ('Path(path_var).read_text()', 'NBP-OPEN-DYNAMIC', '<dynamic>'),
+    # re-rooting through a module's re-export of os, public or private (tempfile._os, random._os)
+    ("import tempfile\ntempfile._os.system('id')", 'NBP-OS-PROCESS', 'os.system'),
+    ("import random\nrandom._os.system('id')", 'NBP-OS-PROCESS', 'os.system'),
+    ("import glob\nglob.os.system('id')", 'NBP-OS-PROCESS', 'os.system'),
+    ("import posixpath\nposixpath.os.system('id')", 'NBP-OS-PROCESS', 'os.system'),
+    ("import platform\nplatform.os.system('id')", 'NBP-OS-PROCESS', 'os.system'),
+    ("import tarfile\ntarfile.os.environ['X']", 'NBP-OS-ENVIRON', 'os.environ'),
+]
+
+# Further cells per class, so each rule is exercised on its own and not only
+# through the first refusal of a probe.
+REVIEW_GAP_CELLS_2 = [
+    # A: value positions
+    ("run(*[spark])", "NBP-INDIRECT", "spark"),
+    ("def get_session():\n    return spark", "NBP-INDIRECT", "spark"),
+    ("mods = {'o': sys}", "NBP-INDIRECT", "sys"),
+    ("import pickle\nloaders = (pickle,)", "NBP-INDIRECT", "pickle"),
+    ("fn = lambda: dbutils", "NBP-INDIRECT", "dbutils"),
+    # B: sinks on unresolved receivers
+    ("get_module().putenv('A', 'b')", "NBP-INDIRECT", "get_module.putenv"),
+    ("mods[0].execvp('id', ['id'])", "NBP-INDIRECT", "<expr>.execvp"),
+    ("x.fork()", "NBP-INDIRECT", "x.fork"),
+    ("x.getattr_static(spark, 'version')", "NBP-INDIRECT", "x.getattr_static"),
+    ("platform.system()", "NBP-INDIRECT", "platform.system"),      # no import in view: unknown root
+    ("fs.open('/etc/passwd').read()", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("fs.open('/Volumes/prod/' + name)", "NBP-OPEN-PATH", "/Volumes/prod/"),
+    # C: .pipe
+    ("spark.sparkContext.textFile('oci://b@ns/x').pipe('id')", "NBP-OS-PROCESS", "spark.sparkContext.textFile.pipe()"),
+    ("rdd = sc.parallelize(xs)\nrdd.pipe(fn)", "NBP-OS-PROCESS", "rdd.pipe()"),
+    ("r = df.rdd\nr.pipe(fn)", "NBP-OS-PROCESS", "df.rdd.pipe()"),       # alias followed
+    ("df.rdd.pipe(fn)", "NBP-OS-PROCESS", "df.rdd.pipe()"),
+    ("cmd = 'id'\ndf.pipe(cmd)", "NBP-OS-PROCESS", "df.pipe()"),
+    ("df.pipe(f'{tool} -x')", "NBP-OS-PROCESS", "df.pipe()"),
+    ("df.pipe('/bin/' + tool)", "NBP-OS-PROCESS", "df.pipe()"),
+    ("df.pipe('{} -x'.format(tool))", "NBP-OS-PROCESS", "df.pipe()"),
+    ("df.pipe(' '.join(argv))", "NBP-OS-PROCESS", "df.pipe()"),
+    # D: string-keyed accessors
+    ("import operator\noperator.attrgetter(name)(obj)", "NBP-INDIRECT", "operator.attrgetter(<dynamic>)"),
+    ("import operator\noperator.methodcaller('__reduce__')(obj)", "NBP-DUNDER-ESCAPE", "<expr>.__reduce__"),
+    ("import operator\noperator.attrgetter('a.f_globals')(obj)", "NBP-DUNDER-ESCAPE", "<expr>.f_globals"),
+    ("import operator\noperator.attrgetter('_conf')(sc)", "NBP-INDIRECT", "operator.attrgetter('_conf')"),
+    ("import operator\noperator.attrgetter('x._secret')(obj)", "NBP-INDIRECT", "operator.attrgetter('x._secret')"),
+    ("from functools import reduce\nreduce(getattr, path, obj)", "NBP-INDIRECT", "functools.reduce(getattr, ...)"),
+    ("import functools, operator\nfunctools.reduce(operator.attrgetter, path, obj)", "NBP-INDIRECT",
+     "functools.reduce(getattr, ...)"),
+    ("import inspect\ninspect.getattr_static(os, 'system')", "NBP-INDIRECT", "os"),
+    ("import inspect\ninspect.getattr_static(obj, name)", "NBP-INDIRECT", "getattr(obj, <dynamic>)"),
+    ("from inspect import getmembers\ngetmembers(obj)", "NBP-INDIRECT", "inspect.getmembers"),
+    ("obj.__getattribute__('x')", "NBP-DUNDER-ESCAPE", "obj.__getattribute__"),
+    # E: re-rooting and vars()
+    ("self.spark._jvm", "NBP-POLICY-TAMPER", "spark._jvm"),
+    ("ctx.sc.addPyFile('oci://b@ns/x/e.zip')", "NBP-BUILTIN-EXEC", "sc.addPyFile"),
+    ("import pandas as pd\npd.io.common.os.environ['X']", "NBP-OS-ENVIRON", "os.environ"),
+    ("import shutil\nshutil.sys.modules['os']", "NBP-INDIRECT", "sys.modules"),
+    ("import pickle\nvars(pickle)['loads']", "NBP-INDIRECT", "pickle"),
+    ("import yaml\nvars(yaml)", "NBP-INDIRECT", "yaml"),
+    ("vars(sc)", "NBP-INDIRECT", "sc"),
+    # F: deserialisers
+    ("import pickle\npickle.Unpickler", "NBP-DESERIALIZE", "pickle.Unpickler"),
+    ("import pickle\npickle.load_session(p)", "NBP-DESERIALIZE", "pickle.load_session"),
+    ("import dill\ndill.load_module(p)", "NBP-DESERIALIZE", "dill.load_module"),
+    ("import pickle\npickle._getattribute(obj, 'x')", "NBP-DESERIALIZE", "pickle._getattribute"),
+    ("import yaml\nyaml._x", "NBP-DESERIALIZE", "yaml._x"),
+    ("import operator\noperator._compare_digest", "NBP-INDIRECT", "operator._compare_digest"),
+    ("import torch\ntorch.jit.load(p, map_location='cpu')", "NBP-DESERIALIZE", "torch.jit.load"),
+    ("import torch\ntorch.serialization.load(p, weights_only=False)", "NBP-DESERIALIZE", "torch.serialization.load"),
+    ("import numpy as np\nnp.load(p, allow_pickle=cfg['pickle'])", "NBP-DESERIALIZE", "numpy.load(allow_pickle=<dynamic>)"),
+    ("import yaml\nyaml.load(s, Loader=SafeLoader)", "NBP-DESERIALIZE", "yaml.load"),      # unresolved name
+    ("import yaml\nSL = yaml.FullLoader\nyaml.load(s, Loader=SL)", "NBP-DESERIALIZE", "yaml.FullLoader"),
+    ("import yaml\nyaml.add_constructor('!x', ctor)", "NBP-DESERIALIZE", "yaml.add_constructor"),
+    ("import yaml\nyaml.SafeLoader.add_constructor('!x', ctor)", "NBP-DESERIALIZE", "yaml.SafeLoader.add_constructor"),
+    ("import yaml\nyaml.add_multi_constructor('!', ctor)", "NBP-DESERIALIZE", "yaml.add_multi_constructor"),
+    ("import yaml\nclass L(yaml.loader.SafeLoader):\n    pass", "NBP-DESERIALIZE", "yaml.loader.SafeLoader"),
+    ("from yaml import SafeLoader\nclass L(SafeLoader):\n    pass", "NBP-DESERIALIZE", "yaml.SafeLoader"),
+    ("import yaml\nyaml.loader.SafeLoader", "NBP-DESERIALIZE", "yaml.loader"),
+    ("import yaml\nyaml.constructor.SafeConstructor", "NBP-DESERIALIZE", "yaml.constructor"),
+    ("from yaml import load_all", "NBP-DESERIALIZE", "yaml.load_all"),
+    ("from yaml import FullLoader", "NBP-DESERIALIZE", "yaml.FullLoader"),
+    ("from yaml import UnsafeConstructor", "NBP-DESERIALIZE", "yaml.UnsafeConstructor"),
+    ("import yaml\nyaml.load_all(s, Loader=yaml.SafeLoader)", "NBP-DESERIALIZE", "yaml.load_all"),
+    # G: namespace subscripts
+    ("v = globals()['my_var'].attr", "NBP-INDIRECT", "globals()"),
+    ("globals()['my_fn']()", "NBP-INDIRECT", "globals()"),
+    ("globals()['my_var']['k']", "NBP-INDIRECT", "globals()"),
+    ("import os as o\nlocals()['o']", "NBP-INDIRECT", "locals()"),
+    ("globals()['spark']", "NBP-INDIRECT", "globals()"),
+    ("globals()['open']", "NBP-INDIRECT", "globals()"),
+    ("globals()['pickle']", "NBP-INDIRECT", "globals()"),
+    # H: *args / **kwargs on the open family
+    ("import codecs\ncodecs.open(**kw)", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("open(*parts, mode='r')", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\nPath('/tmp/x').open(**kw)", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    # I: pydoc
+    ("import pydoc", "NBP-IMPORT-PROCESS", "pydoc"),
+    ("from pydoc import pipepager", "NBP-IMPORT-PROCESS", "pydoc"),
+    # read-mode open: the literal head and folded literals are still path-checked
+    ("open(f'/etc/{name}').read()", "NBP-OPEN-PATH", "/etc/"),
+    ("open('/Volumes/prod/' + name, 'rb').read()", "NBP-OPEN-PATH", "/Volumes/prod/"),
+    ("import os\nopen(os.path.join('/etc', 'passwd')).read()", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("p = '/'.join(['/Workspace', '.oci', 'config'])\nopen(p).read()", "NBP-OPEN-PATH", "/Workspace/.oci/config"),
+    ("open(p, 'r+').read()", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("open(p, mode='w')", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("m = 'w'\nopen(p, m)", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\nPath(p).open('w')", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\nPath(p).read_text()", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+]
+
+
+@pytest.mark.parametrize("source,rule,target", REVIEW_GAP_CELLS + REVIEW_GAP_CELLS_2,
+                         ids=[c[1] + ":" + c[0][:30] for c in REVIEW_GAP_CELLS + REVIEW_GAP_CELLS_2])
+def test_review_gap_cells_are_refused(tmp_path, sandbox_env, source, rule, target):
+    _assert_refused(tmp_path, [source], rule, target)
+
+
+def test_review_gap_cell_count():
+    assert len(REVIEW_GAP_CELLS) == 100
+
+
+# The 19 ordinary notebook cells from the same review, which must stay allowed
+# (scanned with the review's sandbox: catalog sbx / schema mig / prefix oci://bucket@ns/sandbox/).
+REVIEW_POLICY = SandboxPolicy(catalog="sbx", schema="mig", prefix="oci://bucket@ns/sandbox/")
+CLEAN_CELLS_4 = [
+    "import pandas as pd\ndf = pd.read_csv(source_path)\ndf = df.pipe(clean_frame).pipe(add_keys, keys=['id'])",
+    'items = [1, 2, 3]\nitems.remove(2)',
+    "print(getattr(spark, 'version'))",
+    'label = "{0.__class__.__name__}".format(obj)',
+    'import yaml\ncfg = yaml.safe_load(text)\ncfg2 = yaml.load(text, Loader=yaml.SafeLoader)',
+    'import numpy as np\narr = np.load(array_path, allow_pickle=False)',
+    "import operator\nrows.sort(key=operator.itemgetter(1))\nnames = list(map(operator.attrgetter('name'), rows))",
+    'import functools\ntotal = functools.reduce(lambda a, b: a + b, values, 0)',
+    'import inspect\nsig = inspect.signature(transform)',
+    'q = "SELECT id, amount FROM sbx.mig.orders WHERE region = \'" + region + "\'"\nspark.sql(q).show()',
+    "df.write.mode('overwrite').saveAsTable('sbx.mig.orders_clean')",
+    "spark.read.table('sbx.mig.orders').filter('amount > 0').write.format('delta')"
+    ".save('oci://bucket@ns/sandbox/orders_pos')",
+    'from dataclasses import dataclass\nfrom typing import Optional\n@dataclass\nclass Row:\n    id: int\n'
+    '    name: Optional[str] = None\n    def __repr__(self):\n        return f"Row({self.id})"',
+    "with fs.open(object_path, 'rb') as fh:\n    payload = fh.read()",
+    "import matplotlib.pyplot as plt\nplt.plot(df['x'], df['y']); plt.show()",
+    'rdd = sc.parallelize(range(10)).map(lambda x: x * 2)\nprint(rdd.collect())',
+    'result = spark.sql("SHOW TABLES IN sbx.mig")',
+    'import datetime, re, math\nts = datetime.datetime.now(datetime.timezone.utc).isoformat()',
+]
+# Everyday code next to each closed class that must not become a false refusal.
+CLEAN_CELLS_5 = [
+    # A: tolerated value positions
+    "x = spark",
+    "print(spark)",
+    "spark",
+    "ok = isinstance(session, SparkSession)",
+    "t = type(sc)",
+    "has = hasattr(dbutils, 'secrets')",
+    "import os\nsep = os.sep\nhome = os.path.expanduser('~')",
+    "import functools\n@functools.lru_cache(maxsize=None)\ndef f(x):\n    return x",
+    "import operator\nfrom operator import add, itemgetter\ntotal = functools.reduce(add, values)\nkey = itemgetter(0)",
+    # B: homonyms on resolved or everyday receivers
+    "import platform\nosname = platform.system()",
+    "cursor.execute(q)\ncursor.executemany(q, rows)",
+    "loader.load()\nmodel.load_state()",
+    "import pyarrow as pa\nok = pa.types.is_string(t)",
+    "from scipy import signal\nb, a = signal.butter(1, 0.5)",
+    "code = resp.code\nprofile = user.profile.name",
+    "with fs.open(object_path, 'wb') as fh:\n    fh.write(payload)",
+    "import zipfile\nwith zipfile.ZipFile('rel.zip') as z:\n    data = z.open('member.txt').read()",
+    # C: DataFrame.pipe with a callable
+    "import pandas as pd\nout = df.pipe(lambda d: d.dropna())",
+    "def clean(d):\n    return d.dropna()\nout = df.pipe(clean)",
+    "out = df.pipe(helpers.clean, keep='first')",
+    # D: everyday operator / functools / inspect
+    "import operator\ngetter = operator.attrgetter('name', 'id')\nvals = [getter(r) for r in rows]",
+    "import operator\ncall = operator.methodcaller('strip')\nvals = list(map(call, names))",
+    "import functools\np = functools.partial(int, base=2)",
+    "import inspect\nsrc_ok = inspect.isfunction(transform)",
+    # F: the dump side and safe loaders
+    "import pickle\npickle.dump(obj, fh)\nb = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)",
+    "import pickle\npickle.Pickler(fh).dump(obj)",
+    "import joblib\njoblib.dump(model, 'model.joblib')\nres = joblib.Parallel(n_jobs=2)(joblib.delayed(f)(x) for x in xs)",
+    "import yaml\ndocs = list(yaml.safe_load_all(text))\nout = yaml.safe_dump(cfg)",
+    "from yaml import SafeLoader\nimport yaml\ncfg = yaml.load(text, Loader=SafeLoader)",
+    "import yaml\ncfg = yaml.load(text, yaml.CSafeLoader)",
+    "import torch\nm = torch.load('m.pt', weights_only=True)\nd = torch.device('cpu')",
+    "import numpy as np\na = np.load('a.npy', allow_pickle=False)\nb = np.load(p)",
+    # G: the tolerated namespace read
+    "v = globals()['my_var']",
+    "present = 'my_var' in globals()",
+    # folded literal paths that stay relative / inside the sandbox
+    "with open('/'.join(['data', 'in.csv'])) as fh:\n    rows = fh.read()",
+    "import os\nwith open(os.path.join('data', 'in.csv')) as fh:\n    rows = fh.read()",
+    "p = 'data/' + 'in.csv'\nrows = open(p).read()",
+]
+
+
+@pytest.mark.parametrize("source", CLEAN_CELLS_4, ids=[c[:40] for c in CLEAN_CELLS_4])
+def test_review_legit_cells_pass_the_gate(source):
+    assert npol.scan_source(source, policy=REVIEW_POLICY) == []
+
+
+@pytest.mark.parametrize("source", CLEAN_CELLS_5, ids=[c[:40] for c in CLEAN_CELLS_5])
+def test_review_adjacent_everyday_code_passes_the_gate(sandbox_env, source):
+    assert npol.scan_source(source) == []
+
+
+def test_dynamic_open_is_refused_in_every_mode(sandbox_env):
+    for src in ("open(p)", "open(p).read()", "open(p, 'r')", "open(p, 'rb')", "open(p, 'w')", "open(p, 'a')",
+                "open(p, mode)", "open(p, mode='wb')", "open(f'{d}/x.json')", "import io\nio.open(p)",
+                "import codecs\ncodecs.open(p, encoding='utf-8')", "from pathlib import Path\nPath(p).open()",
+                "from pathlib import Path\nPath(p).read_text()"):
+        assert [v.rule for v in npol.scan_source(src)] == ["NBP-OPEN-DYNAMIC"], src
+
+
+def test_open_on_an_unknown_receiver_is_recorded_not_refused(sandbox_env):
+    # <object-store fs>.open(path): not the builtin, not a Path; a literal local path is still
+    # checked, a dynamic one is allowed and recorded (the receiver is not the local filesystem).
+    src = "with fs.open(object_path, 'rb') as fh:\n    payload = fh.read()"
+    assert npol.scan_source(src) == []
+    assert npol.enforce_cell_policy(src, notebook_path="nb", cell_index=2) == []
+    notes = [e for e in npol.get_policy_log() if e["event"] == "unverified_read_path"]
+    assert [(e["target"], e["detail"]["line"], e["cell_index"]) for e in notes] == [("fs.open(<dynamic>)", 1, 2)]
+    assert [(v.rule, v.target) for v in npol.scan_source("fs.open('/etc/passwd')")] == [("NBP-OPEN-PATH", "/etc/passwd")]
+    assert [(v.rule, v.target) for v in npol.scan_source("fs.open(**kw)")] == [("NBP-OPEN-DYNAMIC", "<dynamic>")]
+
+
+def test_pipe_residual_is_recorded(sandbox_env):
+    src = "import pandas as pd\nout = df.pipe(clean_frame)"
+    assert npol.scan_source(src) == []
+    npol.enforce_cell_policy(src, notebook_path="nb", cell_index=1)
+    notes = [e for e in npol.get_policy_log() if e["event"] == "unverified_pipe_callable"]
+    assert [(e["target"], e["detail"]["line"]) for e in notes] == [("df.pipe(clean_frame)", 2)]
+    assert "unverified_pipe_callable" in npol.POLICY_NOTES
+
+
+def test_module_value_rule_follows_aliases_across_cells(sandbox_env):
+    ctx = npol.ScanContext()
+    assert npol.scan_source("import os as o", context=ctx) == []
+    assert [(v.rule, v.target) for v in npol.scan_source("mods = [o]", context=ctx)] == [("NBP-INDIRECT", "os")]
+    ctx = npol.ScanContext()
+    assert npol.scan_source("sp = spark", context=ctx) == []
+    assert [(v.rule, v.target) for v in npol.scan_source("run(sp)", context=ctx)] == [("NBP-INDIRECT", "spark")]
+
+
+def test_rdd_alias_bound_in_an_earlier_cell_cannot_pipe(sandbox_env):
+    ctx = npol.ScanContext()
+    assert npol.scan_source("rdd = sc.parallelize(xs)", context=ctx) == []
+    assert [(v.rule, v.target) for v in npol.scan_source("rdd.pipe(fn)", context=ctx)] \
+        == [("NBP-OS-PROCESS", "rdd.pipe()")]
+
+
+def test_imported_module_receiver_is_resolved_across_cells(sandbox_env):
+    ctx = npol.ScanContext()
+    assert npol.scan_source("import platform", context=ctx) == []
+    assert npol.scan_source("osname = platform.system()", context=ctx) == []

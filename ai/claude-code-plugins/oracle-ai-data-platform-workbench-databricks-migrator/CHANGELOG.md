@@ -108,6 +108,44 @@ All notable changes to this plugin are documented here. Format loosely follows [
   and the interpreter / compat roots, stay refused); `~`, Windows drive / UNC and `file://`
   paths count as absolute on every host. Every new refused / allowed cell is in the test suite
   and fails against the edcb186 scanner.
+- **Sandbox gate: review-derived gap classes closed as classes** (automated review of the
+  round-2 commits plus a probe run against edcb186: 49 of the original 80 probe cells passed
+  the gate there). (A) A gated module, interpreter root or Spark object may only be the root of
+  an attribute chain, the whole right-hand side of a plain name assignment, the callee of a
+  call or an argument of `getattr` / `setattr` / `vars` / `isinstance` / `print`; handed around
+  as a value (`[os][0]`, `(os if c else sys)`, `run(os)`, `{'a': os}['a']`, `return os`,
+  `lambda: os`, `dict(m=os)`, `for m in (os,)`, `with os as m`, a default, a walrus, `*[os]`)
+  it is `NBP-INDIRECT`. (B) A process / environment / introspection sink name (`system`,
+  `popen`, `fork`, `execv*`, `spawn*`, `putenv`, `pipepager`, `getattr_static`, `getmembers`,
+  the JVM bridge names) on a receiver the gate cannot resolve (a call result, a subscript, an
+  unknown name) is refused; `load` / `remove` / `mkdir` / `open` are kept out of that set, and
+  `<object>.open(path)` path-checks a literal and records a dynamic path. (C) `RDD.pipe(cmd)` on
+  a Spark / RDD-rooted chain or an RDD alias, and `.pipe(<string>)` on any receiver, are
+  `NBP-OS-PROCESS`; `DataFrame.pipe(func)` with a lambda / `def` / attribute stays allowed and a
+  bare name the gate cannot type is allowed and recorded (`unverified_pipe_callable`). (D)
+  `operator.attrgetter` / `methodcaller`, `functools.reduce(getattr, ..)`,
+  `inspect.getattr_static` / `getmembers` are judged like `getattr` (non-literal name refused;
+  every dotted segment of a literal checked). (E) A chain segment naming a gated module
+  re-roots the chain (`shutil.os.system`, `pathlib.os`, `numpy.os`, `pd.io.common.os.environ`,
+  `self.spark._jvm`); `vars(<gated module>)` is refused. (F) The pickle family is
+  deny-by-default except the dump side; `_`-prefixed attributes of every gated module,
+  `Unpickler(..).load()` at any depth, `torch.load` at any depth under `torch` unless
+  `weights_only=True` is a literal, `np.load` unless `allow_pickle` is absent or the literal
+  `False`, and for yaml a `Loader` is safe only when it resolves through aliases and
+  from-imports to exactly `yaml.SafeLoader` / `CSafeLoader` / `BaseLoader` / `CBaseLoader`
+  (`from yaml import Loader as SafeLoader` is refused); `yaml.loader.*` / `yaml.constructor.*`,
+  `Full*` / `Unsafe*`, `load_all` / `full_load*` / `unsafe_load*`, `add_constructor` /
+  `add_multi_constructor` and classes subclassing any yaml loader or constructor are refused.
+  (G) `globals()[k]` / `locals()[k]` / `vars()[k]` with a tainted, alias, protected or Spark
+  key, or whose result is dereferenced, is refused; only a plain read of a literal
+  non-protected key (and `'k' in globals()`) is tolerated. (H) `open(*args)` / `open(**kw)` and
+  the same on `io.open` / `codecs.open` / `Path(..).open` are `NBP-OPEN-DYNAMIC`; `open(path_var)`
+  stays refused in read mode too (the library-reader scope decision does not extend to
+  `open()`), while folded literals (`"/etc/" + "passwd"`, `"/".join([..])`,
+  `os.path.join(..)`) and the literal head of an f-string are path-checked. (I) `pydoc` joins
+  the process modules. Every probe cell is in the test suite verbatim (first refusal as the
+  runner reports it) and the legitimate cells of the same review stay allowed; the new tests
+  fail against the edcb186 scanner.
 - Python 3.9 floor: `cluster_lifecycle.py` and `fuse_package_analyzer.py` used PEP 604
   `X | None` annotations evaluated at import time; `from __future__ import annotations` added.
 - **Secrets shim is Vault-only by default** (`engine/aidp_compat/secrets.py`,

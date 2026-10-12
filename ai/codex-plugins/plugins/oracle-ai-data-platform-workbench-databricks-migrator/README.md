@@ -267,7 +267,18 @@ cannot resolve (`spark.read.parquet(src)`, `unverified_read_path`; reading sourc
 parameters is the normal migration case and object-storage / catalog reads are never
 path-checked) and a `spark.sql` statement whose literal head is `SELECT` / `WITH` / `SHOW` /
 `DESCRIBE` / `EXPLAIN` (`unverified_sql_read`; Spark runs one statement per call, so it cannot
-become a write). The gate
+become a write), plus a `DataFrame.pipe(fn)` whose callable the gate cannot type
+(`unverified_pipe_callable`; `RDD.pipe(cmd)` and any string-typed `.pipe()` argument are
+refused). `open(path_var)` is not such a decision: a non-literal `open()` path is refused in
+read mode as well. The review-derived gap classes are closed as classes, not spellings: a gated
+module or Spark object handed around as a value (`[os][0]`, `run(os)`, `return os`,
+`lambda: os`, ...), a process sink name on a receiver the gate cannot resolve
+(`helper().system`, `obj.popen`), string-keyed accessors (`operator.attrgetter` /
+`methodcaller`, `functools.reduce(getattr, ..)`, `inspect.getattr_static` / `getmembers`),
+re-rooting at a module named mid-chain (`shutil.os.system`, `pd.io.common.os.environ`),
+deny-by-default deserialisers (the whole pickle family except the dump side, `torch.load` at
+any depth, `numpy` `allow_pickle`, every unsafe yaml loader / constructor / hook / subclass),
+`globals()[k]` with a tainted key or a dereferenced result, and `open(*a, **kw)`. The gate
 matches these forms statically and is not a Python sandbox: a static AST gate over a full
 Python runtime is a mitigation layer, the platform-level control is the IAM scope of the
 cluster the notebook runs on, and the runtime assertions in `dbutils.fs.*`, `safe_io` and
