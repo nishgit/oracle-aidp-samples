@@ -89,7 +89,18 @@ Two pieces:
    ``setattr``; ``sys.path`` and ``torch`` flags excepted); a process sink
    name or a ``_private`` attribute on an imported module the gate has no
    rules for is refused (``mymod.system``, ``mymod._run``); ``site`` / ``pip``
-   load code from paths and are refused like ``addPyFile``.
+   load code from paths and are refused like ``addPyFile``. Library writers
+   are the mirror of the readers (``np.save``, ``torch.save``, ``joblib.dump``,
+   ``scipy.io.savemat``, ``cv2.imwrite``, ``plt.savefig``, ``pq.write_table``,
+   ``df.to_csv`` / ``to_parquet`` / ``write_parquet`` / ``savefig`` on any
+   receiver, ``wb.save`` / ``model.save`` with a literal): a literal local path
+   outside the sandbox is refused like ``df.write.parquet``, and a path the
+   gate cannot resolve is refused too (writes fail closed; an in-memory buffer
+   or ``ExcelWriter`` handle the notebook bound is not a path). ``tempfile``
+   creators with a literal ``dir=`` / absolute ``prefix=`` (or
+   ``tempfile.tempdir =``) outside the sandbox are filesystem writes; live
+   frame dumps (``faulthandler``, ``traceback.walk_stack`` / ``walk_tb``,
+   ``capture_locals=True``, ``Task.get_stack``) are introspection routes.
 
 The gate is a static check of the forms listed in SUPPORTED_OPERATIONS.md
 section 8; it is not a Python sandbox, and a static gate over a full Python
@@ -172,7 +183,7 @@ _NETWORK_MODULES = frozenset({
     "poplib", "imaplib", "nntplib", "websocket", "websockets", "grpc", "xmlrpc",
     "socketserver", "ssl", "asyncore", "asynchat",
 })
-_INDIRECT_MODULES = frozenset({"importlib", "builtins", "pkgutil", "zipimport", "imp"})
+_INDIRECT_MODULES = frozenset({"importlib", "builtins", "pkgutil", "zipimport", "imp", "faulthandler"})
 # gc.collect() is routine notebook hygiene; the object-graph walkers reach every live object.
 _GC_INDIRECT_ATTRS = frozenset({"get_objects", "get_referrers", "get_referents"})
 # Modules whose purpose is to run code handed to them as a string / docstring / frame.
@@ -204,7 +215,7 @@ _SINK_ATTRS = frozenset({
     "system", "popen", "posix_spawn", "posix_spawnp", "startfile", "fork", "forkpty", "putenv", "unsetenv",
     "execl", "execle", "execlp", "execlpe", "execv", "execve", "execvp", "execvpe",
     "spawnl", "spawnle", "spawnlp", "spawnlpe", "spawnv", "spawnve", "spawnvp", "spawnvpe",
-    "pipepager", "tempfilepager", "getattr_static", "getmembers",
+    "pipepager", "tempfilepager", "getattr_static", "getmembers", "get_stack",
 })
 # A plain ``import m`` of a module the gate has no rules for does not vouch
 # for its attributes: ``mymod.system(..)`` may be ``os`` re-exported or
@@ -245,6 +256,10 @@ _ASYNCIO_NETWORK_ATTRS = frozenset({"open_connection", "start_server", "create_c
 _SYS_INDIRECT_ATTRS = frozenset({"modules", "settrace", "setprofile", "addaudithook", "call_tracing",
                                  "meta_path", "path_hooks", "path_importer_cache"})
 _INSPECT_FRAME_ATTRS = frozenset({"currentframe", "stack", "trace", "getouterframes", "getinnerframes"})
+# ``traceback`` helpers that hand live frame objects out (``print_exc`` /
+# ``format_exc`` / ``extract_stack`` return text / summaries and stay allowed);
+# ``capture_locals=True`` on any traceback helper copies every frame's locals.
+_TRACEBACK_FRAME_ATTRS = frozenset({"walk_stack", "walk_tb"})
 _TYPES_EXEC_ATTRS = frozenset({"FunctionType", "CodeType", "LambdaType"})
 # ``concurrent.futures.ThreadPoolExecutor`` is fine; the process pool forks workers.
 _PROCESS_POOL_NAMES = frozenset({"ProcessPoolExecutor"})
@@ -369,6 +384,69 @@ _SC_PATH_READ_METHODS = frozenset({"textFile", "wholeTextFiles", "binaryFiles", 
                                    "hadoopFile", "newAPIHadoopFile", "pickleFile"})
 _READER_PATH_KWARGS = ("path", "paths", "filepath_or_buffer", "path_or_buf", "io", "source", "file", "filename",
                        "fname", "name", "filename_or_obj", "fp")
+# Local file WRITES through library writers: the mirror of the reader table.
+# A literal local path outside the sandbox prefix is refused (NBP-PATH-WRITE,
+# like ``df.write.parquet``) and so is a path the gate cannot resolve
+# (NBP-PATH-WRITE-DYNAMIC): the read-side scope decision does not extend to
+# writes, which fail closed at every sink. Relative literal paths are
+# tolerated like ``open()``. Entry: chain -> (positional index of the path,
+# keyword names). ``mlflow.<flavor>.save_model(obj, path)`` is matched by
+# suffix because the flavour segment varies.
+_LIB_WRITER_CALLS: Dict[Tuple[str, ...], Tuple[int, Tuple[str, ...]]] = {
+    ("numpy", "save"): (0, ("file",)), ("numpy", "savez"): (0, ("file",)),
+    ("numpy", "savez_compressed"): (0, ("file",)), ("numpy", "savetxt"): (0, ("fname",)),
+    ("torch", "save"): (1, ("f",)), ("torch", "jit", "save"): (1, ("f",)), ("torch", "serialization", "save"): (1, ("f",)),
+    ("joblib", "dump"): (1, ("filename",)),
+    ("scipy", "io", "savemat"): (0, ("file_name",)), ("scipy", "io", "wavfile", "write"): (0, ("filename",)),
+    ("cv2", "imwrite"): (0, ("filename",)),
+    ("matplotlib", "pyplot", "savefig"): (0, ("fname",)), ("matplotlib", "pyplot", "imsave"): (0, ("fname",)),
+    ("imageio", "imwrite"): (0, ("uri",)), ("imageio", "imsave"): (0, ("uri",)), ("imageio", "mimwrite"): (0, ("uri",)),
+    ("imageio", "volwrite"): (0, ("uri",)),
+    ("tifffile", "imwrite"): (0, ("file",)), ("tifffile", "imsave"): (0, ("file",)),
+    ("soundfile", "write"): (0, ("file",)),
+    ("pyarrow", "parquet", "write_table"): (1, ("where",)), ("pyarrow", "parquet", "write_to_dataset"): (1, ("root_path",)),
+    ("pyarrow", "feather", "write_feather"): (1, ("dest",)), ("pyarrow", "csv", "write_csv"): (1, ("output_file",)),
+    ("pyarrow", "output_stream"): (0, ("source",)),
+    ("pandas", "ExcelWriter"): (0, ("path",)), ("pandas", "HDFStore"): (0, ("path",)),
+    ("zarr", "save"): (0, ("store",)), ("zarr", "save_array"): (0, ("store",)), ("zarr", "save_group"): (0, ("store",)),
+    ("plotly", "io", "write_image"): (1, ("file",)), ("plotly", "io", "write_html"): (1, ("file",)),
+    ("plotly", "io", "write_json"): (1, ("file",)),
+    ("dask", "dataframe", "to_parquet"): (1, ("path",)), ("dask", "dataframe", "to_csv"): (1, ("filename",)),
+    ("xarray", "save_mfdataset"): (1, ("paths",)),
+}
+# Receiver-typed writers whose first argument is a path (or a buffer): pandas /
+# polars / xarray / geopandas frame methods, matplotlib ``savefig``, numpy
+# ``tofile``, plotly ``write_html`` / ``write_image``. The receiver's type is
+# unknown but the method name is unambiguous: a literal local path outside the
+# prefix is NBP-PATH-WRITE, a path the gate cannot resolve is
+# NBP-PATH-WRITE-DYNAMIC unless it is a write handle the notebook bound
+# (``buf = io.StringIO(); df.to_csv(buf)``, ``with pd.ExcelWriter(p) as w``) or
+# ``sys.stdout``; no path argument (``df.to_csv()`` returns text) is fine.
+_FRAME_WRITER_ATTRS = frozenset({
+    "to_csv", "to_parquet", "to_pickle", "to_json", "to_hdf", "to_excel", "to_feather", "to_orc", "to_stata",
+    "to_xml", "to_netcdf", "to_zarr", "to_file", "tofile", "savefig", "write_html", "write_image",
+    "write_csv", "write_parquet", "write_json", "write_ndjson", "write_ipc", "write_avro", "write_excel",
+    "write_delta",
+})
+_FRAME_WRITER_KWARGS = ("path_or_buf", "path", "fname", "file", "filename", "buf", "excel_writer", "path_or_buffer",
+                        "store", "fid")
+# ``.save(path)`` and its kin are too generic to type (an ORM row, a Keras /
+# openpyxl / PIL / transformers object): a literal local path outside the prefix
+# is refused, a path the gate cannot resolve is left alone.
+_GENERIC_SAVE_ATTRS = frozenset({"save", "save_model", "save_pretrained", "save_weights", "export"})
+_GENERIC_SAVE_KWARGS = ("path", "filename", "fname", "file", "filepath", "save_directory", "export_dir")
+# Constructors of in-memory buffers / writer handles: a name bound once to one
+# (assignment or ``with .. as name``) is a legitimate non-path writer argument.
+_WRITE_HANDLE_CTORS = frozenset({"StringIO", "BytesIO", "ExcelWriter", "HDFStore"})
+_STREAM_CHAINS = frozenset({("sys", "stdout"), ("sys", "stderr")})
+# ``tempfile`` creators: attr -> (positional slot of ``prefix``, positional slot of ``dir``).
+# A literal ``dir`` outside the sandbox creates files there; an absolute ``prefix``
+# escapes ``dir`` because ``os.path.join`` discards the directory before it. The
+# default directory and a ``dir`` the gate cannot resolve stay allowed.
+_TEMPFILE_CREATORS = {
+    "NamedTemporaryFile": (5, 6), "TemporaryFile": (5, 6), "SpooledTemporaryFile": (6, 7),
+    "TemporaryDirectory": (1, 2), "mkstemp": (1, 2), "mkdtemp": (1, 2), "mktemp": (1, 2),
+}
 # str.format templates: methods that return the receiver's text unchanged in
 # shape, and the stdlib helpers that do, so ``textwrap.dedent("...").format(x)``
 # is checked as the literal.
@@ -401,7 +479,7 @@ _WATCHED_MODULES = _PROCESS_MODULES | _NETWORK_MODULES | _INDIRECT_MODULES | _EX
 _REROOT_NAMES = frozenset({
     "os", "posix", "nt", "sys", "shutil", "subprocess", "importlib", "builtins", "__builtins__", "ctypes",
     "socket", "asyncio", "operator", "inspect", "functools", "pydoc", "io", "pathlib", "gc", "marshal", "shelve",
-    "yaml", "torch", "aidp_compat", "dbutils", "get_ipython",
+    "yaml", "torch", "aidp_compat", "dbutils", "get_ipython", "faulthandler",
 }) | _PICKLE_MODULES | frozenset({"joblib", "jsonpickle"}) | (_SPARK_ROOTS - frozenset({"pyspark"}))
 # Process modules whose name is not a plausible variable name: an attribute
 # chain rooted there is refused even when the import is out of view.
@@ -914,6 +992,9 @@ class ScanContext:
     # (``import helpers as h`` -> ``helpers``): their ``_private`` attributes
     # are refused like those of a gated module.
     modules: Set[str] = field(default_factory=set)
+    # Names bound once to an in-memory buffer / writer handle (``buf = io.StringIO()``,
+    # ``with pd.ExcelWriter(p) as w``): a non-path argument for the frame writers.
+    handles: Set[str] = field(default_factory=set)
 
     def forget(self, name: str) -> None:
         """``name`` is (re)bound in the current cell: drop what it stood for."""
@@ -923,6 +1004,7 @@ class ScanContext:
         self.imported.discard(name)
         self.functions.discard(name)
         self.rdd_names.discard(name)
+        self.handles.discard(name)
         self.constants[name] = None
 
     def is_bound(self, name: str) -> bool:
@@ -1217,6 +1299,16 @@ _REM_LOADER_ARGS = ("Pass the loader's safety switch as a literal keyword the ga
                     "weights_only=True, Loader=yaml.SafeLoader) instead of positionally or through *args / **kwargs.")
 _REM_RECEIVER = ("The receiver of this call was never bound in the notebook, so the gate cannot tell what it is; "
                  "bind it in the notebook (import the library, assign the object) so the call can be judged.")
+_REM_WRITE_PATH = ("Library writers (np.save, torch.save, joblib.dump, df.to_csv / to_parquet, plt.savefig, "
+                   "cv2.imwrite, wb.save, ...) must write under the sandbox prefix or to a relative path; a path "
+                   "the gate cannot resolve is refused like df.write.*(path_var): bind it once to a literal sandbox "
+                   "path, write through df.write / dbutils.fs, or list NBP-PATH-WRITE-DYNAMIC in "
+                   "AIDP_NOTEBOOK_POLICY_ALLOW after review.")
+_REM_TEMPFILE = ("tempfile creates files where dir= / prefix= (or tempfile.tempdir) point; keep the default "
+                 "temporary directory or use a literal directory under the sandbox prefix.")
+_REM_FRAMES = ("Live frames and their locals (faulthandler, traceback.walk_stack / walk_tb, capture_locals=True, "
+               "Task.get_stack) are not available inside the sandbox; traceback.print_exc / format_exc / "
+               "extract_stack return text and stay allowed.")
 
 
 class _PolicyScanner(ast.NodeVisitor):
@@ -1377,6 +1469,14 @@ class _PolicyScanner(ast.NodeVisitor):
                     vchain = self._chain(node.value.func)
                     if vchain and (vchain[0] in _SPARK_ROOTS or any(p in _RDD_CHAIN_ATTRS for p in vchain)):
                         self.ctx.rdd_names.add(name)         # rdd = sc.parallelize(..).map(..)
+                    if self._is_write_handle_ctor(node.value):
+                        self.ctx.handles.add(name)           # buf = io.StringIO()
+            elif isinstance(node, (ast.With, ast.AsyncWith)):
+                for item in node.items:
+                    target = item.optional_vars
+                    if isinstance(target, ast.Name) and bound.get(target.id, 0) == 1 \
+                            and self._is_write_handle_ctor(item.context_expr):
+                        self.ctx.handles.add(target.id)      # with pd.ExcelWriter(p) as writer:
         for name in loaded_elsewhere:
             # A mutable literal is folded only while its name is used for nothing
             # but ``sep.join(name)``; any other use (this or an earlier cell's
@@ -1384,6 +1484,25 @@ class _PolicyScanner(ast.NodeVisitor):
             # what the sandbox check sees (fail closed: the join is then dynamic).
             if isinstance(self.ctx.constants.get(name), (ast.List, ast.Set, ast.Dict)):
                 self.ctx.constants[name] = None
+
+    def _is_write_handle_ctor(self, node: ast.AST) -> bool:
+        """``io.StringIO()`` / ``BytesIO()`` / ``pd.ExcelWriter(..)`` / ``pd.HDFStore(..)``: a
+        buffer or writer handle (the handle's own path is judged where it is built)."""
+        if not isinstance(node, ast.Call):
+            return False
+        chain = self._chain(node.func)
+        return bool(chain) and chain[-1] in _WRITE_HANDLE_CTORS
+
+    def _is_write_handle(self, arg: ast.AST) -> bool:
+        """A writer argument that is not a path: a handle the notebook bound, an inline
+        buffer constructor, or ``sys.stdout`` / ``sys.stderr``."""
+        if isinstance(arg, ast.Name):
+            return arg.id in self.ctx.handles
+        if isinstance(arg, ast.Call):
+            return self._is_write_handle_ctor(arg)
+        if isinstance(arg, ast.Attribute):
+            return tuple(self._chain(arg)) in _STREAM_CHAINS
+        return False
 
     def _is_join_operand(self, node: ast.Name) -> bool:
         """``sep.join(node)``: the one read of a list literal that cannot mutate it."""
@@ -1602,6 +1721,8 @@ class _PolicyScanner(ast.NodeVisitor):
             return RULE_INDIRECT, f"gc.{chain[1]}", f"live object graph access via gc.{chain[1]}", _REM_INDIRECT
         if root == "inspect" and chain[1] in _INSPECT_FRAME_ATTRS:
             return RULE_INDIRECT, f"inspect.{chain[1]}", f"frame access via inspect.{chain[1]}", _REM_INDIRECT
+        if root == "traceback" and chain[1] in _TRACEBACK_FRAME_ATTRS:
+            return RULE_INDIRECT, f"traceback.{chain[1]}", f"frame access via traceback.{chain[1]}", _REM_FRAMES
         if root == "types" and chain[1] in _TYPES_EXEC_ATTRS:
             return RULE_BUILTIN_EXEC, f"types.{chain[1]}", f"code object construction via types.{chain[1]}", \
                 "Dynamic code execution is refused; inline the code as a cell."
@@ -1892,6 +2013,9 @@ class _PolicyScanner(ast.NodeVisitor):
             elts = t.elts if isinstance(t, (ast.Tuple, ast.List)) else [t]
             for elt in elts:
                 self._check_mutation_target(elt, "assignment")
+                if isinstance(elt, ast.Attribute) and self._chain(elt) == ["tempfile", "tempdir"]:
+                    # tempfile.tempdir = d: every later temporary file is created under d
+                    self._check_fs_target(node, node.value, "tempfile.tempdir =")
         self.generic_visit(node)
 
     def visit_AugAssign(self, node: ast.AugAssign):
@@ -2164,6 +2288,13 @@ class _PolicyScanner(ast.NodeVisitor):
                 self._add(RULE_DESERIALIZE, node, f"{'.'.join(chain)}(weights_only=...) not the literal True",
                           target=".".join(chain), remediation=_REM_DESERIALIZE)
                 return
+            if k.arg == "capture_locals" and not (isinstance(k.value, ast.Constant) and k.value.value is False):
+                # traceback.StackSummary.extract(.., capture_locals=True) / TracebackException(..): every
+                # frame's locals are copied into the summary, keyed on the keyword so the receiver does not matter
+                shown = ".".join(chain)
+                self._add(RULE_INDIRECT, node, f"{shown}(capture_locals=...) copies the locals of every frame",
+                          target=f"{shown}(capture_locals=True)", remediation=_REM_FRAMES)
+                return
         if len(chain) == 2 and (chain[0], attr) in _IO_OPEN_CALLS:
             call_name = f"{chain[0]}.{attr}()"
             if (chain[0], attr) in (("io", "open"), ("codecs", "open")):
@@ -2180,6 +2311,14 @@ class _PolicyScanner(ast.NodeVisitor):
             arg = _first_arg(node, _READER_PATH_KWARGS)
             if arg is not None:
                 self._check_read_path(node, arg, reader)
+        writer = self._writer_call_spec(chain, attr)
+        if writer is not None:
+            shown, index, kwargs = writer
+            self._check_lib_write(node, shown, index, kwargs, dynamic_ok=False)
+            return
+        if chain[:1] == ["tempfile"] and attr in _TEMPFILE_CREATORS:
+            self._check_tempfile(node, attr)
+            return
         if chain[:1] == ["os"] and attr in ("chdir", "fchdir"):
             # Relative paths are tolerated for open(); the working directory must therefore stay put.
             lit = self._resolve_literal(_first_arg(node, ("path",)))
@@ -2204,6 +2343,12 @@ class _PolicyScanner(ast.NodeVisitor):
             self._check_writer_option(node, attr)
         elif attr in _WRITER_OPTION_METHODS and any(part in _SPARK_READER_CHAIN for part in chain):
             self._check_reader_option(node, attr, ".".join(chain))
+        elif attr in _FRAME_WRITER_ATTRS and not any(part in _SPARK_IO_CHAIN for part in chain[:-1]):
+            # df.to_csv(p) / pl_df.write_parquet(p) / fig.savefig(p) / arr.tofile(p): unambiguous writers
+            self._check_lib_write(node, ".".join(chain), 0, _FRAME_WRITER_KWARGS, dynamic_ok=False)
+        elif attr in _GENERIC_SAVE_ATTRS and not any(part in _SPARK_IO_CHAIN for part in chain[:-1]):
+            # wb.save(p) / model.save(p) / img.save(p): the receiver cannot be typed, a literal path can be judged
+            self._check_lib_write(node, ".".join(chain), 0, _GENERIC_SAVE_KWARGS, dynamic_ok=True)
         elif attr == "open" and chain[:1] == ["builtins"]:
             self._check_open(node)
         elif chain[:1] == ["os"] and attr in _OS_FS_ATTRS:
@@ -2486,6 +2631,87 @@ class _PolicyScanner(ast.NodeVisitor):
         if attr in _SC_PATH_READ_METHODS and (root in _SPARK_ROOTS or "sparkContext" in chain):
             return ".".join(chain)
         return None
+
+    # -- library writers: local path literals and dynamic targets ------------
+    @staticmethod
+    def _writer_call_spec(chain: List[str], attr: str) -> Optional[Tuple[str, int, Tuple[str, ...]]]:
+        """``(dotted name, positional index of the path, keyword names)`` when
+        ``chain`` is a module-rooted writer in ``_LIB_WRITER_CALLS`` (or
+        ``mlflow.<flavor>.save_model``), else ``None``."""
+        if len(chain) < 2:
+            return None
+        spec = _LIB_WRITER_CALLS.get(tuple(chain))
+        if spec is None and chain[0] == "mlflow" and attr == "save_model":
+            spec = (1, ("path",))
+        if spec is None:
+            return None
+        return ".".join(chain), spec[0], spec[1]
+
+    @staticmethod
+    def _positional_or_keyword(node: ast.Call, index: int, kwargs: Sequence[str]) -> Optional[ast.AST]:
+        """Argument at positional slot ``index`` (when no ``*args`` precedes it) or under one of ``kwargs``."""
+        if len(node.args) > index and not any(isinstance(a, ast.Starred) for a in node.args[:index + 1]):
+            return node.args[index]
+        for k in node.keywords:
+            if k.arg in kwargs:
+                return k.value
+        return None
+
+    def _check_lib_write(self, node: ast.Call, shown: str, index: int, kwargs: Sequence[str],
+                         dynamic_ok: bool) -> None:
+        """A library writer's path argument. Literal (or foldable) local path
+        outside the sandbox -> ``NBP-PATH-WRITE``; the literal head of an
+        f-string / concatenation outside -> ``NBP-PATH-WRITE``; a path the gate
+        cannot resolve -> ``NBP-PATH-WRITE-DYNAMIC`` unless ``dynamic_ok`` (the
+        generic ``.save`` receivers) or the argument is a write handle the
+        notebook bound. ``*args`` / ``**kwargs`` hide the path and are refused
+        for the unambiguous writers. ``None`` / no argument is not a path."""
+        call_name = f"{shown}()"
+        if not dynamic_ok and (any(isinstance(a, ast.Starred) for a in node.args)
+                               or any(k.arg is None for k in node.keywords)):
+            self._add(RULE_PATH_WRITE_DYNAMIC, node, f"{call_name} with *args / **kwargs hides the path",
+                      target="<dynamic>", remediation=_REM_WRITE_PATH)
+            return
+        arg = self._positional_or_keyword(node, index, kwargs)
+        if arg is None or (isinstance(arg, ast.Constant) and arg.value is None):
+            return
+        lit = self._resolve_literal(arg)
+        if lit is not None:
+            if _is_abs_path(lit) and not self.policy.path_in_sandbox(lit):
+                self._add(RULE_PATH_WRITE, node, f"{call_name} writes a path outside the sandbox prefix", target=lit,
+                          remediation=_REM_WRITE_PATH)
+            return
+        head = self._literal_head(arg)
+        if head and _is_local_path(head) and not self.policy.path_in_sandbox(_local_path_for_check(head)):
+            self._add(RULE_PATH_WRITE, node, f"{call_name} writes under a local prefix outside the sandbox",
+                      target=head, remediation=_REM_WRITE_PATH)
+            return
+        if dynamic_ok or self._is_write_handle(arg):
+            return
+        self._add(RULE_PATH_WRITE_DYNAMIC, node, f"{call_name} with a path that cannot be resolved statically",
+                  target="<dynamic>", remediation=_REM_WRITE_PATH)
+
+    def _check_tempfile(self, node: ast.Call, attr: str) -> None:
+        """``tempfile.<creator>(.., prefix=, dir=)``: a literal ``dir`` (or an
+        absolute ``prefix``, which ``os.path.join`` lets escape ``dir``) outside
+        the sandbox is ``NBP-FS-PATH``; the default directory and a value the
+        gate cannot resolve stay allowed (in-sandbox temp usage is everyday code)."""
+        prefix_pos, dir_pos = _TEMPFILE_CREATORS[attr]
+        shown = f"tempfile.{attr}()"
+        for label, pos in (("prefix", prefix_pos), ("dir", dir_pos)):
+            arg = self._positional_or_keyword(node, pos, (label,))
+            if arg is None or (isinstance(arg, ast.Constant) and arg.value is None):
+                continue
+            lit = self._resolve_literal(arg)
+            if lit is not None:
+                if _is_abs_path(lit) and not self.policy.path_in_sandbox(lit):
+                    self._add(RULE_FS_PATH, node, f"{shown} creates files under {label}= outside the sandbox prefix",
+                              target=lit, remediation=_REM_TEMPFILE)
+                continue
+            head = self._literal_head(arg)
+            if head and _is_local_path(head) and not self.policy.path_in_sandbox(_local_path_for_check(head)):
+                self._add(RULE_FS_PATH, node, f"{shown} creates files under a {label}= prefix outside the sandbox",
+                          target=head, remediation=_REM_TEMPFILE)
 
     def _check_reader_option(self, node: ast.Call, method: str, call_name: str) -> None:
         if method == "option":

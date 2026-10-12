@@ -290,7 +290,16 @@ is read-only (`yaml.SafeLoader.yaml_constructors[..] = h`, `.update(..)`, `setat
 ..)`; `sys.path` and `torch` flags stay settable); a process sink name (`mymod.system`) or a
 `_private` attribute (`mymod._run`, `np._core`) on an imported module the gate has no rules for
 is refused (`platform.system()` is the documented homonym); `site` / `pip` load code from a path
-and are refused like `addPyFile`. The gate
+and are refused like `addPyFile`. Library writers are the mirror of the readers and fail
+closed like every other write: `np.save`, `torch.save`, `joblib.dump`, `scipy.io.savemat`,
+`cv2.imwrite`, `plt.savefig`, `pq.write_table`, `pd.ExcelWriter`, `mlflow.*.save_model`, and
+`df.to_csv` / `to_parquet` / `to_pickle` / `write_parquet` / `savefig` / `tofile` on any receiver
+with a literal local path outside the prefix are `NBP-PATH-WRITE`, with a path the gate cannot
+resolve `NBP-PATH-WRITE-DYNAMIC` (a `StringIO` / `BytesIO` / `ExcelWriter` handle the notebook
+bound is not a path); generic `wb.save(..)` / `model.save(..)` / `img.save(..)` judge a literal
+path only. `tempfile` creators with a literal `dir=` or an absolute `prefix=` outside the prefix
+(and `tempfile.tempdir =`) are `NBP-FS-PATH`; `faulthandler`, `traceback.walk_stack` /
+`walk_tb`, `capture_locals=True` and `Task.get_stack()` are frame dumps (`NBP-INDIRECT`). The gate
 matches these forms statically and is not a Python sandbox: a static AST gate over a full
 Python runtime is a mitigation layer, the platform-level control is the IAM scope of the
 cluster the notebook runs on, and the runtime assertions in `dbutils.fs.*`, `safe_io` and

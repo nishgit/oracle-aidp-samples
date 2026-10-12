@@ -2020,3 +2020,163 @@ def test_imported_module_receiver_is_resolved_across_cells(sandbox_env):
     ctx = npol.ScanContext()
     assert npol.scan_source("import platform", context=ctx) == []
     assert npol.scan_source("osname = platform.system()", context=ctx) == []
+
+
+# Coverage round 2 on the cfe1b79 gate: the tester's gap cells verbatim (first entry
+# of each block) and the rest of the class each one belongs to. Every cell passed
+# the gate at cfe1b79.
+REVIEW_GAP_CELLS_4 = [
+    # Q: local-filesystem writes through module-rooted library writers (the mirror of the reader table);
+    #    a literal local path outside the prefix is NBP-PATH-WRITE, a dynamic one NBP-PATH-WRITE-DYNAMIC
+    ("import numpy as np\nnp.save('/etc/evil.npy', a)", "NBP-PATH-WRITE", "/etc/evil.npy"),
+    ("import numpy as np\nnp.savez('/etc/evil.npz', a=a)", "NBP-PATH-WRITE", "/etc/evil.npz"),
+    ("import numpy as np\nnp.savez_compressed('/etc/evil.npz', a)", "NBP-PATH-WRITE", "/etc/evil.npz"),
+    ("import numpy as np\nnp.savetxt('/etc/evil.txt', a)", "NBP-PATH-WRITE", "/etc/evil.txt"),
+    ("np.save('/etc/evil.npy', a)", "NBP-PATH-WRITE", "/etc/evil.npy"),                   # import out of view
+    ("from numpy import save\nsave('/etc/evil.npy', a)", "NBP-PATH-WRITE", "/etc/evil.npy"),
+    ("import torch\ntorch.save(model, '/etc/evil.pt')", "NBP-PATH-WRITE", "/etc/evil.pt"),
+    ("import torch\ntorch.save(model, f='/etc/evil.pt')", "NBP-PATH-WRITE", "/etc/evil.pt"),
+    ("import torch\ntorch.jit.save(scripted, '/etc/evil.pt')", "NBP-PATH-WRITE", "/etc/evil.pt"),
+    ("import joblib\njoblib.dump(obj, '/etc/evil.joblib')", "NBP-PATH-WRITE", "/etc/evil.joblib"),
+    ("import scipy.io\nscipy.io.savemat('/etc/evil.mat', d)", "NBP-PATH-WRITE", "/etc/evil.mat"),
+    ("from scipy.io import savemat\nsavemat('/etc/evil.mat', d)", "NBP-PATH-WRITE", "/etc/evil.mat"),
+    ("import cv2\ncv2.imwrite('/etc/evil.png', img)", "NBP-PATH-WRITE", "/etc/evil.png"),
+    ("import matplotlib.pyplot as plt\nplt.savefig('/etc/evil.png')", "NBP-PATH-WRITE", "/etc/evil.png"),
+    ("from matplotlib import pyplot as plt\nplt.savefig('/etc/evil.png')", "NBP-PATH-WRITE", "/etc/evil.png"),
+    ("import imageio\nimageio.imwrite('/etc/evil.png', img)", "NBP-PATH-WRITE", "/etc/evil.png"),
+    ("import pyarrow.parquet as pq\npq.write_table(table, '/etc/evil.parquet')", "NBP-PATH-WRITE",
+     "/etc/evil.parquet"),
+    ("import pandas as pd\nwriter = pd.ExcelWriter('/etc/evil.xlsx')", "NBP-PATH-WRITE", "/etc/evil.xlsx"),
+    ("import mlflow.sklearn\nmlflow.sklearn.save_model(model, '/etc/evil')", "NBP-PATH-WRITE", "/etc/evil"),
+    ("import numpy as np\nnp.save('~/evil.npy', a)", "NBP-PATH-WRITE", "~/evil.npy"),
+    ("import numpy as np\nnp.save('file:///etc/evil.npy', a)", "NBP-PATH-WRITE", "file:///etc/evil.npy"),
+    ("import numpy as np\nnp.save('oci://b@ns/prod/x.npy', a)", "NBP-PATH-WRITE", "oci://b@ns/prod/x.npy"),
+    ("import numpy as np\nout = '/etc/evil.npy'\nnp.save(out, a)", "NBP-PATH-WRITE", "/etc/evil.npy"),
+    ("import numpy as np\nnp.save(f'/etc/{name}.npy', a)", "NBP-PATH-WRITE", "/etc/"),
+    ("import numpy as np\nnp.save(out_path, a)", "NBP-PATH-WRITE-DYNAMIC", "<dynamic>"),
+    ("import torch\ntorch.save(model, ckpt)", "NBP-PATH-WRITE-DYNAMIC", "<dynamic>"),
+    ("import numpy as np\nnp.save(*args)", "NBP-PATH-WRITE-DYNAMIC", "<dynamic>"),
+    # R: receiver-typed frame writers (pandas / polars / xarray / numpy / matplotlib / plotly methods)
+    ("df.to_csv('/etc/evil.csv')", "NBP-PATH-WRITE", "/etc/evil.csv"),
+    ("import pandas as pd\npd.DataFrame(x).to_csv('/etc/out.csv')", "NBP-PATH-WRITE", "/etc/out.csv"),
+    ("df.to_parquet('/etc/evil.parquet')", "NBP-PATH-WRITE", "/etc/evil.parquet"),
+    ("df.to_pickle('/etc/evil.pkl')", "NBP-PATH-WRITE", "/etc/evil.pkl"),
+    ("df.to_json('/etc/evil.json')", "NBP-PATH-WRITE", "/etc/evil.json"),
+    ("df.to_hdf('/etc/evil.h5', key='df')", "NBP-PATH-WRITE", "/etc/evil.h5"),
+    ("df.to_excel('/etc/evil.xlsx')", "NBP-PATH-WRITE", "/etc/evil.xlsx"),
+    ("df.to_csv(path_or_buf='/etc/evil.csv')", "NBP-PATH-WRITE", "/etc/evil.csv"),
+    ("df.to_csv('/dbfs/mnt/prod/' + name)", "NBP-PATH-WRITE", "/dbfs/mnt/prod/"),
+    ("pl_df.write_parquet('/etc/evil.parquet')", "NBP-PATH-WRITE", "/etc/evil.parquet"),
+    ("ds.to_netcdf('/etc/evil.nc')", "NBP-PATH-WRITE", "/etc/evil.nc"),
+    ("arr.tofile('/etc/evil.bin')", "NBP-PATH-WRITE", "/etc/evil.bin"),
+    ("fig.savefig('/etc/evil.png')", "NBP-PATH-WRITE", "/etc/evil.png"),
+    ("fig.write_html('/etc/evil.html')", "NBP-PATH-WRITE", "/etc/evil.html"),
+    ("df.to_csv(out_path)", "NBP-PATH-WRITE-DYNAMIC", "<dynamic>"),
+    ("df.to_parquet(f'{out_dir}/x.parquet')", "NBP-PATH-WRITE-DYNAMIC", "<dynamic>"),
+    ("df.to_csv(**kw)", "NBP-PATH-WRITE-DYNAMIC", "<dynamic>"),
+    # S: generic .save(path) receivers (openpyxl / Keras / PIL / transformers / docx) with a literal local path
+    ("import openpyxl\nwb.save('/etc/evil.xlsx')", "NBP-PATH-WRITE", "/etc/evil.xlsx"),
+    ("model.save('/etc/evil.h5')", "NBP-PATH-WRITE", "/etc/evil.h5"),
+    ("img.save('/etc/evil.png')", "NBP-PATH-WRITE", "/etc/evil.png"),
+    ("model.save_pretrained('/etc/evil')", "NBP-PATH-WRITE", "/etc/evil"),
+    ("model.export('/etc/evil')", "NBP-PATH-WRITE", "/etc/evil"),
+    ("wb.save(filename='/etc/evil.xlsx')", "NBP-PATH-WRITE", "/etc/evil.xlsx"),
+    ("doc.save('/Workspace/Shared/evil.docx')", "NBP-PATH-WRITE", "/Workspace/Shared/evil.docx"),
+    ("wb.save('/etc/' + name)", "NBP-PATH-WRITE", "/etc/"),
+    # T: tempfile creation outside the sandbox (literal dir= / absolute prefix= / tempfile.tempdir)
+    ("import tempfile\ntempfile.NamedTemporaryFile(dir='/etc')", "NBP-FS-PATH", "/etc"),
+    ("import tempfile\ntempfile.TemporaryFile(dir='/etc')", "NBP-FS-PATH", "/etc"),
+    ("import tempfile\ntempfile.mkstemp(dir='/etc')", "NBP-FS-PATH", "/etc"),
+    ("import tempfile\ntempfile.mkdtemp(dir='/etc')", "NBP-FS-PATH", "/etc"),
+    ("import tempfile\ntempfile.mkdtemp('', 'x', '/etc')", "NBP-FS-PATH", "/etc"),
+    ("import tempfile\ntempfile.TemporaryDirectory(dir='/etc')", "NBP-FS-PATH", "/etc"),
+    ("import tempfile\ntempfile.NamedTemporaryFile(prefix='/etc/evil')", "NBP-FS-PATH", "/etc/evil"),
+    ("import tempfile\ntempfile.mkstemp(dir='/etc/' + sub)", "NBP-FS-PATH", "/etc/"),
+    ("import tempfile as tf\ntf.mkdtemp(dir='/etc')", "NBP-FS-PATH", "/etc"),
+    ("from tempfile import NamedTemporaryFile\nNamedTemporaryFile(dir='/etc')", "NBP-FS-PATH", "/etc"),
+    ("import tempfile\ntempfile.tempdir = '/etc'", "NBP-FS-PATH", "/etc"),
+    ("import tempfile\ntempfile.tempdir = d", "NBP-FS-DYNAMIC", "<dynamic>"),
+    # U: live frame / traceback dumps (faulthandler, traceback.walk_*, capture_locals, Task.get_stack)
+    ("import faulthandler\nfaulthandler.dump_traceback_later(1)", "NBP-INDIRECT", "faulthandler"),
+    ("faulthandler.dump_traceback()", "NBP-INDIRECT", "faulthandler.dump_traceback"),    # import out of view
+    ("from faulthandler import dump_traceback", "NBP-INDIRECT", "faulthandler"),
+    ("import traceback\nframes = list(traceback.walk_stack(None))", "NBP-INDIRECT", "traceback.walk_stack"),
+    ("import traceback\ntraceback.walk_tb(tb)", "NBP-INDIRECT", "traceback.walk_tb"),
+    ("from traceback import walk_stack\nwalk_stack(None)", "NBP-INDIRECT", "traceback.walk_stack"),
+    ("import traceback\ns = traceback.StackSummary.extract(gen, capture_locals=True)", "NBP-INDIRECT",
+     "traceback.StackSummary.extract(capture_locals=True)"),
+    ("import traceback\nte = traceback.TracebackException(t, v, tb, capture_locals=True)", "NBP-INDIRECT",
+     "traceback.TracebackException(capture_locals=True)"),
+    ("task.get_stack()", "NBP-INDIRECT", "task.get_stack"),
+]
+
+
+@pytest.mark.parametrize("source,rule,target", REVIEW_GAP_CELLS_4,
+                         ids=[c[1] + ":" + c[0][:30] for c in REVIEW_GAP_CELLS_4])
+def test_coverage_round2_gap_cells_are_refused(tmp_path, sandbox_env, source, rule, target):
+    _assert_refused(tmp_path, [source], rule, target)
+
+
+def test_coverage_round2_gap_cell_count():
+    assert len(REVIEW_GAP_CELLS_4) >= 70
+
+
+def test_writer_path_bound_in_an_earlier_cell_is_resolved(sandbox_env):
+    ctx = npol.ScanContext()
+    assert npol.scan_source("out = '/etc/evil.npy'", context=ctx) == []
+    assert [(v.rule, v.target) for v in npol.scan_source("import numpy as np\nnp.save(out, a)", context=ctx)] \
+        == [("NBP-PATH-WRITE", "/etc/evil.npy")]
+    ctx = npol.ScanContext()
+    assert npol.scan_source("out = 'oci://b@ns/sbx/arr.npy'", context=ctx) == []
+    assert npol.scan_source("import numpy as np\nnp.save(out, a)", context=ctx) == []
+
+
+def test_write_handle_bound_in_an_earlier_cell_is_followed_until_rebound(sandbox_env):
+    ctx = npol.ScanContext()
+    assert npol.scan_source("import io\nbuf = io.StringIO()", context=ctx) == []
+    assert npol.scan_source("df.to_csv(buf)", context=ctx) == []
+    assert npol.scan_source("buf = resolve_target()", context=ctx) == []
+    assert [v.rule for v in npol.scan_source("df.to_csv(buf)", context=ctx)] == ["NBP-PATH-WRITE-DYNAMIC"]
+
+
+def test_tempfile_inside_the_sandbox_prefix_is_allowed(sandbox_env):
+    local = sandbox_env["local_prefix"] + "stage"
+    assert npol.scan_source(f"import tempfile\ntempfile.mkdtemp(dir={local!r})") == []
+    assert npol.scan_source("import tempfile\ntempfile.mkdtemp(dir='oci://b@ns/sbx/tmp')") == []
+    assert npol.scan_source(f"import tempfile\ntempfile.tempdir = {local!r}") == []
+
+
+# Everyday code next to each round-2 class that must not become a false refusal.
+CLEAN_CELLS_7 = [
+    # Q / R: writes under the sandbox prefix or to a relative path, in-memory buffers, no-path forms
+    "import numpy as np\nnp.save('oci://bucket@ns/sandbox/arr.npy', a)",
+    "import numpy as np\nnp.save('arr.npy', a)\nnp.savetxt('out/arr.txt', a)",
+    "import joblib\njoblib.dump(model, 'model.joblib')",
+    "import torch\ntorch.save(model.state_dict(), 'ckpt.pt')",
+    "out = 'oci://bucket@ns/sandbox/out.npy'\nimport numpy as np\nnp.save(out, a)",
+    "df.to_csv('oci://bucket@ns/sandbox/out.csv', index=False)",
+    "df.to_parquet('out/part.parquet')",
+    "csv_text = df.to_csv(index=False)\njs = df.to_json(orient='records')",
+    "import io\nbuf = io.StringIO()\ndf.to_csv(buf)",
+    "from io import BytesIO\nfig.savefig(BytesIO(), format='png')",
+    "import pandas as pd\nwith pd.ExcelWriter('oci://bucket@ns/sandbox/report.xlsx') as writer:\n"
+    "    df.to_excel(writer, sheet_name='a')",
+    "import matplotlib.pyplot as plt\nplt.plot([1, 2]); plt.savefig('plot.png')",
+    "import sys\ndf.to_csv(sys.stdout)",
+    "import cv2\ncv2.imwrite('oci://bucket@ns/sandbox/img.png', img)",
+    # S: generic .save receivers with a dynamic / relative / absent path
+    "model.save(model_uri)\nrow.save()\nwb.save('report.xlsx')",
+    # T: tempfile defaults, a dir the gate cannot resolve, a relative dir
+    "import tempfile\ntmp = tempfile.mkdtemp()\nd = tempfile.gettempdir()",
+    "import tempfile\nwith tempfile.TemporaryDirectory() as d:\n    print(d)",
+    "import tempfile\nfh = tempfile.NamedTemporaryFile(dir=work_dir, suffix='.csv')",
+    "import tempfile\npath = tempfile.mkstemp(prefix='stage_', dir='.')[1]",
+    # U: everyday traceback use returns text, not frames
+    "import traceback\ntry:\n    run()\nexcept Exception:\n    traceback.print_exc()\n    msg = traceback.format_exc()",
+    "import traceback\nframes = traceback.extract_stack()\nlines = traceback.format_exception(e)",
+]
+
+
+@pytest.mark.parametrize("source", CLEAN_CELLS_7, ids=[c[:40] for c in CLEAN_CELLS_7])
+def test_coverage_round2_adjacent_everyday_code_passes_the_gate(source):
+    assert npol.scan_source(source, policy=REVIEW_POLICY) == []

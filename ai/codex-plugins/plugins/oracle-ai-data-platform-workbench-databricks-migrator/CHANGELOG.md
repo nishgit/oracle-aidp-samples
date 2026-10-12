@@ -202,6 +202,36 @@ All notable changes to this plugin are documented here. Format loosely follows [
   read allowance). The ten gap cells are in the test suite verbatim with per-class refused and
   allowed cells; the new tests fail against the d44b776 scanner, and the 146-cell / 31-cell
   probe files are green.
+- **Sandbox gate: coverage round 2 on cfe1b79 closed as classes** (an analyzer coverage test
+  found ten gaps and no false refusals). (Q) Local-filesystem writes through library writers,
+  the mirror of the reader table: `np.save` / `savez` / `savetxt`, `torch.save` /
+  `torch.jit.save`, `joblib.dump`, `scipy.io.savemat`, `cv2.imwrite`, `plt.savefig`,
+  `imageio.imwrite`, `pyarrow.parquet.write_table`, `pd.ExcelWriter` / `HDFStore`,
+  `plotly.io.write_*`, `mlflow.<flavor>.save_model` and the rest of the table, also via
+  `from numpy import save` / `import matplotlib.pyplot as plt` / with the import out of view.
+  (R) Receiver-typed frame writers on any receiver: `df.to_csv` / `to_parquet` / `to_pickle` /
+  `to_json` / `to_hdf` / `to_excel` / ..., polars `write_*`, xarray `to_netcdf`, numpy
+  `tofile`, `savefig`, plotly `write_html` / `write_image` (`pd.DataFrame(x).to_csv(..)`
+  included). For both: a literal local path outside the prefix (`/etc`, `~`, `file://`, an
+  `oci://` path outside it, a name bound once, a literal head `'/dbfs/mnt/prod/' + name`) is
+  `NBP-PATH-WRITE`; a path the gate cannot resolve is `NBP-PATH-WRITE-DYNAMIC` like
+  `df.write.parquet(path_var)` (writes fail closed at every sink; the read-side
+  `unverified_read_path` allowance does not extend to writers), except an in-memory buffer /
+  writer handle the notebook bound (`buf = io.StringIO()`, `BytesIO()`, `with
+  pd.ExcelWriter(p) as w`) or `sys.stdout`; relative paths and the no-path forms
+  (`df.to_csv()`) stay allowed. (S) Generic `.save` / `.save_model` / `.save_pretrained` /
+  `.save_weights` / `.export` on a receiver the gate cannot type (`wb.save('/etc/x.xlsx')`,
+  `model.save`, `img.save`, `doc.save`) judge a literal path the same way and leave a dynamic
+  one alone. (T) `tempfile` creators with a literal `dir=` (keyword or positional slot) or an
+  absolute `prefix=` outside the prefix, a literal head outside it, and `tempfile.tempdir =
+  '/etc'` are `NBP-FS-PATH` (`tempdir = d` is `NBP-FS-DYNAMIC`); the default directory, a
+  `dir=` the gate cannot resolve and a relative `dir` stay allowed. (U) Live frame dumps are
+  introspection routes (`NBP-INDIRECT`): `faulthandler` at import and as a chain,
+  `traceback.walk_stack` / `walk_tb`, `capture_locals=<not the literal False>` on any
+  receiver and `.get_stack()` on a receiver the gate cannot resolve; `traceback.print_exc` /
+  `format_exc` / `extract_stack` stay allowed. The ten gap cells are in the test suite
+  verbatim with per-class refused and allowed cells; the new tests fail against the cfe1b79
+  scanner, and the probe files (now 183 refused / 40 allowed cells) are green.
 - Python 3.9 floor: `cluster_lifecycle.py` and `fuse_package_analyzer.py` used PEP 604
   `X | None` annotations evaluated at import time; `from __future__ import annotations` added.
 - **Secrets shim is Vault-only by default** (`engine/aidp_compat/secrets.py`,
