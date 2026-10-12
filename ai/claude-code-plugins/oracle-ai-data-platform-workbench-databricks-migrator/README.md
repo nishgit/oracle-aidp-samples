@@ -231,14 +231,27 @@ process / network modules (`subprocess`, `multiprocessing`, `ctypes`, `pty`, `so
 itself, or opens / removes / renames / writes (`open`, `pathlib`, `os.remove`, `shutil.move`,
 `saveAsTable`, `insertInto`, `writeTo`, `df.write.*` including `option("path")`, `CREATE TABLE`
 / `INSERT` / `DROP` / `MERGE` / `DELETE` / `LOCATION` / `OPTIONS (path ...)` via `spark.sql`,
-`dbutils.fs.rm/mv/cp/put/mkdirs`) a target outside the sandbox. A target that is a name bound
-once to a string literal earlier in the run is checked as that literal; any other non-literal
-target is refused unless its rule id is allowlisted. The gate matches these forms statically
-and is not a Python sandbox; the runtime assertions in `dbutils.fs.*`, `safe_io` and
+`dbutils.fs.rm/mv/cp/put/mkdirs`) a target outside the sandbox. The gate is deny-by-default for
+every route to the same capability, not only the direct spelling: the builtins namespace through
+`__builtins__` / `builtins` / `globals()` / `locals()` / `vars()` / `getattr`, `getattr` /
+`setattr` with a non-literal name, dunder and frame introspection chains (`__subclasses__`,
+`__globals__`, `__dict__`, `f_globals`, ...; `NBP-DUNDER-ESCAPE`), the IPython shell API and
+`%magic` / `!command` lines inside a cell (`get_ipython().system`, `InteractiveShell`;
+`NBP-IPYTHON-ESCAPE`), the Spark JVM / py4j bridge (`spark._jvm`, `sc._jsc`, `df._jdf`, `py4j`;
+`NBP-POLICY-TAMPER`), deserialisers that execute code (`pickle.loads`, `yaml.load` without a
+safe loader, `torch.load` without `weights_only=True`; `NBP-DESERIALIZE`), process / debugger /
+profiler modules, the stdlib open-equivalents (`io.open`, `os.open`, `gzip.open`, ...), and
+names that were bound to any of these and later rebound to something the gate cannot resolve.
+A target that is a name bound once to a string literal earlier in the run is checked as that
+literal; any other non-literal target is refused unless its rule id is allowlisted. The gate
+matches these forms statically and is not a Python sandbox: a static AST gate over a full
+Python runtime is a mitigation layer, the platform-level control is the IAM scope of the
+cluster the notebook runs on, and the runtime assertions in `dbutils.fs.*`, `safe_io` and
 `dbutils.secrets` are the enforcement layer for writes that go through the compat helpers (see
-`engine/aidp_compat/SUPPORTED_OPERATIONS.md` section 8 for the rule table and what is not
-covered). Refusals and allowed exceptions are recorded and rendered into each task's test
-report under **Notebook Policy Log**. Scheduled jobs that keep using `aidp_compat` after
+`engine/aidp_compat/SUPPORTED_OPERATIONS.md` section 8 for the rule table, what is not covered
+and the known false refusals). Refusals, allowed exceptions and skipped magic-led cells are
+recorded and rendered into each task's test report under **Notebook Policy Log**. Scheduled
+jobs that keep using `aidp_compat` after
 migration must declare the same variables in their environment.
 
 **Secrets** (`dbutils.secrets`). Lookups go to OCI Vault only (`AIDP_VAULT_OCID`, secret named

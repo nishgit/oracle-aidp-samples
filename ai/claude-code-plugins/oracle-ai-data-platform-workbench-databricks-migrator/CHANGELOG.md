@@ -41,6 +41,42 @@ All notable changes to this plugin are documented here. Format loosely follows [
   refused in any mode and `spark.sql()` with an unresolvable statement is `NBP-SQL-DYNAMIC`.
   `dbutils.fs.mkdirs` asserts its target at runtime; `dbutils.fs.mount` no longer writes
   `extra_configs` to the process environment.
+- **Sandbox gate: deny-by-default for indirect routes** (SEC-AIDP-SAMPLES-005 re-verification).
+  The reviewer's probes `__builtins__['__import__']('os').system('id')`,
+  `__builtins__['open']('/etc/passwd')`, `globals()['__builtins__'][...]`,
+  `get_ipython().system('id')`, `spark._jvm...` and `sc._jvm...` all passed the AST gate at
+  d877d90. The scanner now resolves the builtins namespace through every door (`__builtins__`,
+  `builtins`, `globals()` / `locals()` / `vars()`, `__dict__`, `getattr`) and checks the resolved
+  builtin exactly like the direct form (`NBP-BUILTIN-EXEC` / `NBP-OPEN-PATH`), refusing any
+  non-literal key and any other use of the frame namespace (`NBP-INDIRECT`); refuses `getattr` /
+  `setattr` / `delattr` with a non-literal name, `pkgutil` / `runpy` / `code` / `zipimport` /
+  private `_modules`, `sys.settrace` / `meta_path`, `inspect` frames and `gc.get_objects`;
+  refuses dunder / frame introspection chains (`__subclasses__`, `__globals__`, `__dict__`,
+  `__code__`, `f_globals`, `tb_frame`, ...) under the new `NBP-DUNDER-ESCAPE` (dunder
+  definitions in class bodies stay allowed); refuses the IPython shell API (`get_ipython` call
+  or name, `InteractiveShell`, `IPython` imports, `%magic` / `!cmd` lines inside a cell body)
+  under `NBP-OS-PROCESS` for shell / magic execution and the new `NBP-IPYTHON-ESCAPE`
+  otherwise, and logs the magic-led cells `dbutils.notebook.run` skips (`skipped_magic`; no
+  line of such a cell is executed); refuses the Spark JVM / py4j bridge (any `_private`
+  attribute of `spark` / `sc` / `SparkSession` / `SparkContext`, `_jvm` / `_jsc` / `_gateway` /
+  `_jdf` / ... on any object, `py4j`, `JavaGateway`, `registerJavaFunction`, `addPyFile` /
+  `addJar`) under `NBP-POLICY-TAMPER` / `NBP-BUILTIN-EXEC`; refuses further process / exec
+  routes (`concurrent.futures.ProcessPoolExecutor`, `os.posix_spawn` / `forkpty` / `kill`,
+  `cffi`, `signal`, `resource`, `pdb`, `timeit`, `cProfile`, `doctest`, `webbrowser`,
+  `types.FunctionType`, `breakpoint()`), code-executing deserialisers (`pickle` / `marshal` /
+  `shelve` / `dill` / `joblib` loads, `read_pickle`, `yaml.load` without a safe loader,
+  `torch.load` without `weights_only=True`, `numpy.load(allow_pickle=True)`; new
+  `NBP-DESERIALIZE`), the stdlib open-equivalents (`io.open`, `os.open`, `codecs` / `gzip` /
+  `bz2` / `lzma` / `tarfile` / `zipfile` / `sqlite3` / `linecache`) on paths outside the sandbox
+  and `os.chdir` away from it; and follows aliases of all of these across cells (`sp = spark`,
+  `f = getattr`, `b = __builtins__`), refusing a name that was rebound to something it cannot
+  resolve (fail closed). The test suite adds the reviewer's six probes verbatim plus per-class
+  refused and clean cells; every new test fails against the d877d90 scanner. The gate remains a
+  static mitigation layer over a full Python runtime; the platform-level control is the IAM
+  scope of the cluster (documented in `SUPPORTED_OPERATIONS.md` section 8 together with the
+  known false refusals).
+- Python 3.9 floor: `cluster_lifecycle.py` and `fuse_package_analyzer.py` used PEP 604
+  `X | None` annotations evaluated at import time; `from __future__ import annotations` added.
 - **Secrets shim is Vault-only by default** (`engine/aidp_compat/secrets.py`,
   SEC-AIDP-SAMPLES-006). `AIDP_SECRET_*` environment scanning and the JSON file fallback
   (now only via an explicit `AIDP_SECRETS_FILE`) happen only with

@@ -21,6 +21,7 @@ from aidp_compat.notebook_policy import (
     SandboxPolicy,
     ScanContext,
     enforce_cell_policy,
+    record_skipped_cell,
     require_policy,
 )
 
@@ -180,8 +181,11 @@ class AIDPNotebookUtils:
                     if not source:
                         continue
 
-                    # Skip magic commands that exec() can't handle
+                    # Skip magic commands that exec() can't handle. The whole
+                    # cell is skipped: no line of it is compiled or executed.
+                    # The skip is recorded in the policy log.
                     if source.startswith("%") or source.startswith("!"):
+                        record_skipped_cell(source, notebook_path=notebook_path, cell_index=cell_index)
                         continue
 
                     # Mandatory policy gate at the execution sink: parse the
