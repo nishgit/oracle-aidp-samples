@@ -18,6 +18,8 @@ convert with no model involved. Without ``OPENAI_API_KEY`` the migrator runs
 rule-based only, which is a supported configuration and not a degraded one.
 """
 
+from __future__ import annotations
+
 import hashlib
 import os
 

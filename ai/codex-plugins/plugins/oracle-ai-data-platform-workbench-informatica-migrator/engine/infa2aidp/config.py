@@ -24,6 +24,8 @@ shell if you really mean them.
 All settings have sensible defaults. Users only set what they need.
 """
 
+from __future__ import annotations
+
 import os
 import logging
 import re

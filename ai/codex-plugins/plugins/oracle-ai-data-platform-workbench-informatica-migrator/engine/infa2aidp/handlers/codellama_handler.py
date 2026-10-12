@@ -5,6 +5,8 @@ the Anthropic Claude API. Requires ANTHROPIC_API_KEY. The default model is
 Opus 5 (overridable via CLAUDE_MODEL).
 """
 
+from __future__ import annotations
+
 import hashlib
 import json
 import os

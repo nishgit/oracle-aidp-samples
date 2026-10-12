@@ -14,6 +14,8 @@ Config from .env:
   AIDP_REGION, AIDP_INSTANCE_ID, AIDP_WORKSPACE_KEY, OCI_PROFILE
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import os

@@ -1,5 +1,7 @@
 """Migration handlers: LLM integration, compatibility checking, and confidence scoring."""
 
+from __future__ import annotations
+
 from infa2aidp.handlers.codellama_handler import CodeLlamaHandler, LLMHandler
 from infa2aidp.handlers.openai_handler import OpenAIHandler
 from infa2aidp.handlers.compatibility_checker import CompatibilityChecker
