@@ -46,7 +46,21 @@ Two pieces:
    Spark JVM / py4j bridge (``spark._jvm``, ``sc._jsc``), deserialisers that
    execute code (``pickle.loads``, ``yaml.load`` without a safe loader),
    process / debugger / profiler modules, and names that were bound to any of
-   these and later rebound to something the gate cannot resolve.
+   these and later rebound to something the gate cannot resolve. One rule
+   table serves every spelling of a module attribute: the direct chain, an
+   alias (``import posix as p`` is ``os``), a ``from m import n`` name and
+   ``getattr(m, "literal")``. ``str.format`` templates (literal, bound once,
+   or wrapped in ``textwrap.dedent`` / ``.strip()``) are walked field by field
+   against the dunder read allowlist. Library readers (``pd.read_csv``,
+   ``spark.read.csv``, ``np.load``, ``sc.textFile``, ...) with a literal
+   local-filesystem path outside the sandbox are refused like ``open()``.
+
+   Two scope decisions are allowed and recorded in the policy log instead of
+   refused: a reader path the gate cannot resolve (``unverified_read_path``;
+   reading source data through variables is the normal migration case, and
+   object-storage / catalog reads are never path-checked) and a ``spark.sql``
+   statement whose literal head is a read keyword (``unverified_sql_read``;
+   Spark runs one statement per call, so it cannot become a write).
 
 The gate is a static check of the forms listed in SUPPORTED_OPERATIONS.md
 section 8; it is not a Python sandbox, and a static gate over a full Python
@@ -55,8 +69,8 @@ the cluster the notebook runs on. The runtime assertions
 (:func:`assert_path_in_sandbox`, :func:`assert_table_in_sandbox`) are the
 enforcement layer for every write that goes through the compat helpers.
 
-Every refusal, allowed exception and sandbox declaration is appended to an
-in-process policy log (:func:`get_policy_log`) and, when
+Every refusal, allowed exception, unverified read and sandbox declaration is
+appended to an in-process policy log (:func:`get_policy_log`) and, when
 ``AIDP_NOTEBOOK_POLICY_LOG`` names a file, to that JSONL file, so the
 migration report can include it.
 """
@@ -66,6 +80,7 @@ import json
 import os
 import posixpath
 import re
+import string
 import threading
 import time
 from dataclasses import dataclass, field
@@ -140,7 +155,13 @@ _OS_ENV_ATTRS = frozenset({"environ", "getenv", "putenv", "unsetenv", "environb"
 _OS_PROCESS_ATTRS = frozenset({"system", "popen", "posix_spawn", "posix_spawnp", "startfile",
                                "fork", "forkpty", "kill", "killpg", "abort"})
 _OS_PROCESS_PREFIXES = ("exec", "spawn")
+# The platform modules ``os`` re-exports: ``posix.system`` is ``os.system``. An
+# import of either is tracked as an alias of ``os`` so every os rule applies.
+_OS_EQUIVALENT_MODULES = frozenset({"posix", "nt"})
 _ASYNCIO_PROCESS_ATTRS = frozenset({"create_subprocess_shell", "create_subprocess_exec", "subprocess"})
+# The same capability on an event-loop object (``loop.subprocess_exec``); the
+# loop has no module root to key on, so the method names are refused anywhere.
+_ASYNCIO_LOOP_PROCESS_ATTRS = frozenset({"subprocess_exec", "subprocess_shell"})
 _ASYNCIO_NETWORK_ATTRS = frozenset({"open_connection", "start_server", "create_connection",
                                     "open_unix_connection", "start_unix_server", "create_datagram_endpoint"})
 _SYS_INDIRECT_ATTRS = frozenset({"modules", "settrace", "setprofile", "addaudithook", "call_tracing",
@@ -234,6 +255,43 @@ _TABLE_WRITE_METHODS = frozenset({"saveAsTable", "insertInto", "writeTo"})
 _PATH_WRITE_METHODS = frozenset({"parquet", "csv", "json", "orc", "text", "save"})
 _WRITER_OPTION_METHODS = frozenset({"option", "options"})
 _SQL_METHODS = frozenset({"sql"})
+# Local file READS through library readers. A LITERAL local-filesystem path
+# outside the sandbox prefix is refused (NBP-OPEN-PATH, like open()); a path
+# the gate cannot resolve is allowed (reading source data through variables is
+# the normal migration case) and recorded as ``unverified_read_path``.
+# Object-storage URIs (oci://, abfss://, s3://, ...) and catalog tables are
+# not local paths: reading source data is the point of a migration and the
+# cluster's IAM scope is the control there.
+_DATAFRAME_LIB_ROOTS = frozenset({"pandas", "polars", "modin", "dask", "cudf", "geopandas", "xarray", "pyarrow",
+                                  "vaex", "datatable"})
+_DATAFRAME_READ_PREFIXES = ("read_", "scan_", "open_")
+_DATAFRAME_NON_PATH_READERS = frozenset({"read_sql", "read_sql_query", "read_sql_table", "read_clipboard", "read_gbq"})
+_LIB_READER_CALLS = frozenset({
+    ("numpy", "loadtxt"), ("numpy", "genfromtxt"), ("numpy", "fromfile"), ("numpy", "load"), ("numpy", "memmap"),
+    ("pyarrow", "memory_map"), ("pyarrow", "OSFile"), ("pyarrow", "input_stream"),
+    ("pyarrow", "parquet", "ParquetFile"), ("pyarrow", "parquet", "ParquetDataset"), ("pyarrow", "dataset", "dataset"),
+    ("PIL", "Image", "open"), ("cv2", "imread"), ("h5py", "File"), ("scipy", "io", "loadmat"),
+    ("xml", "etree", "ElementTree", "parse"), ("openpyxl", "load_workbook"), ("xlrd", "open_workbook"),
+    ("imageio", "imread"), ("tifffile", "imread"), ("netCDF4", "Dataset"), ("rasterio", "open"), ("zarr", "open"),
+    ("librosa", "load"), ("soundfile", "read"),
+})
+_SPARK_READER_CHAIN = frozenset({"read", "readStream"})
+_SPARK_IO_CHAIN = _SPARK_READER_CHAIN | frozenset({"write", "writeStream", "writeTo"})
+_SPARK_PATH_READ_METHODS = frozenset({"parquet", "csv", "json", "orc", "text", "load", "textFile", "xml", "avro"})
+_SC_PATH_READ_METHODS = frozenset({"textFile", "wholeTextFiles", "binaryFiles", "binaryRecords", "sequenceFile",
+                                   "hadoopFile", "newAPIHadoopFile", "pickleFile"})
+_READER_PATH_KWARGS = ("path", "paths", "filepath_or_buffer", "path_or_buf", "io", "source", "file", "filename",
+                       "fname", "name", "filename_or_obj", "fp")
+# str.format templates: methods that return the receiver's text unchanged in
+# shape, and the stdlib helpers that do, so ``textwrap.dedent("...").format(x)``
+# is checked as the literal.
+_STR_PRESERVING_METHODS = frozenset({"strip", "lstrip", "rstrip", "upper", "lower", "title", "capitalize",
+                                     "swapcase", "expandtabs", "casefold"})
+_STR_PRESERVING_CALLS = frozenset({("textwrap", "dedent"), ("inspect", "cleandoc")})
+# Informational policy-log events (not refusals, not rule ids).
+NOTE_UNVERIFIED_READ_PATH = "unverified_read_path"      # library reader with a path the gate cannot resolve
+NOTE_UNVERIFIED_SQL_READ = "unverified_sql_read"        # spark.sql read statement with run-time fragments
+POLICY_NOTES = (NOTE_UNVERIFIED_READ_PATH, NOTE_UNVERIFIED_SQL_READ)
 
 # Names whose attributes notebook code must not rebind or introspect: the
 # interpreter and the compat shims the sandbox is built from.
@@ -244,7 +302,7 @@ _PROTECTED_ROOTS = frozenset({"os", "sys", "builtins", "__builtins__", "importli
 # While it stays resolvable the alias is followed; once rebound to something
 # the gate cannot resolve, every later use of the name is refused (fail closed).
 _WATCHED_MODULES = _PROCESS_MODULES | _NETWORK_MODULES | _INDIRECT_MODULES | _EXEC_MODULES | _JVM_BRIDGE_MODULES \
-    | _IPYTHON_MODULES | _IO_MODULES | _DESERIALIZE_MODULES | _PROTECTED_ROOTS \
+    | _IPYTHON_MODULES | _IO_MODULES | _DESERIALIZE_MODULES | _PROTECTED_ROOTS | _OS_EQUIVALENT_MODULES \
     | frozenset({"asyncio", "concurrent", "yaml", "aidp_compat"})
 # Single names that may be aliased (``sp = spark``, ``f = getattr``, ``b = __builtins__``)
 # and that taint the alias for the rest of the run.
@@ -282,6 +340,10 @@ _SQL_WRITE_VERB_RE = re.compile(
 _SQL_TEMP_VIEW_RE = re.compile(
     r"^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(?:GLOBAL\s+)?TEMP(?:ORARY)?\s+VIEW\b", re.IGNORECASE
 )
+# Spark executes one statement per spark.sql() call, so a statement whose
+# literal head is a read keyword cannot become a write whatever the run-time
+# tail contains. Dynamic statements with any other head are refused.
+_SQL_READ_HEAD_RE = re.compile(r"^\s*(?:SELECT|WITH|SHOW|DESCRIBE|DESC|EXPLAIN)\b", re.IGNORECASE)
 
 
 def _is_sql_write_verb(text: str) -> bool:
@@ -301,6 +363,12 @@ _SQL_SCHEMA_STMT_RE = re.compile(
 _SQL_COMMENT_RE = re.compile(r"--[^\n]*|/\*.*?\*/", re.DOTALL)
 _URI_RE = re.compile(r"^([A-Za-z][A-Za-z0-9+.\-]*)://([^/\\]*)([/\\].*)?$", re.DOTALL)
 _SEGMENT_SPLIT_RE = re.compile(r"[\\/]+")
+# Host-absolute forms regardless of the host this module runs on: a Windows
+# drive (``C:\``, ``C:/``), a UNC path (``\\server\share``) and a ``file:`` URI.
+_WINDOWS_PATH_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\)")
+_FILE_URI_RE = re.compile(r"^file:/+", re.IGNORECASE)
+# ``{0.attr[key].attr}``: the attribute / index steps after the argument name.
+_FORMAT_FIELD_STEP_RE = re.compile(r"\.([^.\[]*)|\[([^\]]*)\]")
 
 
 # ── Errors ─────────────────────────────────────────────────────────────
@@ -835,12 +903,87 @@ def _magic_violation(source: str) -> Optional["Violation"]:
 
 
 def _is_abs_path(path: str) -> bool:
-    """POSIX-absolute, URI (``scheme://``) or host-absolute path.
+    """POSIX-absolute, home-relative (``~``), URI (``scheme://``) or host-absolute path.
 
     Notebooks run on Linux clusters, so a leading ``/`` is absolute even when
-    this module is imported on Windows (where ``os.path.isabs`` disagrees).
+    this module is imported on Windows (where ``os.path.isabs`` disagrees);
+    Windows drive / UNC forms are absolute even when checked on Linux.
     """
-    return path.startswith("/") or "://" in path or os.path.isabs(path)
+    return path.startswith(("/", "~")) or "://" in path or bool(_WINDOWS_PATH_RE.match(path)) \
+        or os.path.isabs(path)
+
+
+def _is_local_path(path: str) -> bool:
+    """A literal that names the cluster's local filesystem: POSIX-absolute
+    (``/etc``, ``/dbfs``, ``/Workspace``, ``/tmp``, ``/Volumes``), ``~``, a
+    Windows drive / UNC path or a ``file:`` URI. Object-storage URIs
+    (``oci://``, ``abfss://``, ``s3://``, ...) and relative paths are not."""
+    p = path.strip()
+    return p.startswith(("/", "~")) or bool(_WINDOWS_PATH_RE.match(p)) or bool(_FILE_URI_RE.match(p))
+
+
+def _local_path_for_check(path: str) -> str:
+    """``file:///tmp/x`` -> ``/tmp/x`` so the sandbox-prefix comparison sees the path."""
+    p = path.strip()
+    m = _FILE_URI_RE.match(p)
+    return "/" + p[m.end():] if m else p
+
+
+def _format_field_escape(template: str) -> Optional[str]:
+    """First ``str.format`` replacement field of ``template`` that walks a
+    refused dunder / frame attribute (``{0.__class__.__mro__}``), with its
+    braces, or ``None``. Honours ``_DUNDER_ALLOW``; index steps (``[key]``)
+    are item lookups, not attribute access. Nested fields inside a format
+    spec are formatted with the same arguments and are walked too.
+    """
+    try:
+        parsed = list(string.Formatter().parse(template))
+    except ValueError:
+        return None   # str.format raises the same error before evaluating anything
+    for _literal, field_name, format_spec, _conversion in parsed:
+        if field_name is None:
+            continue
+        steps_from = len(field_name)
+        for i, ch in enumerate(field_name):
+            if ch in ".[":
+                steps_from = i
+                break
+        for m in _FORMAT_FIELD_STEP_RE.finditer(field_name, steps_from):
+            attr = m.group(1)
+            if attr is not None and ((_is_dunder(attr) and attr not in _DUNDER_ALLOW) or attr in _FRAME_ATTRS):
+                return "{" + field_name + "}"
+        if format_spec and "{" in format_spec:
+            nested = _format_field_escape(format_spec)
+            if nested is not None:
+                return nested
+    return None
+
+
+def _import_chain(module_name: str) -> Tuple[str, ...]:
+    """Dotted import name as a chain, with ``posix`` / ``nt`` canonicalised to ``os``."""
+    parts = module_name.split(".")
+    if parts and parts[0] in _OS_EQUIVALENT_MODULES:
+        parts[0] = "os"
+    return tuple(parts)
+
+
+def _module_level_statements(tree: ast.Module) -> Iterable[ast.stmt]:
+    """Statements that run in the cell's own namespace: the top level and the
+    bodies of compound statements that do not open a scope (``for`` /
+    ``while`` / ``if`` / ``with`` / ``try``). Function and class bodies are
+    not descended into: a binding there is a different name."""
+    stack: List[ast.stmt] = list(reversed(tree.body))
+    while stack:
+        node = stack.pop()
+        yield node
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        children: List[ast.stmt] = []
+        for attr in ("body", "orelse", "finalbody"):
+            children.extend(getattr(node, attr, None) or [])
+        for handler in getattr(node, "handlers", None) or []:
+            children.extend(handler.body)
+        stack.extend(reversed(children))
 
 
 def _is_prohibited_module(name: str, policy: SandboxPolicy) -> Optional[Tuple[str, str]]:
@@ -904,6 +1047,11 @@ _REM_INDIRECT = ("Indirect access to the interpreter (importlib, builtins / __bu
                  "import the module you need directly and call it by name so the gate can see it.")
 _REM_DUNDER = ("Dunder and frame introspection chains (__subclasses__, __globals__, __dict__, __code__, f_globals, "
                "tb_frame, ...) are refused; use the public API of the object.")
+_REM_FORMAT = ("Write the format template as a literal in the notebook (or a name bound once to one): a template "
+               "built at run time can address attributes of the formatted objects (__class__.__mro__, "
+               "__globals__, ...), so an unresolvable template with run-time arguments is refused.")
+_REM_READ_PATH = ("Read source data from object storage (oci://...), a catalog table, a relative path or a path under "
+                  "the sandbox prefix; a literal local-filesystem path outside it is refused.")
 _REM_IPYTHON = ("The IPython shell API (get_ipython, InteractiveShell, %magics, !commands) is not available inside "
                 "the sandbox; express the step in plain Python or dbutils.")
 _REM_JVM = ("The Spark JVM / py4j bridge (spark._jvm, sc._jsc, df._jdf, py4j) and private Spark attributes are "
@@ -919,6 +1067,9 @@ class _PolicyScanner(ast.NodeVisitor):
         self.policy = policy
         self.ctx = context if context is not None else ScanContext()
         self.violations: List[Violation] = []
+        # Informational entries (``rule`` holds the POLICY_NOTES event name):
+        # allowed operations the gate could not verify, for the policy log.
+        self.notes: List[Violation] = []
         self._seen: set = set()
         # Node ids a more specific check has already judged (``__builtins__['open'](..)``
         # is reported as open(), not additionally as namespace access).
@@ -936,6 +1087,14 @@ class _PolicyScanner(ast.NodeVisitor):
         self._seen.add(key)
         self.violations.append(Violation(rule=rule, detail=detail, target=target,
                                          lineno=lineno, remediation=remediation))
+
+    def _note(self, event: str, node: ast.AST, detail: str, target: str = "") -> None:
+        lineno = getattr(node, "lineno", 0)
+        key = (event, lineno, target)
+        if key in self._seen:
+            return
+        self._seen.add(key)
+        self.notes.append(Violation(rule=event, detail=detail, target=target, lineno=lineno))
 
     # -- pre-pass: bindings, aliases, constants -------------------------
     def prepare(self, tree: ast.Module) -> None:
@@ -996,13 +1155,19 @@ class _PolicyScanner(ast.NodeVisitor):
                 taint_assignment([node.target], node.value)
         for name in bound:
             self.ctx.forget(name)
-        for node in tree.body:
+        for node in _module_level_statements(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
-                    if alias.asname and bound.get(alias.asname, 0) == 1:
-                        self.ctx.aliases[alias.asname] = tuple(alias.name.split("."))
-                    elif not alias.asname and bound.get(_module_root(alias.name), 0) == 1:
-                        self.ctx.identities.add(_module_root(alias.name))
+                    local = alias.asname or _module_root(alias.name)
+                    if bound.get(local, 0) != 1:
+                        continue
+                    chain = _import_chain(alias.name)
+                    if alias.asname:
+                        self.ctx.aliases[local] = chain
+                    elif chain[0] != local:
+                        self.ctx.aliases[local] = chain[:1]      # import posix -> an alias of os
+                    else:
+                        self.ctx.identities.add(local)
             elif isinstance(node, ast.ImportFrom) and node.module:
                 if _module_root(node.module) == "aidp_compat":
                     continue  # helpers keep their own names (dbutils, translate_path, safe_*)
@@ -1011,7 +1176,7 @@ class _PolicyScanner(ast.NodeVisitor):
                         continue
                     local = alias.asname or alias.name
                     if bound.get(local, 0) == 1:
-                        self.ctx.aliases[local] = tuple(node.module.split(".")) + (alias.name,)
+                        self.ctx.aliases[local] = _import_chain(node.module) + (alias.name,)
             elif isinstance(node, ast.Assign) and len(node.targets) == 1 \
                     and isinstance(node.targets[0], ast.Name):
                 name = node.targets[0].id
@@ -1175,6 +1340,27 @@ class _PolicyScanner(ast.NodeVisitor):
             if root in _PROTECTED_ROOTS and part.startswith("_"):
                 target = ".".join(chain[:i + 1])
                 return RULE_POLICY_TAMPER, target, f"access to a private attribute of {root} ({target})", _REM_TAMPER
+        # Module rules. One table for every entry point: a direct attribute
+        # chain, an alias that stands for one (``from os import system``,
+        # ``import posix as p``), ``getattr(mod, "literal")`` and an import.
+        if root == "os":
+            if chain[1] in _OS_ENV_ATTRS:
+                return RULE_OS_ENVIRON, f"os.{chain[1]}", f"access to os.{chain[1]}", _REM_ENV
+            if chain[1] in _OS_PROCESS_ATTRS or chain[1].startswith(_OS_PROCESS_PREFIXES):
+                return RULE_OS_PROCESS, f"os.{chain[1]}", f"access to os.{chain[1]}", _REM_PROC
+        if root == "shutil" and chain[1] == "rmtree":
+            return RULE_SHUTIL_RMTREE, "shutil.rmtree", "access to shutil.rmtree", \
+                "Use dbutils.fs.rm on a sandbox path instead."
+        if root in _INDIRECT_MODULES:
+            return RULE_INDIRECT, f"{root}.{chain[1]}", f"access to {root}.{chain[1]}", _REM_INDIRECT
+        if root == "asyncio" and chain[1] in _ASYNCIO_PROCESS_ATTRS:
+            return RULE_OS_PROCESS, f"asyncio.{chain[1]}", f"access to asyncio.{chain[1]}", _REM_PROC
+        if chain[-1] in _ASYNCIO_LOOP_PROCESS_ATTRS:
+            target = ".".join(chain)
+            return RULE_OS_PROCESS, target, f"{target}() starts a subprocess through the event loop", _REM_PROC
+        if root == "aidp_compat":
+            target = ".".join(chain[:3])
+            return RULE_POLICY_TAMPER, target, f"attribute access on the aidp_compat package ({target})", _REM_TAMPER
         if root in _SPARK_ROOTS and chain[-1] in _SPARK_CODE_LOAD_ATTRS:
             target = ".".join(chain)
             return RULE_BUILTIN_EXEC, target, f"{target}() loads code into the session", \
@@ -1187,7 +1373,7 @@ class _PolicyScanner(ast.NodeVisitor):
             if chain[-1] in _IPYTHON_SHELL_ATTRS:
                 return RULE_OS_PROCESS, target, f"IPython shell escape {target}", _REM_PROC
             return RULE_IPYTHON_ESCAPE, target, f"IPython shell object access {target}", _REM_IPYTHON
-        if root == "sys" and chain[1] in _SYS_INDIRECT_ATTRS and chain[1] != "modules":
+        if root == "sys" and chain[1] in _SYS_INDIRECT_ATTRS:
             return RULE_INDIRECT, f"sys.{chain[1]}", f"access to sys.{chain[1]}", _REM_INDIRECT
         if root == "gc" and chain[1] in _GC_INDIRECT_ATTRS:
             return RULE_INDIRECT, f"gc.{chain[1]}", f"live object graph access via gc.{chain[1]}", _REM_INDIRECT
@@ -1251,45 +1437,26 @@ class _PolicyScanner(ast.NodeVisitor):
             self._add(rule, node, f"import from prohibited module '{mod}'", target=root,
                       remediation=self._import_remediation(rule))
         else:
+            chain = list(_import_chain(mod)) if mod else []       # from posix import system -> os.system
             if mod == "http" and "client" in names and not self.policy.allow_network:
                 self._add(RULE_IMPORT_NETWORK, node, "import of prohibited module 'http.client'",
                           target="http.client", remediation=self._import_remediation(RULE_IMPORT_NETWORK))
-            if mod == "os":
-                if "*" in names:
-                    self._add(RULE_OS_ENVIRON, node, "star import of os brings os.environ into the namespace",
-                              target="os.*", remediation=_REM_ENV)
-                env_hits = names & _OS_ENV_ATTRS
-                if env_hits:
-                    self._add(RULE_OS_ENVIRON, node, f"import of os.{sorted(env_hits)[0]}",
-                              target=f"os.{sorted(env_hits)[0]}", remediation=_REM_ENV)
-                proc_hits = {n for n in names if n in _OS_PROCESS_ATTRS or n.startswith(_OS_PROCESS_PREFIXES)}
-                if proc_hits:
-                    self._add(RULE_OS_PROCESS, node, f"import of os.{sorted(proc_hits)[0]}",
-                              target=f"os.{sorted(proc_hits)[0]}", remediation=_REM_PROC)
-            if mod == "sys" and ("modules" in names or "*" in names):
+            if chain == ["os"] and "*" in names:
+                self._add(RULE_OS_ENVIRON, node, "star import of os brings os.environ into the namespace",
+                          target="os.*", remediation=_REM_ENV)
+            if chain == ["sys"] and "*" in names:
                 self._add(RULE_INDIRECT, node, "import of sys.modules", target="sys.modules",
                           remediation=_REM_INDIRECT)
-            if mod == "asyncio":
-                proc_hits = names & _ASYNCIO_PROCESS_ATTRS
-                if proc_hits:
-                    self._add(RULE_OS_PROCESS, node, f"import of asyncio.{sorted(proc_hits)[0]}",
-                              target=f"asyncio.{sorted(proc_hits)[0]}", remediation=_REM_PROC)
-                net_hits = names & _ASYNCIO_NETWORK_ATTRS
-                if net_hits and not self.policy.allow_network:
-                    self._add(RULE_IMPORT_NETWORK, node, f"import of asyncio.{sorted(net_hits)[0]}",
-                              target=f"asyncio.{sorted(net_hits)[0]}",
-                              remediation=self._import_remediation(RULE_IMPORT_NETWORK))
-            if mod == "shutil" and "rmtree" in names:
-                self._add(RULE_SHUTIL_RMTREE, node, "import of shutil.rmtree", target="shutil.rmtree",
-                          remediation="Use dbutils.fs.rm on a sandbox path instead.")
-            # Every other name that stands for a gated chain (``from pickle import loads``,
-            # ``from inspect import currentframe``, ``from concurrent.futures import
-            # ProcessPoolExecutor``) is judged as that chain at import time.
+            # Every name that stands for a gated chain (``from os import system``,
+            # ``from pickle import loads``, ``from inspect import currentframe``,
+            # ``from concurrent.futures import ProcessPoolExecutor``) is judged
+            # as that chain at import time, by the same table as attribute access.
             for name in sorted(names - {"*"}):
                 if (mod, name) in (("yaml", "load"), ("yaml", "load_all"), ("torch", "load")):
                     continue  # judged at the call (Loader= / weights_only=)
-                self._add_rule(node, self._attr_rule(mod.split(".") + [name]))
-            if "*" in names and mod != "os" and _module_root(mod) in _STAR_IMPORT_REFUSED:
+                if chain:
+                    self._add_rule(node, self._attr_rule(chain + [name]))
+            if "*" in names and chain != ["os"] and _module_root(mod) in _STAR_IMPORT_REFUSED:
                 self._add(RULE_INDIRECT, node, f"star import of {mod} binds its API under unqualified names",
                           target=mod + ".*", remediation=_REM_INDIRECT)
         self.generic_visit(node)
@@ -1327,29 +1494,6 @@ class _PolicyScanner(ast.NodeVisitor):
             self.generic_visit(node)
             return
         chain = self._chain(node)
-        if len(chain) >= 2 and chain[0] == "os":
-            attr = chain[1]
-            if attr in _OS_ENV_ATTRS:
-                self._add(RULE_OS_ENVIRON, node, f"access to os.{attr}", target=f"os.{attr}",
-                          remediation=_REM_ENV)
-            elif attr in _OS_PROCESS_ATTRS or attr.startswith(_OS_PROCESS_PREFIXES):
-                self._add(RULE_OS_PROCESS, node, f"access to os.{attr}", target=f"os.{attr}",
-                          remediation=_REM_PROC)
-        if chain[:2] == ["shutil", "rmtree"]:
-            self._add(RULE_SHUTIL_RMTREE, node, "access to shutil.rmtree", target="shutil.rmtree",
-                      remediation="Use dbutils.fs.rm on a sandbox path instead.")
-        if chain[:2] == ["sys", "modules"]:
-            self._add(RULE_INDIRECT, node, "access to sys.modules", target="sys.modules",
-                      remediation=_REM_INDIRECT)
-        if chain and chain[0] in _INDIRECT_MODULES and len(chain) >= 2:
-            self._add(RULE_INDIRECT, node, f"access to {chain[0]}.{chain[1]}",
-                      target=f"{chain[0]}.{chain[1]}", remediation=_REM_INDIRECT)
-        if len(chain) >= 2 and chain[0] == "asyncio" and chain[1] in _ASYNCIO_PROCESS_ATTRS:
-            self._add(RULE_OS_PROCESS, node, f"access to asyncio.{chain[1]}",
-                      target=f"asyncio.{chain[1]}", remediation=_REM_PROC)
-        if chain and chain[0] == "aidp_compat" and len(chain) >= 2:
-            self._add(RULE_POLICY_TAMPER, node, f"attribute access on the aidp_compat package ({'.'.join(chain[:3])})",
-                      target=".".join(chain[:3]), remediation=_REM_TAMPER)
         if len(chain) < 2:
             # Attribute on an expression the chain cannot name (``().__class__``,
             # ``x[0].__dict__``): the attribute itself is still judged.
@@ -1490,8 +1634,7 @@ class _PolicyScanner(ast.NodeVisitor):
                 self._check_attribute_call(node, resolved, resolved[-1])
         elif isinstance(func, ast.Attribute):
             self._check_attribute_call(node, self._chain(func), func.attr)
-            if func.attr == "format":
-                self._check_format_literal(node, func.value)
+            self._check_format_call(node, func)
         self.generic_visit(node)
 
     def _check_name_call(self, node: ast.Call, name: str, bare: Optional[str] = None) -> None:
@@ -1520,12 +1663,67 @@ class _PolicyScanner(ast.NodeVisitor):
                       remediation="Process and FFI modules are not available inside the sandbox; "
                                   "use ThreadPoolExecutor.")
 
-    def _check_format_literal(self, node: ast.Call, receiver: ast.AST) -> None:
-        """``"{0.__class__.__mro__}".format(x)``: attribute lookups inside a format string."""
-        lit = _literal_str(receiver)
-        if lit is not None and re.search(r"\{[^{}]*[.\[]__\w+__", lit):
-            self._add(RULE_DUNDER_ESCAPE, node, "dunder attribute lookup inside a str.format() field",
-                      target=lit[:80], remediation=_REM_DUNDER)
+    # -- str.format templates ----------------------------------------------
+    def _fold_literal(self, node: Optional[ast.AST]) -> Optional[str]:
+        """Literal text of ``node``: a constant, a name bound once to one, ``"a" + "b"``."""
+        node = self._resolve_value(node)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            left, right = self._fold_literal(node.left), self._fold_literal(node.right)
+            return None if left is None or right is None else left + right
+        return _literal_str(node)
+
+    def _resolve_template(self, node: Optional[ast.AST]) -> Optional[str]:
+        """The format template behind ``node``, through text-preserving wrappers
+        (``textwrap.dedent("...")``, ``"...".strip()``), or ``None``."""
+        while isinstance(self._resolve_value(node), ast.Call):
+            call = self._resolve_value(node)
+            fn = call.func
+            if isinstance(fn, ast.Attribute) and fn.attr in _STR_PRESERVING_METHODS:
+                node = fn.value
+            elif tuple(self._chain(fn)) in _STR_PRESERVING_CALLS and call.args:
+                node = call.args[0]
+            else:
+                return None
+        return self._fold_literal(node)
+
+    def _check_format_call(self, node: ast.Call, func: ast.Attribute) -> None:
+        """``<template>.format(..)`` / ``.format_map(..)``, ``str.format(t, ..)``,
+        ``string.Formatter().format / vformat(t, ..)``: a replacement field can
+        walk attributes of the formatted objects (``{0.__class__.__mro__}``)."""
+        chain = self._chain(func)
+        if func.attr in ("format", "format_map") and chain == ["str", func.attr]:
+            if node.args:
+                self._check_format_template(node, node.args[0], node.args[1:], node.keywords)
+            return
+        if func.attr in ("format", "vformat") and chain[:2] == ["string", "Formatter"]:
+            if node.args:
+                self._check_format_template(node, node.args[0], node.args[1:], node.keywords)
+            return
+        if func.attr not in ("format", "format_map"):
+            return
+        if any(part in _SPARK_IO_CHAIN for part in chain[:-1]):
+            return   # DataFrameReader / DataFrameWriter .format("delta")
+        self._check_format_template(node, func.value, node.args, node.keywords)
+
+    def _check_format_template(self, node: ast.Call, template: ast.AST, args: Sequence[ast.AST],
+                               keywords: Sequence[ast.keyword]) -> None:
+        text = self._resolve_template(template)
+        if text is not None:
+            field = _format_field_escape(text)
+            if field is not None:
+                self._add(RULE_DUNDER_ESCAPE, node, "dunder / frame attribute lookup inside a str.format() field",
+                          target=field[:80], remediation=_REM_DUNDER)
+            return
+        # Unresolvable template. With only literal arguments nothing of the
+        # notebook's objects is reachable; with a run-time argument the
+        # template decides which of its attributes are walked: fail closed.
+        dynamic = any(isinstance(a, ast.Starred) or not isinstance(self._resolve_value(a), ast.Constant)
+                      for a in args)
+        dynamic = dynamic or any(k.arg is None or not isinstance(self._resolve_value(k.value), ast.Constant)
+                                 for k in keywords)
+        if dynamic:
+            self._add(RULE_DUNDER_ESCAPE, node, "str.format() on a template that cannot be resolved statically",
+                      target="<dynamic>", remediation=_REM_FORMAT)
 
     def _check_attribute_call(self, node: ast.Call, chain: List[str], attr: str) -> None:
         if chain[:1] == ["get_ipython"] and len(chain) >= 2:
@@ -1537,6 +1735,11 @@ class _PolicyScanner(ast.NodeVisitor):
             if arg is not None:
                 self._check_io_target(node, arg, f"{chain[0]}.{attr}()")
             return
+        reader = self._reader_call_name(chain, attr)
+        if reader is not None:
+            arg = _first_arg(node, _READER_PATH_KWARGS)
+            if arg is not None:
+                self._check_read_path(node, arg, reader)
         if chain[:1] == ["os"] and attr in ("chdir", "fchdir"):
             # Relative paths are tolerated for open(); the working directory must therefore stay put.
             lit = self._resolve_literal(_first_arg(node, ("path",)))
@@ -1559,6 +1762,8 @@ class _PolicyScanner(ast.NodeVisitor):
             self._check_path_write(node, attr)
         elif attr in _WRITER_OPTION_METHODS and ("write" in chain or "writeTo" in chain):
             self._check_writer_option(node, attr)
+        elif attr in _WRITER_OPTION_METHODS and any(part in _SPARK_READER_CHAIN for part in chain):
+            self._check_reader_option(node, attr, ".".join(chain))
         elif attr == "open" and chain[:1] == ["builtins"]:
             self._check_open(node)
         elif chain[:1] == ["os"] and attr in _OS_FS_ATTRS:
@@ -1576,7 +1781,16 @@ class _PolicyScanner(ast.NodeVisitor):
             return
         chain = self._chain(arg) if isinstance(arg, (ast.Attribute, ast.Name, ast.Call)) else []
         mutate = builtin in _MUTATE_BUILTINS
-        if self._is_protected_root(chain) or (chain and chain[0] in _SPARK_ROOTS) or self._is_builtins_namespace(arg):
+        name = _literal_str(node.args[1]) if len(node.args) >= 2 else None
+        # A Spark object tolerates getattr with a literal, public attribute name
+        # (``getattr(spark, "version")``); the name is then judged like
+        # ``spark.version`` below. Dynamic names, private / dunder names, vars()
+        # and every mutation stay refused. The interpreter / compat roots have
+        # no legitimate reflective use in a notebook: refused whatever the name.
+        spark_obj = bool(chain) and chain[0] in _SPARK_ROOTS
+        spark_refused = spark_obj and (mutate or builtin == "vars" or name is None or name.startswith("_"))
+        protected = self._is_protected_root(chain) and not spark_obj
+        if protected or spark_refused or self._is_builtins_namespace(arg):
             rule = RULE_POLICY_TAMPER if mutate else RULE_INDIRECT
             shown = ".".join(chain) if chain else "__builtins__"
             self._add(rule, node, f"{builtin}() on {shown}", target=shown,
@@ -1584,7 +1798,6 @@ class _PolicyScanner(ast.NodeVisitor):
             return
         if builtin == "vars" or len(node.args) < 2:
             return
-        name = _literal_str(node.args[1])
         shown = ".".join(chain) if chain else "<expr>"
         if name is None:
             # getattr(obj, "sys" + "tem") / setattr(obj, key, v): the attribute name is built at run time.
@@ -1639,6 +1852,52 @@ class _PolicyScanner(ast.NodeVisitor):
         if arg is None:
             return
         self._check_io_target(node, arg, "open()")
+
+    # -- library readers: local path literals ------------------------------
+    @staticmethod
+    def _reader_call_name(chain: List[str], attr: str) -> Optional[str]:
+        """Dotted name when ``chain`` is a known path reader, else ``None``.
+
+        pandas-style ``read_* / scan_* / open_*`` on a dataframe library,
+        the loaders in ``_LIB_READER_CALLS``, ``spark.read[Stream].<fmt>/load``
+        and ``sparkContext.textFile``-style RDD readers.
+        """
+        if len(chain) < 2:
+            return None
+        root = chain[0]
+        if root in _DATAFRAME_LIB_ROOTS and attr.startswith(_DATAFRAME_READ_PREFIXES) \
+                and attr not in _DATAFRAME_NON_PATH_READERS:
+            return ".".join(chain)
+        if tuple(chain) in _LIB_READER_CALLS:
+            return ".".join(chain)
+        if attr in _SPARK_PATH_READ_METHODS and any(part in _SPARK_READER_CHAIN for part in chain[:-1]):
+            return ".".join(chain)
+        if attr in _SC_PATH_READ_METHODS and (root in _SPARK_ROOTS or "sparkContext" in chain):
+            return ".".join(chain)
+        return None
+
+    def _check_reader_option(self, node: ast.Call, method: str, call_name: str) -> None:
+        if method == "option":
+            if len(node.args) >= 2 and _literal_str(node.args[0]) == "path":
+                self._check_read_path(node, node.args[1], call_name + "('path')")
+            return
+        for k in node.keywords:
+            if k.arg == "path":
+                self._check_read_path(node, k.value, call_name + "(path=)")
+
+    def _check_read_path(self, node: ast.Call, arg: ast.AST, call_name: str) -> None:
+        """Literal local path outside the sandbox -> refused; object-storage /
+        relative literal -> fine; unresolvable -> allowed, recorded."""
+        lit = self._resolve_literal(arg)
+        if lit is None:
+            self._note(NOTE_UNVERIFIED_READ_PATH, node,
+                       f"{call_name}() with a path that cannot be resolved statically; the read is allowed "
+                       "and unverified (the cluster's IAM scope is the control)",
+                       target=f"{call_name}(<dynamic>)")
+            return
+        if _is_local_path(lit) and not self.policy.path_in_sandbox(_local_path_for_check(lit)):
+            self._add(RULE_OPEN_PATH, node, f"{call_name}() reads a local path outside the sandbox prefix",
+                      target=lit, remediation=_REM_READ_PATH)
 
     def _check_io_target(self, node: ast.Call, arg: ast.AST, call_name: str) -> None:
         lit = self._resolve_literal(arg)
@@ -1794,11 +2053,27 @@ class _PolicyScanner(ast.NodeVisitor):
                           target="<dynamic>",
                           remediation="Pass a literal statement (or a name bound once to one), or list "
                                       "NBP-SQL-DYNAMIC in AIDP_NOTEBOOK_POLICY_ALLOW after review.")
-            elif head and _is_sql_write_verb(head):
+                return
+            # Spark runs one statement per call: a statement whose literal head
+            # (after whitespace / comments) is a read keyword, or a session-scoped
+            # TEMP VIEW, cannot become a write whatever the run-time tail is.
+            head_text = _SQL_COMMENT_RE.sub(" ", head).strip()
+            if _SQL_READ_HEAD_RE.match(head_text) or _SQL_TEMP_VIEW_RE.match(head_text):
+                self._note(NOTE_UNVERIFIED_SQL_READ, node,
+                           f"{call_name}() read statement with run-time fragments; allowed, the literal head "
+                           "fixes the statement type", target=head_text[:80])
+            elif head_text and _is_sql_write_verb(head_text):
                 self._add(RULE_SQL_DYNAMIC, node, f"{call_name}() DDL/DML with a non-literal target",
                           target="<dynamic>",
                           remediation="Use a literal sandbox table, or list NBP-SQL-DYNAMIC in "
                                       "AIDP_NOTEBOOK_POLICY_ALLOW after review.")
+            else:
+                self._add(RULE_SQL_DYNAMIC, node,
+                          f"{call_name}() statement whose leading keyword is not a literal read keyword",
+                          target="<dynamic>",
+                          remediation="Start the statement with a literal SELECT / WITH / SHOW / DESCRIBE / "
+                                      "EXPLAIN (or CREATE TEMP VIEW), pass a fully literal statement, or list "
+                                      "NBP-SQL-DYNAMIC in AIDP_NOTEBOOK_POLICY_ALLOW after review.")
             return
         name, is_schema_stmt, locations = _sql_write_target(lit)
         for location in locations:
@@ -1832,19 +2107,26 @@ def scan_source(source: str, *, filename: str = "<cell>", policy: Optional[Sandb
     a refusal (``NBP-OS-PROCESS`` / ``NBP-IPYTHON-ESCAPE``) so the attempt
     shows up in the policy log.
     """
-    pol = policy or require_policy()
+    violations, _notes = _scan(source, filename=filename, policy=policy or require_policy(), context=context)
+    return violations
+
+
+def _scan(source: str, *, filename: str, policy: SandboxPolicy,
+          context: Optional[ScanContext]) -> Tuple[List[Violation], List[Violation]]:
+    """``(violations, notes)`` for one cell; see :func:`scan_source`."""
     try:
         tree = ast.parse(source, filename=filename)
     except SyntaxError:
         magic = _magic_violation(source)
         if magic is None:
             raise
-        return [magic]
-    scanner = _PolicyScanner(pol, context)
+        return [magic], []
+    scanner = _PolicyScanner(policy, context)
     scanner.prepare(tree)
     scanner.visit(tree)
     scanner.violations.sort(key=lambda v: (v.lineno, v.rule))
-    return scanner.violations
+    scanner.notes.sort(key=lambda v: (v.lineno, v.rule))
+    return scanner.violations, scanner.notes
 
 
 def enforce_cell_policy(source: str, *, notebook_path: str, cell_index: int,
@@ -1852,12 +2134,19 @@ def enforce_cell_policy(source: str, *, notebook_path: str, cell_index: int,
                         context: Optional[ScanContext] = None) -> List[Violation]:
     """Gate one code cell. Returns the allowed exceptions; raises on refusal.
 
+    Allowed-but-unverified operations (a library reader with a dynamic path,
+    a ``spark.sql`` read statement with run-time fragments) are recorded in
+    the policy log under the :data:`POLICY_NOTES` events before the verdict.
+
     Raises:
         SandboxUndeclaredError: no policy declared.
         PolicyViolation: the first refused violation (all are logged first).
     """
     pol = policy or require_policy()
-    violations = scan_source(source, filename=str(notebook_path), policy=pol, context=context)
+    violations, notes = _scan(source, filename=str(notebook_path), policy=pol, context=context)
+    for n in notes:
+        _record(n.rule, rule="", target=n.target, notebook_path=str(notebook_path), cell_index=cell_index,
+                detail={"line": n.lineno, "detail": n.detail})
     refused: List[Violation] = []
     allowed: List[Violation] = []
     for v in violations:
@@ -1944,5 +2233,5 @@ __all__ = [
     "scan_source", "enforce_cell_policy",
     "assert_path_in_sandbox", "assert_table_in_sandbox", "record_secret_refusal", "record_skipped_cell",
     "get_policy_log", "clear_policy_log", "policy_log_json", "policy_log_markdown",
-    "ALL_RULES",
+    "ALL_RULES", "POLICY_NOTES",
 ]

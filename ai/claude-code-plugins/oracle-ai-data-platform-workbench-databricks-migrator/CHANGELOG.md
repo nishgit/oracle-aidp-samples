@@ -75,6 +75,39 @@ All notable changes to this plugin are documented here. Format loosely follows [
   static mitigation layer over a full Python runtime; the platform-level control is the IAM
   scope of the cluster (documented in `SUPPORTED_OPERATIONS.md` section 8 together with the
   known false refusals).
+- **Sandbox gate: round-2 gaps closed by generalising the rules** (static review of the
+  SEC-AIDP-SAMPLES-005 gate at edcb186). `posix` / `nt`, the platform modules `os` re-exports,
+  are tracked as aliases of `os`, so `import posix; posix.system(..)`, `from posix import
+  environ`, `import nt as n; n.environ` meet every os rule. The os / shutil / sys.modules /
+  importlib / asyncio / aidp_compat attribute rules moved into the one rule table that already
+  served `getattr(mod, "literal")`, `from m import n` aliases and imports, so the indirect
+  route (`asyncio.run(getattr(asyncio, "create_subprocess_exec")(..))`) is judged exactly like
+  the direct one; `loop.subprocess_exec` / `subprocess_shell` added. `str.format` templates are
+  resolved like any other target (a literal, a name bound once in this or an earlier cell,
+  `"a" + "b"`, `textwrap.dedent(..)`, `.strip()`) and every replacement field is walked
+  (`format_map`, `str.format(t, ..)`, `string.Formatter().format / vformat`, nested format-spec
+  fields) against the dunder read allowlist, so `t = "{0.__class__.__mro__}"; t.format(obj)`
+  and `"{x.__init__.__globals__[os].environ}".format_map(..)` are `NBP-DUNDER-ESCAPE` while
+  `"{0.__class__.__name__}".format(obj)` is no longer refused; an unresolvable template
+  formatted with a run-time argument fails closed. Local file reads through library readers
+  (`pandas` / `polars` / `pyarrow` / `xarray` `read_*`, `numpy.load*`, `spark.read.<fmt>` /
+  `load` / `option("path")`, `sc.textFile`, `PIL.Image.open`, `h5py.File`,
+  `ElementTree.parse`, ...) with a literal local path (`/etc`, `/dbfs`, `/Workspace`, `/tmp`,
+  `~`, `C:\`, `file://`) outside the prefix are `NBP-OPEN-PATH`; scope decision: a reader path
+  the gate cannot resolve is allowed (reading source data through variables is the normal
+  migration case; the cluster's IAM scope is the control) and recorded in the policy log as
+  `unverified_read_path`, and object-storage / catalog reads are never path-checked. Scope
+  decision for dynamic SQL: a `spark.sql` statement whose literal head (after whitespace and
+  comments) is `SELECT` / `WITH` / `SHOW` / `DESCRIBE` / `DESC` / `EXPLAIN` (or a TEMP VIEW)
+  cannot become a write because Spark runs one statement per call, so it is allowed and
+  recorded as `unverified_sql_read`; every other dynamic head (DDL/DML, `USE`, empty, a
+  variable) is `NBP-SQL-DYNAMIC`, which also closes `spark.sql(f"{verb} TABLE prod.t")`.
+  Constants bound once inside `for` / `if` / `with` / `try` bodies are resolved (the loop-bound
+  `q = "SELECT .." + str(cid); spark.sql(q)` false refusal); `getattr(spark, "version")` and
+  other literal public names on Spark objects are allowed (dynamic, private and dunder names,
+  and the interpreter / compat roots, stay refused); `~`, Windows drive / UNC and `file://`
+  paths count as absolute on every host. Every new refused / allowed cell is in the test suite
+  and fails against the edcb186 scanner.
 - Python 3.9 floor: `cluster_lifecycle.py` and `fuse_package_analyzer.py` used PEP 604
   `X | None` annotations evaluated at import time; `from __future__ import annotations` added.
 - **Secrets shim is Vault-only by default** (`engine/aidp_compat/secrets.py`,

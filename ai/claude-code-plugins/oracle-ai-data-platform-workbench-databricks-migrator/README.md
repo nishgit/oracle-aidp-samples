@@ -242,8 +242,19 @@ every route to the same capability, not only the direct spelling: the builtins n
 safe loader, `torch.load` without `weights_only=True`; `NBP-DESERIALIZE`), process / debugger /
 profiler modules, the stdlib open-equivalents (`io.open`, `os.open`, `gzip.open`, ...), and
 names that were bound to any of these and later rebound to something the gate cannot resolve.
+The same rule table serves every spelling: `posix` / `nt` are judged as `os`, `getattr(mod,
+"literal")` like `mod.literal`, and `str.format` / `format_map` templates (literal or bound once)
+are walked field by field (`{0.__class__.__mro__}` refused, `{0.__class__.__name__}` fine).
+Library readers (`pd.read_csv`, `spark.read.csv`, `np.load`, `sc.textFile`, ...) with a literal
+local path (`/etc/passwd`, `/dbfs/...`, `~`, `C:\`, `file://`) outside the prefix are refused.
 A target that is a name bound once to a string literal earlier in the run is checked as that
-literal; any other non-literal target is refused unless its rule id is allowlisted. The gate
+literal; any other non-literal target is refused unless its rule id is allowlisted, with two
+scope decisions that are allowed and recorded in the policy log instead: a reader path the gate
+cannot resolve (`spark.read.parquet(src)`, `unverified_read_path`; reading source data through
+parameters is the normal migration case and object-storage / catalog reads are never
+path-checked) and a `spark.sql` statement whose literal head is `SELECT` / `WITH` / `SHOW` /
+`DESCRIBE` / `EXPLAIN` (`unverified_sql_read`; Spark runs one statement per call, so it cannot
+become a write). The gate
 matches these forms statically and is not a Python sandbox: a static AST gate over a full
 Python runtime is a mitigation layer, the platform-level control is the IAM scope of the
 cluster the notebook runs on, and the runtime assertions in `dbutils.fs.*`, `safe_io` and

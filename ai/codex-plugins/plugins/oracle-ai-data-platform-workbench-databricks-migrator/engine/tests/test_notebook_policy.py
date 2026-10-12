@@ -1252,3 +1252,199 @@ def test_clean_notebook_with_dunder_definitions_and_aliases_executes(tmp_path, s
         for k in ("CLEAN_MARK", "acc", "kind", "_Acc", "_Sub", "_o"):
             g.pop(k, None)
     assert [e for e in npol.get_policy_log() if e["event"] in ("refused", "allowed_exception")] == []
+
+
+# ══════════════════════════════════════════════════════════════════════
+# SEC-AIDP-SAMPLES-005 round 2: gaps from the static review of edcb186
+# ══════════════════════════════════════════════════════════════════════
+# (9) Each gap is closed by generalising the rule, not the spelling: posix / nt
+#     are os; the indirect (getattr) route consults the same rule table as the
+#     direct one; str.format templates are resolved and walked; library readers
+#     refuse literal local paths; a dynamic spark.sql statement needs a literal
+#     read-keyword head.
+ROUND2_GAP_CELLS = [
+    # -- (1) posix / nt are the modules os re-exports: every os rule applies
+    ("import posix\nposix.system('id')", "NBP-OS-PROCESS", "os.system"),
+    ("import posix\nTOKEN = posix.environ.get('AIDP_TOKEN')", "NBP-OS-ENVIRON", "os.environ"),
+    ("import posix\nposix.open('/etc/passwd', 0)", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("import posix\nposix.remove('/Volumes/prod/x')", "NBP-FS-PATH", "/Volumes/prod/x"),
+    ("import posix\nposix.fork()", "NBP-OS-PROCESS", "os.fork"),
+    ("import posix\nposix.environ = {}", "NBP-OS-ENVIRON", "os.environ"),
+    ("from posix import system", "NBP-OS-PROCESS", "os.system"),
+    ("from posix import environ as _e", "NBP-OS-ENVIRON", "os.environ"),
+    ("from posix import *", "NBP-OS-ENVIRON", "os.*"),
+    ("import posix as p\np.popen('id')", "NBP-OS-PROCESS", "os.popen"),
+    ("import nt\nnt.system('id')", "NBP-OS-PROCESS", "os.system"),
+    ("import nt as n\nn.environ['X']", "NBP-OS-ENVIRON", "os.environ"),
+    # -- (2) the indirect route consults the same rule table as direct access
+    ("import asyncio\nasyncio.run(getattr(asyncio, 'create_subprocess_exec')('id'))", "NBP-OS-PROCESS",
+     "asyncio.create_subprocess_exec"),
+    ("import asyncio\nf = getattr(asyncio, 'create_subprocess_shell')", "NBP-OS-PROCESS",
+     "asyncio.create_subprocess_shell"),
+    ("import asyncio\nloop = asyncio.get_event_loop()\nloop.subprocess_exec(lambda: None, 'id')", "NBP-OS-PROCESS",
+     "loop.subprocess_exec"),
+    ("import asyncio\nloop = asyncio.get_event_loop()\ngetattr(loop, 'subprocess_shell')", "NBP-OS-PROCESS",
+     "loop.subprocess_shell"),
+    ("getattr(spark.sparkContext, 'addPyFile')('oci://b@ns/x/e.zip')", "NBP-BUILTIN-EXEC",
+     "spark.sparkContext.addPyFile"),
+    ("import os\nfrom os import system as run_cmd\nrun_cmd('id')", "NBP-OS-PROCESS", "os.system"),
+    # -- (3) str.format: templates are resolved and every field is walked
+    ("t = '{0.__class__.__mro__}'\nt.format(obj)", "NBP-DUNDER-ESCAPE", "{0.__class__.__mro__}"),
+    ("'{x.__init__.__globals__[os].environ}'.format_map(dict(x=obj))", "NBP-DUNDER-ESCAPE",
+     "{x.__init__.__globals__[os].environ}"),
+    ("t = '{x.__init__.__globals__}'\nt.format_map(dict(x=obj))", "NBP-DUNDER-ESCAPE", "{x.__init__.__globals__}"),
+    ("str.format('{0.__class__.__mro__}', obj)", "NBP-DUNDER-ESCAPE", "{0.__class__.__mro__}"),
+    ("str.format_map('{x.__globals__}', dict(x=f))", "NBP-DUNDER-ESCAPE", "{x.__globals__}"),
+    ("import string\nstring.Formatter().format('{0.__subclasses__}', obj)", "NBP-DUNDER-ESCAPE",
+     "{0.__subclasses__}"),
+    ("import string\nstring.Formatter().vformat('{0.__code__}', (f,), {})", "NBP-DUNDER-ESCAPE", "{0.__code__}"),
+    ("import textwrap\ntextwrap.dedent('  {0.__class__.__mro__}').format(obj)", "NBP-DUNDER-ESCAPE",
+     "{0.__class__.__mro__}"),
+    ("('{0.__class__.' + '__mro__}').format(obj)", "NBP-DUNDER-ESCAPE", "{0.__class__.__mro__}"),
+    ("'{0:{1.__class__.__mro__}}'.format(a, b)", "NBP-DUNDER-ESCAPE", "{1.__class__.__mro__}"),   # nested spec
+    ("'{0.f_globals}'.format(frame)", "NBP-DUNDER-ESCAPE", "{0.f_globals}"),
+    ("tpl = dbutils.widgets.get('tpl')\ntpl.format(obj)", "NBP-DUNDER-ESCAPE", "<dynamic>"),        # fail closed
+    ("TEMPLATES['x'].format(row=row)", "NBP-DUNDER-ESCAPE", "<dynamic>"),
+    ("tpl = 'a {0}'\ntpl = 'b {0}'\ntpl.format(obj)", "NBP-DUNDER-ESCAPE", "<dynamic>"),            # rebound: unknown
+    # -- (4) local file reads through library readers (literal local path outside the prefix)
+    ("import pandas as pd\npd.read_csv('/etc/passwd')", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("import pandas as pd\npd.read_parquet('~/.oci/config')", "NBP-OPEN-PATH", "~/.oci/config"),
+    ("import pandas as pd\npd.read_json(path_or_buf='/Workspace/.oci/config')", "NBP-OPEN-PATH",
+     "/Workspace/.oci/config"),
+    ("import pandas as pd\npd.read_csv('C:\\\\Users\\\\x\\\\secret.csv')", "NBP-OPEN-PATH", "C:\\Users\\x\\secret.csv"),
+    ("from pandas import read_csv\nread_csv('/etc/passwd')", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("import pandas as pd\nP = '/etc/passwd'\npd.read_csv(P)", "NBP-OPEN-PATH", "/etc/passwd"),      # resolved constant
+    ("spark.read.text('file:///etc/passwd')", "NBP-OPEN-PATH", "file:///etc/passwd"),
+    ("spark.read.csv('/dbfs/mnt/prod/x.csv')", "NBP-OPEN-PATH", "/dbfs/mnt/prod/x.csv"),
+    ("spark.read.format('csv').load('/Workspace/.oci/config')", "NBP-OPEN-PATH", "/Workspace/.oci/config"),
+    ("spark.read.option('path', '/etc/passwd').load()", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("spark.read.options(path='/etc/passwd').load()", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("spark.read.load(path='/etc/passwd')", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("spark.readStream.parquet('/tmp/other/in')", "NBP-OPEN-PATH", "/tmp/other/in"),
+    ("rdr = spark.read\nrdr.json('/etc/x.json')", "NBP-OPEN-PATH", "/etc/x.json"),
+    ("sc.textFile('/etc/passwd')", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("spark.sparkContext.wholeTextFiles('/Volumes/prod/docs')", "NBP-OPEN-PATH", "/Volumes/prod/docs"),
+    ("import numpy as np\nnp.loadtxt('/etc/passwd')", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("import numpy as np\nnp.load('/Volumes/prod/a.npy')", "NBP-OPEN-PATH", "/Volumes/prod/a.npy"),
+    ("import pyarrow.parquet as pq\npq.read_table('/Volumes/prod/x.parquet')", "NBP-OPEN-PATH",
+     "/Volumes/prod/x.parquet"),
+    ("import polars as pl\npl.scan_csv('/etc/passwd')", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("from PIL import Image\nImage.open('/Workspace/.ssh/id_rsa')", "NBP-OPEN-PATH", "/Workspace/.ssh/id_rsa"),
+    ("import xml.etree.ElementTree as ET\nET.parse('/etc/x.xml')", "NBP-OPEN-PATH", "/etc/x.xml"),
+    ("import h5py\nh5py.File('/Volumes/prod/m.h5', 'r')", "NBP-OPEN-PATH", "/Volumes/prod/m.h5"),
+    ("open('~/.oci/config').read()", "NBP-OPEN-PATH", "~/.oci/config"),
+    ("open('C:\\\\Users\\\\x\\\\.oci\\\\config').read()", "NBP-OPEN-PATH", "C:\\Users\\x\\.oci\\config"),
+    # -- (c) a dynamic spark.sql statement needs a LITERAL read-keyword head
+    ("spark.sql(f'{verb} TABLE prod.t')", "NBP-SQL-DYNAMIC", "<dynamic>"),
+    ("spark.sql('  ' + q)", "NBP-SQL-DYNAMIC", "<dynamic>"),
+    ("spark.sql('/* c */ ' + q)", "NBP-SQL-DYNAMIC", "<dynamic>"),
+    ("spark.sql('-- c\\n' + q)", "NBP-SQL-DYNAMIC", "<dynamic>"),
+    ("spark.sql(f'USE {db}')", "NBP-SQL-DYNAMIC", "<dynamic>"),
+    ("spark.sql(verb + ' TABLE prod.t')", "NBP-SQL-DYNAMIC", "<dynamic>"),
+    ("spark.sql('SELECTX ' + q)", "NBP-SQL-DYNAMIC", "<dynamic>"),
+]
+
+
+@pytest.mark.parametrize("source,rule,target", ROUND2_GAP_CELLS,
+                         ids=[c[1] + ":" + c[0][:30] for c in ROUND2_GAP_CELLS])
+def test_round2_gap_cells_are_refused(tmp_path, sandbox_env, source, rule, target):
+    _assert_refused(tmp_path, [source], rule, target)
+
+
+def test_posix_alias_bound_in_an_earlier_cell_is_followed(sandbox_env):
+    # (scanned, not executed: ``posix`` only exists on POSIX hosts)
+    ctx = npol.ScanContext()
+    assert npol.scan_source("import posix as p", context=ctx) == []
+    assert [(v.rule, v.target) for v in npol.scan_source("p.system('id')", context=ctx)] \
+        == [("NBP-OS-PROCESS", "os.system")]
+    ctx = npol.ScanContext()
+    assert npol.scan_source("import nt", context=ctx) == []
+    assert [(v.rule, v.target) for v in npol.scan_source("nt.environ['X']", context=ctx)] \
+        == [("NBP-OS-ENVIRON", "os.environ")]
+
+
+def test_format_template_bound_in_an_earlier_cell_is_resolved(tmp_path, sandbox_env):
+    _assert_refused(tmp_path, ["TPL = 'kind: {0.__class__.__mro__}'", "TPL.format(obj)"], "NBP-DUNDER-ESCAPE",
+                    "{0.__class__.__mro__}", cell_index=1)
+
+
+# (10) False refusals fixed: legitimate code the gate wrongly refused.
+CLEAN_CELLS_3 = [
+    # (a) format fields consult _DUNDER_ALLOW
+    "'{0.__class__.__name__}'.format(obj)",
+    "'{0.__class__}'.format(obj)",
+    "'{x[__class__]}'.format(x=d)",                                           # item lookup, not attribute access
+    "'{0:>{1}}'.format(a, 8)",
+    "msg = 'rows: {n}'\nout = msg.format(n=count)",
+    "import textwrap\nmsg = textwrap.dedent('''\n  rows: {n}''').format(n=count)",
+    "w = df.write.mode('overwrite')\nw.format('delta').save('oci://b@ns/sbx/x')",
+    "fmt = 'delta'\nw = df.write.mode('overwrite')\nw.format(fmt).save('oci://b@ns/sbx/x')",
+    "df.write.format(fmt).save('oci://b@ns/sbx/x')",
+    "spark.read.format(fmt).load(src)",
+    # (b) getattr on a Spark object with a literal public name
+    "getattr(spark, 'version')",
+    "v = getattr(spark, 'version')",
+    "n = getattr(sc, 'defaultParallelism')",
+    "getattr(spark.conf, 'get')('spark.app.name')",
+    # (c) dynamic read-only SQL with a literal read-keyword head
+    "q = 'SELECT * FROM sbx.t WHERE id=' + str(cid)\nspark.sql(q)",
+    "for cid in ids:\n    q = 'SELECT * FROM sbx.t WHERE id=' + str(cid)\n    spark.sql(q)",
+    "if flag:\n    q = f'SELECT count(*) FROM sbx.t WHERE d={d}'\n    spark.sql(q)",
+    "spark.sql('SELECT * FROM sbx.t WHERE id=' + str(cid))",
+    "spark.sql(f'WITH c AS (SELECT 1) SELECT * FROM c WHERE x={v}')",
+    "spark.sql('SHOW TABLES IN {}'.format(s))",
+    "spark.sql('-- filter\\nSELECT 1 FROM {}'.format(s))",
+    "spark.sql('/* cols */ DESCRIBE {}'.format(s))",
+    "spark.sql('DESC ' + t)",
+    "spark.sql('EXPLAIN ' + q)",
+    # (4) dynamic, object-storage, catalog and relative reads stay allowed
+    "import pandas as pd\npdf = pd.read_csv(src_path)",
+    "spark.read.csv(path, header=True)",
+    "spark.read.format('parquet').load(src)",
+    "import pandas as pd\npdf = pd.read_csv('oci://b@ns/prod/x.csv')",
+    "spark.read.parquet('abfss://c@a.dfs.core.windows.net/prod/in')",
+    "spark.read.parquet('s3://bucket/prod/in')",
+    "spark.read.parquet('oci://b@ns/sbx/in')",
+    "spark.read.table('prod.t')",
+    "import pandas as pd\npdf = pd.read_csv('data/local.csv')",
+    "import pandas as pd\npdf = pd.read_sql('SELECT 1', con)",
+    "import numpy as np\na = np.load('a.npy')",
+]
+
+
+@pytest.mark.parametrize("source", CLEAN_CELLS_3, ids=[c[:40] for c in CLEAN_CELLS_3])
+def test_round2_false_refusals_pass_the_gate(sandbox_env, source):
+    assert npol.scan_source(source) == []
+
+
+def test_local_reads_inside_the_sandbox_prefix_are_allowed(sandbox_env):
+    inside = sandbox_env["local_prefix"] + "in.csv"
+    assert npol.scan_source(f"import pandas as pd\npdf = pd.read_csv({inside!r})") == []
+    pol = SandboxPolicy(catalog="default", schema="sbx", prefix="oci://b@ns/sbx/", extra_prefixes=("/tmp/sbx/",))
+    assert npol.scan_source("spark.read.csv('file:///tmp/sbx/in.csv')", policy=pol) == []
+    assert npol.scan_source("spark.read.csv('/tmp/sbx/in.csv')", policy=pol) == []
+    assert [v.rule for v in npol.scan_source("spark.read.csv('file:///tmp/other/in.csv')", policy=pol)] \
+        == ["NBP-OPEN-PATH"]
+
+
+def test_unverified_reads_are_allowed_and_recorded(sandbox_env):
+    src = ("import pandas as pd\n"
+           "pdf = pd.read_csv(src_path)\n"
+           "rows = spark.sql('SELECT * FROM sbx.t WHERE id=' + str(cid))")
+    assert npol.scan_source(src) == []
+    assert npol.enforce_cell_policy(src, notebook_path="nb", cell_index=3) == []
+    notes = [e for e in npol.get_policy_log() if e["event"] in npol.POLICY_NOTES]
+    assert [(e["event"], e["target"], e["cell_index"], e["notebook_path"]) for e in notes] == [
+        ("unverified_read_path", "pandas.read_csv(<dynamic>)", 3, "nb"),
+        ("unverified_sql_read", "SELECT * FROM sbx.t WHERE id=", 3, "nb"),
+    ]
+    assert [e["detail"]["line"] for e in notes] == [2, 3]
+    assert all(e["rule"] == "" and e["remediation"] == "" for e in notes)
+    assert "unverified_read_path" in npol.policy_log_markdown()
+    assert [e for e in npol.get_policy_log() if e["event"] in ("refused", "allowed_exception")] == []
+
+
+def test_verified_reads_are_not_recorded(sandbox_env):
+    npol.enforce_cell_policy("x = spark.read.parquet('oci://b@ns/prod/in')\ny = spark.sql('SELECT 1')",
+                             notebook_path="nb", cell_index=0)
+    assert [e for e in npol.get_policy_log() if e["event"] in npol.POLICY_NOTES] == []
