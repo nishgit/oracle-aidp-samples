@@ -39,22 +39,27 @@ class FakeCursor:
 
     `by_role` maps a role name to its SHOW GRANTS rows; a database role is
     keyed by its dotted name (`SALES_DB.WRITER`). A role not in `by_role`
-    answers `grants`. `future_by_role` is the same for SHOW FUTURE GRANTS
-    (a role not in it has none); `fail_future` makes that statement fail.
-    `user_roles` is what SHOW GRANTS TO USER lists; None makes that
+    answers `grants`, except PUBLIC, which holds nothing unless `by_role`
+    says otherwise (as in most accounts). `future_by_role` is the same for
+    SHOW FUTURE GRANTS (a role not in it has none); `fail_future` makes
+    that statement fail. `user_roles` is what SHOW GRANTS TO USER lists for
+    the session's user SVC -- by default the session role alone, the
+    service user the README asks for; `fail_user_grants` makes that
     statement fail, as a cursor that may not run it would.
     """
 
     def __init__(self, grants, *, role="READER", secondary="",
                  secondary_value="", by_role=None, fail_grants=None,
-                 user_roles=None, future_by_role=None, fail_future=None):
+                 user_roles=None, fail_user_grants=False,
+                 future_by_role=None, fail_future=None):
         self.grants = grants
         self.role = role
         self.secondary = secondary
         self.secondary_value = secondary_value
         self.by_role = by_role or {}
         self.fail_grants = fail_grants
-        self.user_roles = user_roles
+        self.user_roles = [role] if user_roles is None else list(user_roles)
+        self.fail_user_grants = fail_user_grants
         self.future_by_role = future_by_role or {}
         self.fail_future = fail_future
         self.calls = []
@@ -69,7 +74,7 @@ class FakeCursor:
         if low.startswith("select current_user()"):
             return [{"U": "SVC"}]
         if low.startswith("show grants to user"):
-            if self.user_roles is None:
+            if self.fail_user_grants:
                 raise RuntimeError("SQL access control error")
             return [{"created_on": "x", "role": r, "granted_to": "USER",
                      "grantee_name": "SVC"} for r in self.user_roles]
@@ -79,6 +84,8 @@ class FakeCursor:
                 raise RuntimeError(self.fail_grants)
             name = ".".join(part.strip('"') for part in
                             sql.split("role", 1)[1].strip().split('"."'))
+            if name == "PUBLIC" and name not in self.by_role:
+                return []
             return self.by_role.get(name, self.grants)
         if low.startswith("show future grants to role") or \
                 low.startswith("show future grants to database role"):
@@ -218,17 +225,18 @@ def test_secondary_roles_are_checked_too():
     with pytest.raises(RoleNotReadOnly) as caught:
         assert_role_read_only(cur, database="SALES_DB")
     assert "DELETE" in str(caught.value) and "WRITER" in str(caught.value)
-    asked = [c for c in cur.calls if c.lower().startswith("show grants")]
-    assert len(asked) == 2, "the primary and the one distinct secondary"
+    asked = [c for c in cur.calls if c.lower().startswith("show grants to role")]
+    assert len(asked) == 3, "the primary, the one distinct secondary, PUBLIC"
     assert any('"WRITER"' in c for c in asked), "role names are quoted"
 
 
 def test_the_evidence_carries_no_credential_and_only_grant_facts():
     evidence = read_role_grants(FakeCursor(READ_ONLY), database="SALES_DB")
-    assert set(evidence) == {"role", "secondary_roles", "inherited_roles",
-                             "database", "grants_read", "future_grants_read",
-                             "by_privilege", "write_grants",
-                             "out_of_scope_writes", "read_only"}
+    assert set(evidence) == {"role", "secondary_roles", "user", "user_roles",
+                             "inherited_roles", "database", "grants_read",
+                             "future_grants_read", "by_privilege",
+                             "write_grants", "out_of_scope_writes",
+                             "read_only"}
 
 
 # --- the role hierarchy: a role holds what the roles granted to it hold ----
@@ -275,7 +283,7 @@ def test_a_granted_role_that_is_itself_read_only_passes_and_is_named():
                          _grant("SELECT", "TABLE", "SALES_DB.PUBLIC.ITEMS")]})
     evidence = assert_role_read_only(cur, database="SALES_DB")
     assert evidence["read_only"] is True
-    assert evidence["inherited_roles"] == ["role VIEWER"]
+    assert evidence["inherited_roles"] == ["role PUBLIC", "role VIEWER"]
     assert evidence["grants_read"] == len(READ_ONLY) + 2
     assert evidence["by_privilege"]["SELECT"] == 3, "VIEWER's SELECT counts"
     assert "inherited role VIEWER" in describe_role_grants(evidence)
@@ -297,9 +305,10 @@ def test_a_cycle_in_the_hierarchy_terminates_and_each_role_is_read_once():
                               "B": [_grant("USAGE", "ROLE", "READER"),
                                     _grant("USAGE", "ROLE", "A")]})
     evidence = assert_role_read_only(cur, database="SALES_DB")
-    assert evidence["inherited_roles"] == ["role A", "role B"]
-    listings = [c for c in cur.calls if c.lower().startswith("show grants")]
-    assert len(listings) == 3, "READER, A, B: once each"
+    assert evidence["inherited_roles"] == ["role PUBLIC", "role A", "role B"]
+    listings = [c for c in cur.calls
+                if c.lower().startswith("show grants to role")]
+    assert len(listings) == 4, "READER, PUBLIC, A, B: once each"
 
 
 def test_an_unreadable_inherited_listing_fails_closed():
@@ -324,23 +333,72 @@ def test_a_write_row_with_no_object_name_is_judged_inside_the_source():
         assert_role_read_only(cur, database="SALES_DB")
 
 
-# --- secondary roles ALL: the roles in effect must be named, or refused ----
+# --- the user's roles: every role the credential can USE ROLE into ---------
+#
+# The threat is a credential that reaches someone else, and that credential
+# can `USE ROLE` any role granted to the user, whatever role the session
+# started with. So the user's grants are read for EVERY session, not only
+# under USE SECONDARY ROLES ALL, and every role they name is walked.
 
-def test_secondary_roles_all_with_no_names_fails_closed_when_unreadable():
-    """`{"roles":"","value":"ALL"}` says every role granted to the user is
-    in effect without naming one. When SHOW GRANTS TO USER cannot say
-    either, the session is refused rather than read as `no secondaries`."""
-    cur = FakeCursor(READ_ONLY, secondary="", secondary_value="ALL",
-                     user_roles=None)
+def test_the_user_roles_are_read_for_every_session():
+    cur = FakeCursor(READ_ONLY, secondary="", secondary_value="NONE")
+    evidence = assert_role_read_only(cur, database="SALES_DB")
+    assert 'show grants to user "SVC"' in cur.calls
+    assert evidence["user"] == "SVC" and evidence["user_roles"] == []
+
+
+def test_a_write_held_by_another_role_of_the_user_refuses_the_session():
+    """User SVC holds READER and WRITER; the session runs as READER with no
+    secondary roles. WRITER is still one USE ROLE away for whoever holds
+    the credential, so its DELETE is judged as the session's own."""
+    cur = FakeCursor(READ_ONLY, secondary="", secondary_value="NONE",
+                     user_roles=["READER", "WRITER"],
+                     by_role={"WRITER": [_grant("DELETE", "TABLE",
+                                                "SALES_DB.PUBLIC.ORDERS")]})
     with pytest.raises(RoleNotReadOnly) as caught:
         assert_role_read_only(cur, database="SALES_DB")
     message = str(caught.value)
-    assert "secondary roles are active" in message
-    assert "--only-primary-role" in message, "it must say how to fix it"
-    assert any(c.lower().startswith("show grants to user") for c in cur.calls)
+    assert "DELETE on TABLE SALES_DB.PUBLIC.ORDERS held by role WRITER" in message
+    assert "granted to user SVC: WRITER" in message
+    assert 'show grants to role "WRITER"' in cur.calls
+    evidence = read_role_grants(cur, database="SALES_DB")
+    assert evidence["user_roles"] == ["WRITER"]
+    [refused] = evidence["write_grants"]
+    assert refused["role"] == "WRITER" and refused["via"] is None
+
+
+def test_a_system_role_granted_to_the_user_is_refused_unlisted():
+    """SVC holds READER and SYSADMIN. The session is READER, but the
+    credential can USE ROLE SYSADMIN, and SYSADMIN's reach is Snowflake's
+    to define: refused on sight, never listed."""
+    cur = FakeCursor(READ_ONLY, secondary="", secondary_value="NONE",
+                     user_roles=["READER", "SYSADMIN"])
+    with pytest.raises(RoleNotReadOnly) as caught:
+        assert_role_read_only(cur, database="SALES_DB")
+    message = str(caught.value)
+    assert "role SYSADMIN, granted to user SVC, is a system role" in message
+    assert "service user" in message, "it must say what to fix"
+    assert not any('"SYSADMIN"' in c for c in cur.calls), "never listed"
+
+
+def test_unreadable_user_grants_fail_closed():
+    """When SHOW GRANTS TO USER cannot be run, the roles the credential
+    reaches are unknown, under USE SECONDARY ROLES ALL or not: refused."""
+    for value in ("ALL", "NONE"):
+        cur = FakeCursor(READ_ONLY, secondary="", secondary_value=value,
+                         fail_user_grants=True)
+        with pytest.raises(RoleNotReadOnly) as caught:
+            assert_role_read_only(cur, database="SALES_DB")
+        message = str(caught.value)
+        assert "roles granted to the session's user could not be read" in message
+        assert "USE ROLE" in message and "service user" in message
+        assert any(c.lower().startswith("show grants to user")
+                   for c in cur.calls)
 
 
 def test_secondary_roles_all_with_no_names_is_resolved_from_the_user_grants():
+    """`{"roles":"","value":"ALL"}` says every role granted to the user is
+    in effect without naming one; the user's grants name them."""
     cur = FakeCursor(READ_ONLY, secondary="", secondary_value="ALL",
                      user_roles=["READER", "WRITER"],
                      by_role={"WRITER": [_grant("DELETE", "TABLE",
@@ -356,12 +414,15 @@ def test_secondary_roles_all_with_no_names_is_resolved_from_the_user_grants():
     assert evidence["read_only"] is True and evidence["secondary_roles"] == []
 
 
-def test_secondary_roles_all_with_names_trusts_the_names():
+def test_a_named_secondary_role_is_walked_once_with_the_user_roles():
     cur = FakeCursor(READ_ONLY, secondary="VIEWER", secondary_value="ALL",
-                     by_role={"VIEWER": []})
-    assert assert_role_read_only(cur, database="SALES_DB")["read_only"]
-    assert not any(c.lower().startswith("show grants to user")
-                   for c in cur.calls)
+                     user_roles=["READER", "VIEWER"], by_role={"VIEWER": []})
+    evidence = assert_role_read_only(cur, database="SALES_DB")
+    assert evidence["read_only"] is True
+    assert evidence["secondary_roles"] == ["VIEWER"]
+    assert evidence["user_roles"] == [], "VIEWER is not listed twice"
+    assert sum('"VIEWER"' in c and c.lower().startswith("show grants to role")
+               for c in cur.calls) == 1
 
 
 def test_an_unreadable_secondary_roles_payload_fails_closed():
@@ -373,6 +434,32 @@ def test_an_unreadable_secondary_roles_payload_fails_closed():
         return inner(sql, params)
     with pytest.raises(RoleNotReadOnly, match="cannot read"):
         assert_role_read_only(raw, database="SALES_DB")
+    # ...and a payload that parses but is not an object is the same.
+    def listed(sql, params=None):
+        if "current_role()" in sql.lower():
+            return [{"R": "READER", "S": '["WRITER"]'}]
+        return inner(sql, params)
+    with pytest.raises(RoleNotReadOnly, match="cannot read"):
+        assert_role_read_only(listed, database="SALES_DB")
+
+
+@pytest.mark.parametrize("row", [
+    {"R": "READER"},                # no S column at all
+    {"R": "READER", "S": ""},       # an empty one
+    {"R": "READER", "S": None},     # a null one
+])
+def test_a_missing_or_empty_secondary_roles_value_fails_closed(row):
+    """`if raw:` used to read these as `no secondary roles`. The roles in
+    effect are unknown, which the docstring promises to refuse."""
+    inner = FakeCursor(READ_ONLY)
+
+    def run_sql(sql, params=None):
+        if "current_role()" in sql.lower():
+            return [row]
+        return inner(sql, params)
+    with pytest.raises(RoleNotReadOnly, match="returned nothing"):
+        assert_role_read_only(run_sql, database="SALES_DB")
+    assert not any(c.lower().startswith("show grants") for c in inner.calls)
 
 
 # --- grants that are not ON source data but lead to a source write ---------
@@ -612,4 +699,261 @@ def test_a_future_grants_listing_at_the_cap_cannot_prove_anything():
         _future("SELECT", "TABLE", f"SALES_DB.S{i}.<TABLE>")
         for i in range(SHOW_GRANTS_CAP)]})
     with pytest.raises(RoleNotReadOnly, match="future grants, at or over"):
+        assert_role_read_only(cur, database="SALES_DB")
+
+
+# --- PUBLIC: held by every role, named by no listing -----------------------
+
+def test_a_write_granted_to_public_refuses_the_session():
+    """`GRANT INSERT ON TABLE ... TO ROLE PUBLIC` reaches every role in the
+    account, and SHOW GRANTS TO ROLE READER never says `USAGE on ROLE
+    PUBLIC`, so the walk cannot find it: PUBLIC is listed on its own."""
+    cur = FakeCursor(READ_ONLY, by_role={"PUBLIC": [
+        _grant("INSERT", "TABLE", "SALES_DB.PUBLIC.ORDERS")]})
+    with pytest.raises(RoleNotReadOnly) as caught:
+        assert_role_read_only(cur, database="SALES_DB")
+    message = str(caught.value)
+    assert "INSERT on TABLE SALES_DB.PUBLIC.ORDERS held by role PUBLIC" in message
+    assert "nothing to PUBLIC" in message, "it must say what to fix"
+    assert 'show grants to role "PUBLIC"' in cur.calls
+    assert 'show future grants to role "PUBLIC"' in cur.calls
+    evidence = read_role_grants(cur, database="SALES_DB")
+    assert "role PUBLIC" in evidence["inherited_roles"]
+    [refused] = evidence["write_grants"]
+    assert refused["role"] == "PUBLIC" and refused["via"] is None
+    # ...and a future write granted to PUBLIC is the same.
+    future = FakeCursor(READ_ONLY, future_by_role={"PUBLIC": [
+        _future("INSERT", "TABLE", "SALES_DB.PUBLIC.<TABLE>")]})
+    with pytest.raises(RoleNotReadOnly, match="future INSERT .*held by role "
+                                              "PUBLIC"):
+        assert_role_read_only(future, database="SALES_DB")
+
+
+def test_public_is_walked_for_every_session_and_reported():
+    cur = FakeCursor(READ_ONLY)
+    evidence = assert_role_read_only(cur, database="SALES_DB")
+    assert 'show grants to role "PUBLIC"' in cur.calls
+    assert evidence["inherited_roles"] == ["role PUBLIC"]
+    assert "inherited role PUBLIC" in describe_role_grants(evidence)
+    # A role PUBLIC holds through its own hierarchy is walked too.
+    deeper = FakeCursor(READ_ONLY,
+                        by_role={"PUBLIC": [_grant("USAGE", "ROLE", "EVERYONE")],
+                                 "EVERYONE": [_grant("DROP", "SCHEMA",
+                                                     "SALES_DB.PUBLIC")]})
+    with pytest.raises(RoleNotReadOnly, match="DROP on SCHEMA SALES_DB.PUBLIC "
+                                              "via EVERYONE held by role PUBLIC"):
+        assert_role_read_only(deeper, database="SALES_DB")
+
+
+def test_an_unreadable_public_listing_fails_closed():
+    inner = FakeCursor(READ_ONLY)
+
+    def deny_public(sql, params=None):
+        if '"PUBLIC"' in sql:
+            raise RuntimeError("Insufficient privileges")
+        return inner(sql, params)
+    with pytest.raises(RoleNotReadOnly, match="role PUBLIC .*could not be read"):
+        assert_role_read_only(deny_public, database="SALES_DB")
+
+
+# --- the database: scope excuses only what it can PLACE elsewhere ----------
+#
+# With `database:` set, a write on a table of another database is reported,
+# not refused. That carve-out used to apply to every class the module did
+# not list, so MANAGE GRANTS on a padded ` ACCOUNT`, on the ORGANIZATION or
+# on a class Snowflake adds tomorrow read as "another database" and passed.
+# Only a database-contained source class with a database part in its name
+# can be placed; everything else is judged inside the scope.
+
+@pytest.mark.parametrize("privilege,granted_on,name", [
+    ("MANAGE GRANTS", " ACCOUNT", "AB12345"),        # padded class
+    ("MANAGE GRANTS", "ACCOUNT ", "AB12345"),
+    ("MANAGE GRANTS", "ORGANIZATION", "ORG1"),
+    ("OWNERSHIP", "LISTING", "MY_LISTING"),
+    ("OWNERSHIP", "AUTHENTICATION_POLICY", "AP"),
+    ("FROBNICATE", "NEW_THING", "OTHER_DB.PUBLIC.X"),
+    ("OWNERSHIP", "NEW_THING", "OTHER_DB.PUBLIC.X"),
+    (" manage  grants ", "account", "AB12345"),     # padded privilege
+])
+def test_a_refused_privilege_off_the_source_classes_is_refused_in_any_scope(
+        privilege, granted_on, name):
+    cur = FakeCursor(READ_ONLY + [_grant(privilege, granted_on, name)])
+    with pytest.raises(RoleNotReadOnly) as caught:
+        assert_role_read_only(cur, database="SALES_DB")
+    message = str(caught.value)
+    shown = " ".join(privilege.split()).upper()
+    assert f"{shown} on {granted_on.strip().upper()} {name}" in message
+    assert "other databases" not in message
+    evidence = read_role_grants(cur, database="SALES_DB")
+    assert evidence["out_of_scope_writes"] == 0
+    assert evidence["read_only"] is False
+
+
+@pytest.mark.parametrize("granted_on", [None, "", "   "])
+def test_a_row_with_no_object_class_is_refused_whatever_its_privilege(
+        granted_on):
+    """A null or blank `granted_on` cannot be placed or judged. It used to
+    fall through the scope filter (MANAGE GRANTS passed) or be read as a
+    source read (USAGE naming SECURITYADMIN passed, unwalked)."""
+    for privilege, name in [("MANAGE GRANTS", "AB12345"),
+                            ("USAGE", "SECURITYADMIN"),
+                            ("SELECT", "SALES_DB.PUBLIC.ORDERS")]:
+        cur = FakeCursor(READ_ONLY + [{"privilege": privilege,
+                                       "granted_on": granted_on,
+                                       "name": name}])
+        with pytest.raises(RoleNotReadOnly) as caught:
+            assert_role_read_only(cur, database="SALES_DB")
+        message = str(caught.value)
+        assert f"{privilege} on ? {name}" in message
+        assert "no object class" in message
+        with pytest.raises(RoleNotReadOnly, match="no object class"):
+            assert_role_read_only(cur)
+
+
+def test_a_write_on_a_source_object_with_no_database_part_is_judged_inside():
+    """`INSERT on TABLE ORDERS` names no database, so it cannot be shown to
+    be on another one; a schema needs two parts, a database one."""
+    for granted_on, name in [("TABLE", "ORDERS"), ("SCHEMA", "PUBLIC"),
+                             ("TABLE", '"ORDERS"'), ("TABLE", ".X.Y")]:
+        cur = FakeCursor(READ_ONLY + [_grant("INSERT", granted_on, name)])
+        with pytest.raises(RoleNotReadOnly, match="INSERT"):
+            assert_role_read_only(cur, database="SALES_DB")
+    # ...while a placed write on another database is still only reported.
+    for granted_on, name in [("TABLE", "SCRATCH.PUBLIC.T"),
+                             ("SCHEMA", "SCRATCH.PUBLIC"),
+                             ("DATABASE", "SCRATCH"),
+                             ("EVENT_TABLE", "SCRATCH.PUBLIC.EVENTS"),
+                             ("FUNCTION", "SCRATCH.PUBLIC.F(VARCHAR)")]:
+        cur = FakeCursor(READ_ONLY + [_grant("OWNERSHIP", granted_on, name)])
+        evidence = assert_role_read_only(cur, database="SALES_DB")
+        assert evidence["read_only"] is True
+        assert evidence["out_of_scope_writes"] == 1
+
+
+# --- governance objects: judged wherever they live --------------------------
+
+@pytest.mark.parametrize("privilege,granted_on,name", [
+    ("OWNERSHIP", "MASKING_POLICY", "OTHER_DB.GOV.MASK"),
+    ("OWNERSHIP", "TAG", "OTHER_DB.GOV.PII"),
+    ("OWNERSHIP", "ROW_ACCESS_POLICY", "OTHER_DB.GOV.RAP"),
+    ("OWNERSHIP", "AGGREGATION_POLICY", "OTHER_DB.GOV.AGG"),
+    ("OWNERSHIP", "PROJECTION_POLICY", "OTHER_DB.GOV.PP"),
+    ("APPLY", "MASKING_POLICY", "OTHER_DB.GOV.MASK"),
+    ("APPLY", "TAG", "OTHER_DB.GOV.PII"),
+    ("OWNERSHIP", "NETWORK_RULE", "OTHER_DB.NET.EGRESS"),
+    ("OWNERSHIP", "MASKING_POLICY", "SALES_DB.GOV.MASK"),
+])
+def test_owning_or_applying_a_policy_or_tag_in_any_database_is_a_write(
+        privilege, granted_on, name):
+    """A masking policy in OTHER_DB can be applied to SALES_DB columns, and
+    its owner can change what those columns show. It is not source data of
+    OTHER_DB; it governs the source, so the scope does not excuse it."""
+    cur = FakeCursor(READ_ONLY + [_grant(privilege, granted_on, name)])
+    with pytest.raises(RoleNotReadOnly) as caught:
+        assert_role_read_only(cur, database="SALES_DB")
+    message = str(caught.value)
+    assert f"{privilege} on {granted_on} {name}" in message
+    assert "whichever database" in message, "the reason names the reach"
+    assert read_role_grants(cur, database="SALES_DB")["out_of_scope_writes"] == 0
+
+
+def test_reading_a_tag_passes():
+    """READ on a tag reads its values; it changes nothing."""
+    cur = FakeCursor(READ_ONLY + [_grant("READ", "TAG", "OTHER_DB.GOV.PII")])
+    assert assert_role_read_only(cur, database="SALES_DB")["read_only"]
+
+
+# --- role classes: walked exactly, or refused --------------------------------
+
+@pytest.mark.parametrize("granted_on", [" ROLE", "ROLE ", "role", " Role "])
+def test_a_padded_role_class_is_still_an_inheritance_hop(granted_on):
+    """`USAGE on ' ROLE' SECURITYADMIN` used to read as a plain USAGE on an
+    unknown class and pass; the class is read with its padding removed,
+    so the system role is refused and a custom role is walked."""
+    cur = FakeCursor(READ_ONLY + [_grant("USAGE", granted_on, "SECURITYADMIN")],
+                     by_role={"SECURITYADMIN": []})
+    with pytest.raises(RoleNotReadOnly, match="SECURITYADMIN.*is a system role"):
+        assert_role_read_only(cur, database="SALES_DB")
+    helper = FakeCursor(READ_ONLY + [_grant("USAGE", granted_on, "HELPER")],
+                        by_role={"HELPER": [_grant("MANAGE GRANTS", "ACCOUNT",
+                                                   "ACME")]})
+    with pytest.raises(RoleNotReadOnly, match="MANAGE GRANTS on ACCOUNT ACME "
+                                              "via HELPER"):
+        assert_role_read_only(helper, database="SALES_DB")
+    assert 'show grants to role "HELPER"' in helper.calls
+
+
+def test_a_database_role_class_spelled_with_a_space_is_walked():
+    cur = FakeCursor(READ_ONLY + [_grant("USAGE", "DATABASE ROLE", "SALES_DB.DR")],
+                     by_role={"SALES_DB.DR": [_grant("INSERT", "TABLE",
+                                                     "SALES_DB.PUBLIC.ORDERS")]})
+    with pytest.raises(RoleNotReadOnly, match="INSERT .*via database role "
+                                              "SALES_DB.DR"):
+        assert_role_read_only(cur, database="SALES_DB")
+    assert 'show grants to database role "SALES_DB"."DR"' in cur.calls
+
+
+@pytest.mark.parametrize("granted_on,name", [
+    ("INSTANCE_ROLE", "SNOWFLAKE.LOCAL.BUDGET!ADMIN"),
+    ("APPLICATION_ROLE", "SOME_APP.APP_ADMIN"),
+    ("SERVICE_ROLE", "SALES_DB.PUBLIC.SVC!ALL_ENDPOINTS_USAGE"),
+])
+def test_usage_of_a_role_class_the_walk_does_not_follow_is_refused(
+        granted_on, name):
+    cur = FakeCursor(READ_ONLY + [_grant("USAGE", granted_on, name)])
+    with pytest.raises(RoleNotReadOnly, match=f"USAGE on {granted_on} .*not "
+                                              f"walked"):
+        assert_role_read_only(cur, database="SALES_DB")
+    # ...with or without a scope, and never counted as another database.
+    with pytest.raises(RoleNotReadOnly, match="not walked"):
+        assert_role_read_only(cur)
+
+
+# --- rows the cursor hands back in a shape the check cannot read -----------
+
+def test_a_grants_row_that_is_not_a_mapping_refuses_rather_than_crashes():
+    cur = FakeCursor(READ_ONLY + [("2026", "INSERT", "TABLE",
+                                   "SALES_DB.PUBLIC.ORDERS")])
+    with pytest.raises(RoleNotReadOnly, match="cannot read") as caught:
+        assert_role_read_only(cur, database="SALES_DB")
+    assert isinstance(caught.value, AuthError)
+
+
+# --- the legitimate role, in full, still passes -----------------------------
+
+LEGITIMATE = READ_ONLY + [
+    _grant("READ", "STAGE", "SALES_DB.PUBLIC.LANDING"),
+    _grant("USAGE", "FILE_FORMAT", "SALES_DB.PUBLIC.CSV"),
+    _grant("USAGE", "FUNCTION", "SALES_DB.PUBLIC.F(VARCHAR)"),
+    _grant("USAGE", "PROCEDURE", "SALES_DB.PUBLIC.LOAD_ORDERS(VARCHAR)"),
+    _grant("USAGE", "SEQUENCE", "SALES_DB.PUBLIC.SEQ"),
+    _grant("SELECT", "MATERIALIZED_VIEW", "SALES_DB.PUBLIC.MV"),
+    _grant("SELECT", "ICEBERG_TABLE", "OTHER_DB.PUBLIC.ICE"),
+    _grant("MONITOR", "WAREHOUSE", "MIGRATE_WH"),
+    _grant("USAGE", "INTEGRATION", "S3_INT"),
+    _grant("MONITOR USAGE", "ACCOUNT", "ACME"),
+    _grant("CREATE DATABASE", "ACCOUNT", "ACME"),
+    _grant("IMPORTED PRIVILEGES", "DATABASE", "SNOWFLAKE"),
+    _grant("MONITOR", "USER", "SVC"),
+]
+
+
+@pytest.mark.parametrize("database", ["SALES_DB", "sales_db", '"SALES_DB"', None])
+def test_the_legitimate_migration_role_passes_with_or_without_a_scope(database):
+    """Every grant the README asks the account owner to make, plus MONITOR
+    on the service user (its own query history): read-only, together."""
+    cur = FakeCursor(LEGITIMATE)
+    evidence = assert_role_read_only(cur, database=database)
+    assert evidence["read_only"] is True
+    assert evidence["out_of_scope_writes"] == 0
+    assert evidence["grants_read"] == len(LEGITIMATE)
+
+
+def test_monitor_on_a_user_passes_and_anything_else_on_one_does_not():
+    """MONITOR on USER reads that user's query history and nothing else."""
+    assert assert_role_read_only(
+        FakeCursor(READ_ONLY + [_grant("MONITOR", "USER", "SVC")]),
+        database="SALES_DB")["read_only"]
+    cur = FakeCursor(READ_ONLY + [_grant("APPLYBUDGET", "USER", "SVC")])
+    with pytest.raises(RoleNotReadOnly, match="APPLYBUDGET on USER SVC"):
         assert_role_read_only(cur, database="SALES_DB")

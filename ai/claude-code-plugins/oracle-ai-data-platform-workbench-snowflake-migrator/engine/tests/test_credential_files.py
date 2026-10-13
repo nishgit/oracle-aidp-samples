@@ -263,6 +263,8 @@ def _session(grants):
         low = " ".join(sql.split()).lower()
         if "current_role()" in low:
             return [{"R": "READER", "S": '{"roles":"","value":""}'}]
+        if low.startswith("select current_user()"):
+            return [{"U": "SVC"}]
         if low.startswith("show grants to role"):
             return grants
         return []
@@ -347,8 +349,13 @@ def test_preflight_runs_the_role_check_once_as_a_reported_step(
                        str(tmp_path / "out"), "--config",
                        str(_config(tmp_path))])
     assert rc == 1, "a role that can INSERT fails preflight"
+    # One check: the session role, the user's roles and PUBLIC are each
+    # listed once, not again by the connection-time gate.
     grants_reads = [c for c in calls if c.lower().startswith("show grants")]
-    assert len(grants_reads) == 1
+    assert grants_reads.count('show grants to role "READER"') == 1
+    assert grants_reads.count('show grants to user "SVC"') == 1
+    assert grants_reads.count('show grants to role "PUBLIC"') == 1
+    assert len(grants_reads) == 3
     report = (tmp_path / "out" / "PREFLIGHT_CONFIG.md").read_text(encoding="utf-8")
     assert "source role is read-only | **FAIL**" in report
     assert "`INSERT` on TABLE `SALES_DB.S.T`" in report

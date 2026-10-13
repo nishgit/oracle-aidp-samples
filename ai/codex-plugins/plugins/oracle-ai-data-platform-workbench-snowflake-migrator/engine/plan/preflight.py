@@ -320,10 +320,13 @@ def render_preflight_report(result: dict) -> str:
         # confirm the role is the one they meant and holds only reads.
         roles = grants["role"] + (
             f' (+ secondary: {", ".join(grants["secondary_roles"])})'
-            if grants.get("secondary_roles") else "")
+            if grants.get("secondary_roles") else "") + (
+            f' (+ granted to user {grants.get("user")}: '
+            f'{", ".join(grants["user_roles"])})'
+            if grants.get("user_roles") else "")
         scope = grants.get("database") or "every database"
         names = "`, `".join(grants.get("inherited_roles") or [])
-        walked = (f" and every role granted to it (`{names}`)"
+        walked = (f" and every role it reaches (`{names}`)"
                   if names else "")
         lines += ["## Source role grants", "",
                   f'Role `{roles}`, {grants["grants_read"]} grant(s) read '

@@ -46,12 +46,13 @@ No bundled credentials, no MCP server, no third-party network calls.
   basename — never its value, never its directory.
 - Before any discovery, the session role's grants and future grants are read
   back with `SHOW GRANTS TO ROLE` / `SHOW FUTURE GRANTS TO ROLE`, through
-  every role granted to it, and the run stops if the role can write the
-  source database (CREATE, ALTER, DROP, INSERT, UPDATE, DELETE, MERGE,
-  TRUNCATE, OWNERSHIP), holds a privilege that leads to a write (MANAGE
-  GRANTS, OWNERSHIP of a role or user, CREATE ROLE, EXECUTE TASK, ...), is or
-  inherits a system role, or if the grants cannot be read. `preflight` lists
-  the grants it found.
+  every role granted to it, through `PUBLIC`, and through every other role
+  granted to the service user (`SHOW GRANTS TO USER`), and the run stops if
+  the credential can write the source database (CREATE, ALTER, DROP, INSERT,
+  UPDATE, DELETE, MERGE, TRUNCATE, OWNERSHIP), holds a privilege that leads
+  to a write (MANAGE GRANTS, OWNERSHIP of a role, user, policy or tag, CREATE
+  ROLE, EXECUTE TASK, ...), is, inherits or is granted a system role, or if
+  the grants cannot be read. `preflight` lists the grants it found.
 - The Snowflake credential reaches your AIDP tenancy in two ways, each only
   with `--execute`:
   1. `provision --execute --source-config <file>` uploads the credential

@@ -1118,6 +1118,8 @@ def _read_only_session(sql, params=None):
     low = " ".join(sql.split()).lower()
     if "current_role()" in low:
         return [{"R": "READER", "S": '{"roles":"","value":""}'}]
+    if low.startswith("select current_user()"):
+        return [{"U": "SVC"}]
     if low.startswith("show grants to role"):
         return [{"privilege": "SELECT", "granted_on": "TABLE",
                  "name": "D.S.T"}]
