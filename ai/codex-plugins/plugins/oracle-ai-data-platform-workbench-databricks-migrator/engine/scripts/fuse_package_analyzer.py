@@ -16,6 +16,8 @@ Usage:
     python3 $HOME/.aidp-migrator/engine/scripts/fuse_package_analyzer.py --packages econml --output /tmp/econml_risk.json
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import os

@@ -393,7 +393,7 @@ def test_clean_notebook_runs_and_returns_exit_value(tmp_path, sandbox_env):
 def test_allowlisted_rule_is_logged_as_exception_and_executes(tmp_path, sandbox_env, monkeypatch):
     monkeypatch.setenv("AIDP_NOTEBOOK_POLICY_ALLOW", "NBP-TABLE-DYNAMIC")
     path = write_notebook(tmp_path, "child", [
-        "TARGET = ''.join(['sbx', '.t'])",      # not statically resolvable -> needs the exception
+        "TARGET = ''.join(['sbx', '.t']).strip()",      # a call the gate does not fold -> needs the exception
         "df.write.saveAsTable(TARGET)",
     ])
     globals()["df"] = _FakeDF()
@@ -799,3 +799,1625 @@ def test_monkeypatching_the_runtime_assertion_is_refused(tmp_path, sandbox_env):
     with pytest.raises(PolicyViolation) as ei:
         runner(tmp_path).run(path)
     assert ei.value.rule_id == "NBP-POLICY-TAMPER"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# SEC-AIDP-SAMPLES-005 revalidation: every route to the same capability
+# ══════════════════════════════════════════════════════════════════════
+# The security reviewer's residual probes, verbatim.
+@pytest.mark.parametrize("source,rule,target", [
+    ("__builtins__['__import__']('os').system('id')", "NBP-BUILTIN-EXEC", "__import__"),
+    ("__builtins__['open']('/etc/passwd').read()", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("globals()['__builtins__']['open']('/etc/passwd').read()", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("get_ipython().system('id')", "NBP-OS-PROCESS", "get_ipython.system"),
+    ("spark._jvm.java.lang.Runtime.getRuntime().exec('id')", "NBP-POLICY-TAMPER", "spark._jvm"),
+    ("sc._jvm.java.lang.Runtime.getRuntime().exec('id')", "NBP-POLICY-TAMPER", "sc._jvm"),
+])
+def test_residual_notebook_policy_bypasses_are_refused(tmp_path, sandbox_env, source, rule, target):
+    path = write_notebook(tmp_path, "child", [source + "\nREFUSED_MARK = 1"])
+    globals().pop("REFUSED_MARK", None)
+    with pytest.raises(PolicyViolation) as ei:
+        runner(tmp_path).run(path)
+    assert ei.value.rule_id == rule
+    assert target in ei.value.target
+    assert "REFUSED_MARK" not in globals()
+
+
+def _assert_refused(tmp_path, cells, rule, target, cell_index=0, stubs=None):
+    """Run ``cells`` as a notebook; the cell at ``cell_index`` must be refused
+    with exactly ``rule`` / ``target`` before any of its lines (or any later
+    cell) executes, and the refusal must be in the policy log with notebook
+    path, cell index, rule, target and remediation."""
+    g = globals()
+    saved = dict(g)
+    g.update(stubs or {})
+    cells = list(cells)
+    cells[cell_index] = cells[cell_index] + "\nREFUSED_MARK = 1"
+    cells.append("LATER_MARK = 1")
+    path = write_notebook(tmp_path, "child", cells)
+    try:
+        with pytest.raises(PolicyViolation) as ei:
+            runner(tmp_path).run(path)
+        err = ei.value
+        assert isinstance(err, PermissionError)
+        assert (err.rule_id, err.target, err.cell_index) == (rule, target, cell_index)
+        assert err.notebook_path == path and err.remediation
+        assert "REFUSED_MARK" not in g and "LATER_MARK" not in g
+        entries = [e for e in npol.get_policy_log() if e["event"] == "refused" and e["cell_index"] == cell_index]
+        assert entries, "refusal must be recorded in the policy log"
+        assert (entries[0]["rule"], entries[0]["target"], entries[0]["notebook_path"]) == (rule, target, path)
+        assert entries[0]["remediation"]
+        return err
+    finally:
+        # Earlier cells executed in this module's namespace; put it back.
+        for k in set(g) - set(saved):
+            g.pop(k, None)
+        for k, v in saved.items():
+            if g.get(k) is not v:
+                g[k] = v
+
+
+# (1) Builtin indirection: the builtins namespace through any door is checked
+#     like the direct form, and a key / attribute that is not a literal is refused.
+BUILTIN_INDIRECTION_CELLS = [
+    ("__builtins__.open('/etc/passwd')", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("__builtins__.__dict__['open']('/etc/passwd')", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("getattr(__builtins__, 'open')('/etc/passwd')", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("globals()['__builtins__']['__import__']('os').system('id')", "NBP-BUILTIN-EXEC", "__import__"),
+    ("locals()['__builtins__']['eval']('1')", "NBP-BUILTIN-EXEC", "eval"),
+    ("vars()['__builtins__']['compile']('1', 'f', 'eval')", "NBP-BUILTIN-EXEC", "compile"),
+    ("getattr(__builtins__, '__import__')('os')", "NBP-BUILTIN-EXEC", "__import__"),
+    ("__builtins__['exec']('x=1')", "NBP-BUILTIN-EXEC", "exec"),
+    ("g = globals\ng()['__builtins__']['exec']('x=1')", "NBP-BUILTIN-EXEC", "exec"),
+    ("vars(__builtins__)['open']('rel.txt')", "NBP-INDIRECT", "__builtins__['open']"),       # relative, still indirect
+    ("__builtins__['op' + 'en']('/etc/passwd')", "NBP-INDIRECT", "__builtins__[<dynamic>]"),
+    ("k = 'open'\n__builtins__[k]('/etc/passwd')", "NBP-INDIRECT", "__builtins__[<dynamic>]"),
+    ("getattr(__builtins__, 'op' + 'en')", "NBP-INDIRECT", "__builtins__"),
+    ("import builtins\nbuiltins.open('/etc/passwd')", "NBP-INDIRECT", "builtins"),
+    ("print(__builtins__)", "NBP-INDIRECT", "__builtins__"),
+    ("d = globals()", "NBP-INDIRECT", "globals()"),
+    ("ns = locals()", "NBP-INDIRECT", "locals()"),
+    ("for k, v in globals().items():\n    pass", "NBP-INDIRECT", "globals()"),
+    ("__builtins__['print'] = lambda *a: None", "NBP-POLICY-TAMPER", "__builtins__"),
+    ("globals()['__builtins__'] = {}", "NBP-POLICY-TAMPER", "globals()['__builtins__']"),
+    ("globals()['dbutils'] = None", "NBP-POLICY-TAMPER", "globals()['dbutils']"),
+    ("list(map(open, ['/etc/passwd']))", "NBP-INDIRECT", "open"),                          # builtin handed around
+    ("import functools\nfunctools.partial(open, '/etc/passwd')()", "NBP-INDIRECT", "open"),
+    ("f = exec\nf('x=1')", "NBP-BUILTIN-EXEC", "exec"),
+    ("o = open\no('/etc/passwd')", "NBP-OPEN-PATH", "/etc/passwd"),
+]
+
+
+@pytest.mark.parametrize("source,rule,target", BUILTIN_INDIRECTION_CELLS,
+                         ids=[c[1] + ":" + c[0][:30] for c in BUILTIN_INDIRECTION_CELLS])
+def test_builtin_indirection_is_refused(tmp_path, sandbox_env, source, rule, target):
+    _assert_refused(tmp_path, [source], rule, target)
+
+
+# (2) Dynamic attribute / key access on protected roots and import machinery.
+DYNAMIC_ACCESS_CELLS = [
+    ("import os\ngetattr(os, 'sys' + 'tem')('id')", "NBP-INDIRECT", "os"),
+    ("import os\nn = 'system'\ngetattr(os, n)('id')", "NBP-INDIRECT", "os"),
+    ("getattr(obj, name)", "NBP-INDIRECT", "getattr(obj, <dynamic>)"),
+    ("setattr(obj, key, value)", "NBP-INDIRECT", "setattr(obj, <dynamic>)"),
+    ("delattr(obj, 'x' + 'y')", "NBP-INDIRECT", "delattr(obj, <dynamic>)"),
+    ("getattr(spark, '_jvm')", "NBP-INDIRECT", "spark"),
+    ("import pkgutil", "NBP-INDIRECT", "pkgutil"),
+    ("import runpy\nrunpy.run_path('/tmp/x.py')", "NBP-BUILTIN-EXEC", "runpy"),
+    ("import code", "NBP-BUILTIN-EXEC", "code"),
+    ("import sys\nsys.modules['o' + 's'].system('id')", "NBP-INDIRECT", "sys.modules"),
+    ("import zipimport", "NBP-INDIRECT", "zipimport"),
+    ("import _io\n_io.open('/etc/passwd')", "NBP-INDIRECT", "_io"),
+    ("import importlib.util", "NBP-INDIRECT", "importlib"),
+    ("from importlib import import_module as im\nim('os')", "NBP-INDIRECT", "importlib"),
+    ("import sys\nsys.settrace(lambda *a: None)", "NBP-INDIRECT", "sys.settrace"),
+    ("import sys\nsys.meta_path.insert(0, finder)", "NBP-INDIRECT", "sys.meta_path"),
+    ("import inspect\nfr = inspect.currentframe()", "NBP-INDIRECT", "inspect.currentframe"),
+    ("import gc\ngc.get_objects()", "NBP-INDIRECT", "gc.get_objects"),
+    ("from shutil import *", "NBP-INDIRECT", "shutil.*"),
+    ("from pickle import *", "NBP-INDIRECT", "pickle.*"),
+]
+
+
+@pytest.mark.parametrize("source,rule,target", DYNAMIC_ACCESS_CELLS,
+                         ids=[c[1] + ":" + c[0][:30] for c in DYNAMIC_ACCESS_CELLS])
+def test_dynamic_access_on_protected_roots_is_refused(tmp_path, sandbox_env, source, rule, target):
+    _assert_refused(tmp_path, [source], rule, target)
+
+
+# (3) Dunder / frame introspection chains (attribute ACCESS; dunder definitions stay fine).
+DUNDER_ESCAPE_CELLS = [
+    ("().__class__.__bases__[0].__subclasses__()", "NBP-DUNDER-ESCAPE", "<expr>.__subclasses__"),
+    ("x.__class__.__mro__", "NBP-DUNDER-ESCAPE", "x.__class__.__mro__"),
+    ("f.__globals__['__builtins__']", "NBP-DUNDER-ESCAPE", "f.__globals__"),
+    ("f.__code__.co_code", "NBP-DUNDER-ESCAPE", "f.__code__"),
+    ("obj.__reduce_ex__(2)", "NBP-DUNDER-ESCAPE", "obj.__reduce_ex__"),
+    ("e.__traceback__.tb_frame.f_back.f_globals", "NBP-DUNDER-ESCAPE", "e.__traceback__"),
+    ("import sys\nsys.exc_info()[2].tb_frame.f_globals", "NBP-DUNDER-ESCAPE", "tb_frame.f_globals"),
+    ("type(x).mro()", "NBP-DUNDER-ESCAPE", "type.mro"),
+    ("obj.__dict__['secret']", "NBP-DUNDER-ESCAPE", "obj.__dict__"),
+    ("getattr(obj, '__subclasses__')()", "NBP-DUNDER-ESCAPE", "obj.__subclasses__"),
+    ("getattr(obj, '__globals__')", "NBP-DUNDER-ESCAPE", "obj.__globals__"),
+    ("\"{0.__class__.__mro__}\".format(x)", "NBP-DUNDER-ESCAPE", "{0.__class__.__mro__}"),
+    ("spark.__dict__", "NBP-DUNDER-ESCAPE", "spark.__dict__"),
+    ("fn.__closure__[0].cell_contents", "NBP-DUNDER-ESCAPE", "fn.__closure__"),
+    ("obj.__getattribute__('x')", "NBP-DUNDER-ESCAPE", "obj.__getattribute__"),
+    ("m.__loader__.exec_module(m)", "NBP-DUNDER-ESCAPE", "m.__loader__"),
+    ("m.__spec__.loader", "NBP-DUNDER-ESCAPE", "m.__spec__"),
+    ("gen.gi_frame.f_globals", "NBP-DUNDER-ESCAPE", "gen.gi_frame"),
+    ("import inspect\ninspect.stack()[1][0].f_globals", "NBP-DUNDER-ESCAPE", "<expr>.f_globals"),
+    ("cls.__init_subclass__", "NBP-DUNDER-ESCAPE", "cls.__init_subclass__"),
+    ("bound.__self__", "NBP-DUNDER-ESCAPE", "bound.__self__"),
+    ("bound.__func__.__globals__", "NBP-DUNDER-ESCAPE", "bound.__func__"),
+    ("obj.__reduce__()", "NBP-DUNDER-ESCAPE", "obj.__reduce__"),
+    ("x.__class__.__base__", "NBP-DUNDER-ESCAPE", "x.__class__.__base__"),
+]
+
+
+@pytest.mark.parametrize("source,rule,target", DUNDER_ESCAPE_CELLS,
+                         ids=[c[1] + ":" + c[0][:30] for c in DUNDER_ESCAPE_CELLS])
+def test_dunder_escape_chains_are_refused(tmp_path, sandbox_env, source, rule, target):
+    _assert_refused(tmp_path, [source], rule, target)
+
+
+# (4) IPython: the shell object, its imports, and %magic / !command lines inside a cell body.
+IPYTHON_CELLS = [
+    ("import IPython", "NBP-IPYTHON-ESCAPE", "IPython"),
+    ("from IPython import get_ipython", "NBP-IPYTHON-ESCAPE", "IPython"),
+    ("from IPython.core.interactiveshell import InteractiveShell", "NBP-IPYTHON-ESCAPE", "IPython"),
+    ("ip = get_ipython()", "NBP-IPYTHON-ESCAPE", "get_ipython"),
+    ("get_ipython().getoutput('id')", "NBP-OS-PROCESS", "get_ipython.getoutput"),
+    ("get_ipython().run_line_magic('sh', 'id')", "NBP-OS-PROCESS", "get_ipython.run_line_magic"),
+    ("get_ipython().run_cell_magic('bash', '', 'id')", "NBP-OS-PROCESS", "get_ipython.run_cell_magic"),
+    ("get_ipython().magic('sh id')", "NBP-OS-PROCESS", "get_ipython.magic"),
+    ("get_ipython().system_raw('id')", "NBP-OS-PROCESS", "get_ipython.system_raw"),
+    ("get_ipython().ev('__import__(\"os\")')", "NBP-IPYTHON-ESCAPE", "get_ipython.ev"),
+    ("get_ipython().ex('import os')", "NBP-IPYTHON-ESCAPE", "get_ipython.ex"),
+    ("get_ipython().run_cell('import os')", "NBP-IPYTHON-ESCAPE", "get_ipython.run_cell"),
+    ("get_ipython().user_ns['dbutils']", "NBP-IPYTHON-ESCAPE", "get_ipython.user_ns"),
+    ("InteractiveShell.instance().system('id')", "NBP-IPYTHON-ESCAPE", "InteractiveShell"),
+    ("gi = get_ipython\ngi().system('id')", "NBP-OS-PROCESS", "get_ipython.system"),
+    ("x = 1\n!id", "NBP-OS-PROCESS", "!id"),
+    ("x = 1\n%%bash\nid", "NBP-OS-PROCESS", "%%bash"),
+    ("x = 1\n%sh id", "NBP-OS-PROCESS", "%sh"),
+    ("x = 1\n%pip install requests", "NBP-OS-PROCESS", "%pip"),
+    ("x = 1\n%matplotlib inline", "NBP-IPYTHON-ESCAPE", "%matplotlib"),
+    ("x = 1\n%run ./other", "NBP-IPYTHON-ESCAPE", "%run"),
+]
+
+
+@pytest.mark.parametrize("source,rule,target", IPYTHON_CELLS, ids=[c[1] + ":" + c[0][:30] for c in IPYTHON_CELLS])
+def test_ipython_escapes_are_refused(tmp_path, sandbox_env, source, rule, target):
+    _assert_refused(tmp_path, [source], rule, target)
+
+
+def test_magic_led_cell_is_skipped_whole_and_logged(tmp_path, sandbox_env):
+    # A cell whose FIRST line is a magic is skipped as a unit: no line of it
+    # is compiled or executed, and the skip is visible in the policy log.
+    path = write_notebook(tmp_path, "child", ["%sh id\nMAGIC_MARK = 1", "!id\nBANG_MARK = 1", "AFTER_MARK = 1"])
+    g = globals()
+    for k in ("MAGIC_MARK", "BANG_MARK", "AFTER_MARK"):
+        g.pop(k, None)
+    try:
+        assert runner(tmp_path).run(path) == "ok"
+        assert "MAGIC_MARK" not in g and "BANG_MARK" not in g
+        assert g["AFTER_MARK"] == 1
+    finally:
+        g.pop("AFTER_MARK", None)
+    skipped = [e for e in npol.get_policy_log() if e["event"] == "skipped_magic"]
+    assert [(e["cell_index"], e["target"]) for e in skipped] == [(0, "%sh id"), (1, "!id")]
+    assert all(e["notebook_path"] == path and e["remediation"] for e in skipped)
+    assert [e for e in npol.get_policy_log() if e["event"] == "refused"] == []
+
+
+# (5) Spark JVM / py4j bridges: private Spark attributes and py4j handles.
+JVM_BRIDGE_CELLS = [
+    ("spark.sparkContext._jsc.sc()", "NBP-POLICY-TAMPER", "spark.sparkContext._jsc"),
+    ("spark._jsparkSession", "NBP-POLICY-TAMPER", "spark._jsparkSession"),
+    ("spark._gateway", "NBP-POLICY-TAMPER", "spark._gateway"),
+    ("sc._gateway.jvm.java.lang.Runtime", "NBP-POLICY-TAMPER", "sc._gateway"),
+    ("spark.sparkContext._gateway", "NBP-POLICY-TAMPER", "spark.sparkContext._gateway"),
+    ("spark.sparkContext._conf._jconf", "NBP-POLICY-TAMPER", "spark.sparkContext._conf"),
+    ("SparkContext._active_spark_context._jvm", "NBP-POLICY-TAMPER", "SparkContext._active_spark_context"),
+    ("SparkSession._instantiatedSession._jvm", "NBP-POLICY-TAMPER", "SparkSession._instantiatedSession"),
+    ("SparkSession._activeSession", "NBP-POLICY-TAMPER", "SparkSession._activeSession"),
+    ("SparkSession.getActiveSession()._jvm", "NBP-POLICY-TAMPER", "SparkSession.getActiveSession._jvm"),
+    ("from pyspark.sql import SparkSession\nSparkSession._instantiatedSession", "NBP-POLICY-TAMPER",
+     "pyspark.sql.SparkSession._instantiatedSession"),
+    ("df._jdf.sparkSession()", "NBP-POLICY-TAMPER", "df._jdf"),
+    ("df.rdd._jrdd", "NBP-POLICY-TAMPER", "df.rdd._jrdd"),
+    ("sqlContext._jsqlContext", "NBP-POLICY-TAMPER", "sqlContext._jsqlContext"),
+    ("import py4j", "NBP-POLICY-TAMPER", "py4j"),
+    ("from py4j.java_gateway import JavaGateway", "NBP-POLICY-TAMPER", "py4j"),
+    ("JavaGateway()", "NBP-POLICY-TAMPER", "JavaGateway"),
+    ("sp = spark\nsp._jvm", "NBP-POLICY-TAMPER", "spark._jvm"),
+    ("ctx = spark.sparkContext\nctx._jvm", "NBP-POLICY-TAMPER", "spark.sparkContext._jvm"),
+    ("spark.sparkContext.addPyFile('oci://b@ns/x/evil.zip')", "NBP-BUILTIN-EXEC", "spark.sparkContext.addPyFile"),
+    ("sc.addJar('oci://b@ns/x/evil.jar')", "NBP-BUILTIN-EXEC", "sc.addJar"),
+    ("spark.udf.registerJavaFunction('f', 'com.x.Evil')", "NBP-POLICY-TAMPER", "spark.udf.registerJavaFunction"),
+    ("session = make()\nsession._jvm", "NBP-POLICY-TAMPER", "session._jvm"),
+    ("spark._jvm = None", "NBP-POLICY-TAMPER", "spark._jvm"),
+]
+
+
+@pytest.mark.parametrize("source,rule,target", JVM_BRIDGE_CELLS, ids=[c[1] + ":" + c[0][:30] for c in JVM_BRIDGE_CELLS])
+def test_jvm_bridges_are_refused(tmp_path, sandbox_env, source, rule, target):
+    _assert_refused(tmp_path, [source], rule, target)
+
+
+# (6) Other process / exec / open routes.
+PROCESS_EXEC_CELLS = [
+    ("from concurrent.futures import ProcessPoolExecutor", "NBP-IMPORT-PROCESS",
+     "concurrent.futures.ProcessPoolExecutor"),
+    ("import concurrent.futures\nconcurrent.futures.ProcessPoolExecutor()", "NBP-IMPORT-PROCESS",
+     "concurrent.futures.ProcessPoolExecutor"),
+    ("from concurrent import futures\nfutures.ProcessPoolExecutor(2)", "NBP-IMPORT-PROCESS",
+     "concurrent.futures.ProcessPoolExecutor"),
+    ("import concurrent.futures.process", "NBP-IMPORT-PROCESS", "concurrent.futures.process"),
+    ("import os\nos.posix_spawn('/bin/sh', ['sh'], {})", "NBP-OS-PROCESS", "os.posix_spawn"),
+    ("import os\nos.forkpty()", "NBP-OS-PROCESS", "os.forkpty"),
+    # (references only: if a regression ever let these through, the suite must not kill itself)
+    ("import os\nkill = os.kill", "NBP-OS-PROCESS", "os.kill"),
+    ("import os\nbye = os._exit", "NBP-POLICY-TAMPER", "os._exit"),
+    ("import pickle\npickle.loads(b)", "NBP-DESERIALIZE", "pickle.loads"),
+    ("import pickle\npickle.load(fh)", "NBP-DESERIALIZE", "pickle.load"),
+    ("import pickle\npickle.Unpickler(fh).load()", "NBP-DESERIALIZE", "pickle.Unpickler"),
+    ("import marshal\nmarshal.loads(b)", "NBP-DESERIALIZE", "marshal.loads"),
+    ("import shelve\nshelve.open(p)", "NBP-DESERIALIZE", "shelve.open"),
+    ("import dill\ndill.loads(b)", "NBP-DESERIALIZE", "dill.loads"),
+    ("import cloudpickle\ncloudpickle.load(fh)", "NBP-DESERIALIZE", "cloudpickle.load"),
+    ("import joblib\njoblib.load('m.pkl')", "NBP-DESERIALIZE", "joblib.load"),
+    ("import pandas as pd\npd.read_pickle('x.pkl')", "NBP-DESERIALIZE", "pandas.read_pickle"),
+    ("import yaml\nyaml.load(s)", "NBP-DESERIALIZE", "yaml.load"),
+    ("import yaml\nyaml.load(s, Loader=yaml.Loader)", "NBP-DESERIALIZE", "yaml.load"),
+    ("import yaml\nyaml.unsafe_load(s)", "NBP-DESERIALIZE", "yaml.unsafe_load"),
+    ("import yaml\nyaml.full_load(s)", "NBP-DESERIALIZE", "yaml.full_load"),
+    ("import torch\ntorch.load('m.pt')", "NBP-DESERIALIZE", "torch.load"),
+    ("import torch\ntorch.load('m.pt', weights_only=False)", "NBP-DESERIALIZE", "torch.load"),
+    ("import numpy as np\nnp.load('a.npy', allow_pickle=True)", "NBP-DESERIALIZE", "numpy.load(allow_pickle=True)"),
+    ("import jsonpickle\njsonpickle.decode(s)", "NBP-DESERIALIZE", "jsonpickle.decode"),
+    ("from pickle import loads\nloads(b)", "NBP-DESERIALIZE", "pickle.loads"),
+    ("import cffi", "NBP-IMPORT-PROCESS", "cffi"),
+    ("import signal", "NBP-IMPORT-PROCESS", "signal"),
+    ("import resource", "NBP-IMPORT-PROCESS", "resource"),
+    ("import psutil", "NBP-IMPORT-PROCESS", "psutil"),
+    ("import pexpect", "NBP-IMPORT-PROCESS", "pexpect"),
+    ("import _posixsubprocess", "NBP-IMPORT-PROCESS", "_posixsubprocess"),
+    ("import code\ncode.interact()", "NBP-BUILTIN-EXEC", "code"),
+    ("import pdb\npdb.set_trace()", "NBP-BUILTIN-EXEC", "pdb"),
+    ("breakpoint()", "NBP-BUILTIN-EXEC", "breakpoint"),
+    ("import timeit\ntimeit.timeit('__import__(\"os\")')", "NBP-BUILTIN-EXEC", "timeit"),
+    ("import cProfile\ncProfile.run('import os')", "NBP-BUILTIN-EXEC", "cProfile"),
+    ("import doctest", "NBP-BUILTIN-EXEC", "doctest"),
+    ("import webbrowser", "NBP-IMPORT-PROCESS", "webbrowser"),
+    ("import antigravity", "NBP-IMPORT-PROCESS", "antigravity"),
+    ("import io\nio.open('/etc/passwd')", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("import io\nio.FileIO('/etc/passwd')", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("import os\nos.open('/etc/passwd', os.O_RDONLY)", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("import codecs\ncodecs.open('/etc/passwd', encoding='utf-8')", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("import gzip\ngzip.open('/Volumes/prod/x.gz')", "NBP-OPEN-PATH", "/Volumes/prod/x.gz"),
+    ("import tarfile\ntarfile.open('/Volumes/prod/x.tar')", "NBP-OPEN-PATH", "/Volumes/prod/x.tar"),
+    ("import zipfile\nzipfile.ZipFile('/Workspace/.oci/config')", "NBP-OPEN-PATH", "/Workspace/.oci/config"),
+    ("import io\nio.open(p)", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("import sqlite3\nsqlite3.connect('/Volumes/prod/x.db')", "NBP-OPEN-PATH", "/Volumes/prod/x.db"),
+    ("import linecache\nlinecache.getline('/etc/passwd', 1)", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("import os\nos.chdir('/Volumes/prod')", "NBP-FS-PATH", "/Volumes/prod"),
+    ("import os\nos.chdir('no-such-dir/..')", "NBP-FS-PATH", "no-such-dir/.."),       # relative: cwd must stay put
+    ("import os\nos.chdir(p)", "NBP-FS-DYNAMIC", "<dynamic>"),
+    ("import types\ntypes.FunctionType(co, {})", "NBP-BUILTIN-EXEC", "types.FunctionType"),
+    ("from types import CodeType", "NBP-BUILTIN-EXEC", "types.CodeType"),
+    ("import asyncio\nasyncio.open_connection('h', 80)", "NBP-IMPORT-NETWORK", "asyncio.open_connection"),
+    ("import socketserver", "NBP-IMPORT-NETWORK", "socketserver"),
+    ("import ssl", "NBP-IMPORT-NETWORK", "ssl"),
+]
+
+
+@pytest.mark.parametrize("source,rule,target", PROCESS_EXEC_CELLS,
+                         ids=[c[1] + ":" + c[0][:30] for c in PROCESS_EXEC_CELLS])
+def test_other_process_exec_routes_are_refused(tmp_path, sandbox_env, source, rule, target):
+    _assert_refused(tmp_path, [source], rule, target)
+
+
+# (7) Namespace / alias tracking across the cells of one run; a name rebound
+#     to something unknown and then used is refused (fail closed).
+class _Stub:
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+ALIAS_TRACKING_CASES = [
+    # (cells, rule, target, refused cell index, stub globals for the cells that run)
+    (["x = __builtins__", "x['open']('/etc/passwd')"], "NBP-OPEN-PATH", "/etc/passwd", 1, {}),
+    (["f = getattr", "f(os, 'system')('id')"], "NBP-INDIRECT", "os", 1, {}),
+    (["sp = spark", "sp._jvm"], "NBP-POLICY-TAMPER", "spark._jvm", 1, {"spark": _Stub()}),
+    (["ctx = spark.sparkContext", "ctx.addPyFile('oci://b@ns/x/e.zip')"], "NBP-BUILTIN-EXEC",
+     "spark.sparkContext.addPyFile", 1, {"spark": _Stub(sparkContext=_Stub())}),
+    (["b = __builtins__", "d = b.__dict__", "d['open']('/etc/passwd')"], "NBP-DUNDER-ESCAPE",
+     "__builtins__.__dict__", 1, {}),
+    (["g = globals", "ns = g()"], "NBP-INDIRECT", "globals()", 1, {}),
+    (["gi = get_ipython", "gi().system('id')"], "NBP-OS-PROCESS", "get_ipython.system", 1,
+     {"get_ipython": lambda: None}),
+    (["ipy = get_ipython()", "ipy.system('id')"], "NBP-IPYTHON-ESCAPE", "get_ipython", 0, {}),
+    (["from pickle import loads as unpack", "unpack(blob)"], "NBP-DESERIALIZE", "pickle.loads", 0, {}),
+    (["import pickle", "P = pickle", "P.loads(b)"], "NBP-DESERIALIZE", "pickle.loads", 2, {}),
+    (["import os as o", "o.popen('id')"], "NBP-OS-PROCESS", "os.popen", 1, {}),
+    # rebound to something the gate cannot resolve -> every later use refused
+    (["f = getattr", "f = make_getter()", "f(obj, 'x')"], "NBP-INDIRECT", "f", 2,
+     {"make_getter": lambda: None}),
+    (["sp = spark", "sp = build_session()", "sp.sparkContext.getConf()"], "NBP-INDIRECT", "sp", 2,
+     {"spark": _Stub(), "build_session": lambda: None}),
+    (["o = open", "o = my_open", "o('rel.txt')"], "NBP-INDIRECT", "o", 2, {"my_open": None}),
+    (["import os", "os = fake_os()", "os.path.join('a', 'b')"], "NBP-INDIRECT", "os", 2,
+     {"fake_os": lambda: None}),
+    (["b = __builtins__", "b = {}", "b['open']"], "NBP-INDIRECT", "b", 2, {}),
+]
+
+
+@pytest.mark.parametrize("cells,rule,target,idx,stubs", ALIAS_TRACKING_CASES,
+                         ids=[c[1] + ":" + " | ".join(c[0])[:40] for c in ALIAS_TRACKING_CASES])
+def test_aliases_are_followed_across_cells_and_rebinding_fails_closed(tmp_path, sandbox_env, cells, rule,
+                                                                        target, idx, stubs):
+    _assert_refused(tmp_path, cells, rule, target, cell_index=idx, stubs=stubs)
+
+
+def test_refused_cell_count_covers_the_revalidation_classes():
+    refused = BUILTIN_INDIRECTION_CELLS + DYNAMIC_ACCESS_CELLS + DUNDER_ESCAPE_CELLS + IPYTHON_CELLS \
+        + JVM_BRIDGE_CELLS + PROCESS_EXEC_CELLS
+    assert len(refused) + len(ALIAS_TRACKING_CASES) >= 40
+    for rule in ("NBP-DUNDER-ESCAPE", "NBP-IPYTHON-ESCAPE", "NBP-DESERIALIZE"):
+        assert rule in npol.ALL_RULES
+
+
+# (8) Clean notebooks keep working.
+CLEAN_CELLS_2 = [
+    "import pandas as pd\nimport numpy as np\ndf = pd.DataFrame({'a': [1]})\nx = np.array([1])",
+    "import matplotlib.pyplot as plt\nplt.plot([1, 2])",
+    "import plotly.express as px\nfig = px.bar(df, x='a')",
+    "pd.options.display.max_columns = 50",
+    "df2 = df.alias('d')",
+    "x = spark.read.parquet('oci://b@ns/prod/in')",
+    "df.write.mode('overwrite').parquet('oci://b@ns/sbx/out')",
+    "dbutils.widgets.text('p', '1')\nv = dbutils.widgets.get('p')",
+    "dbutils.notebook.exit('ok')",
+    "display(df)",
+    "s = 'a {}'.format(1)",
+    "n = f'{x} rows'",
+    "d = {'key': 1}\nv = d['key']",
+    "class Model:\n    def __init__(self, n):\n        self.n = n\n    def __repr__(self):\n        return f'Model({self.n})'",
+    "class B(A):\n    def __init__(self):\n        super().__init__()",
+    "name = type(df).__name__",
+    "m = df.__class__.__name__",
+    "import yaml\ncfg = yaml.safe_load(s)",
+    "import yaml\ncfg = yaml.load(s, Loader=yaml.SafeLoader)",
+    "from yaml import load, SafeLoader\ncfg = load(s, Loader=SafeLoader)",
+    "import torch\nm = torch.load('m.pt', weights_only=True)",
+    "import numpy as np\na = np.load('a.npy')",
+    "import pickle\npickle.dump(obj, fh)",
+    "from concurrent.futures import ThreadPoolExecutor",
+    "import json\nj = json.loads(s)",
+    "v = globals()['my_var']",
+    "globals()['result'] = 1",
+    "import os\np = os.path.join('a', 'b')",
+    "import sys\nprint(sys.version)",
+    "with open('rel.txt', 'w') as fh:\n    fh.write('x')",
+    "import sqlite3\nc = sqlite3.connect(':memory:')",
+    "import io\nbuf = io.BytesIO(b'x')",
+    "import inspect\nsig = inspect.signature(fn)",
+    "row.__fields__",
+    "spark.sparkContext.setLogLevel('WARN')",
+    "spark.conf.get('spark.sql.shuffle.partitions')",
+    "from pyspark.sql import SparkSession, functions as F\nc = F.col('a')",
+    "from pyspark.sql.functions import col, lit",
+    "import logging\nlog = logging.getLogger(__name__)",
+    "setattr(obj, 'x', 1)",
+    "y = getattr(df, 'count')()",
+    "x = hasattr(df, 'write')",
+    "def helper(spark, df):\n    return df.count()",
+    "import gc\ngc.collect()",
+    "sc = spark.sparkContext\nn = sc.defaultParallelism",
+    "import os as o\nimport sys as s\no2 = o\nE = o2.path.sep",
+    "try:\n    risky()\nexcept Exception as e:\n    print(str(e))",
+    "total = sum(len(x) for x in rows)",
+    "pdf = df.toPandas()",
+]
+
+
+@pytest.mark.parametrize("source", CLEAN_CELLS_2, ids=[c[:40] for c in CLEAN_CELLS_2])
+def test_clean_cell_passes_the_hardened_gate(sandbox_env, source):
+    assert npol.scan_source(source) == []
+
+
+def test_chdir_inside_the_sandbox_prefix_is_allowed(sandbox_env):
+    inside = sandbox_env["local_prefix"] + "work"
+    assert npol.scan_source(f"import os\nos.chdir({inside!r})") == []
+
+
+def test_clean_notebook_with_dunder_definitions_and_aliases_executes(tmp_path, sandbox_env):
+    path = write_notebook(tmp_path, "child", [
+        "import json\nimport os as _o",
+        "class _Acc:\n    def __init__(self):\n        self.items = []\n    def __len__(self):\n"
+        "        return len(self.items)\n    def __repr__(self):\n        return 'Acc({})'.format(len(self))",
+        "class _Sub(_Acc):\n    def __init__(self):\n        super().__init__()\n        self.items.append(1)",
+        "acc = _Sub()\nsetattr(acc, 'tag', 'x')\nkind = type(acc).__name__",
+        "globals()['CLEAN_MARK'] = json.dumps({'n': len(acc), 'kind': kind, 'tag': getattr(acc, 'tag'),"
+        " 'sep': _o.path.sep})",
+    ])
+    g = globals()
+    for k in ("CLEAN_MARK", "acc", "kind", "_Acc", "_Sub"):
+        g.pop(k, None)
+    try:
+        assert runner(tmp_path).run(path) == "ok"
+        assert json.loads(g["CLEAN_MARK"]) == {"n": 1, "kind": "_Sub", "tag": "x", "sep": os.path.sep}
+    finally:
+        for k in ("CLEAN_MARK", "acc", "kind", "_Acc", "_Sub", "_o"):
+            g.pop(k, None)
+    assert [e for e in npol.get_policy_log() if e["event"] in ("refused", "allowed_exception")] == []
+
+
+# ══════════════════════════════════════════════════════════════════════
+# SEC-AIDP-SAMPLES-005 round 2: gaps from the static review of edcb186
+# ══════════════════════════════════════════════════════════════════════
+# (9) Each gap is closed by generalising the rule, not the spelling: posix / nt
+#     are os; the indirect (getattr) route consults the same rule table as the
+#     direct one; str.format templates are resolved and walked; library readers
+#     refuse literal local paths; a dynamic spark.sql statement needs a literal
+#     read-keyword head.
+ROUND2_GAP_CELLS = [
+    # -- (1) posix / nt are the modules os re-exports: every os rule applies
+    ("import posix\nposix.system('id')", "NBP-OS-PROCESS", "os.system"),
+    ("import posix\nTOKEN = posix.environ.get('AIDP_TOKEN')", "NBP-OS-ENVIRON", "os.environ"),
+    ("import posix\nposix.open('/etc/passwd', 0)", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("import posix\nposix.remove('/Volumes/prod/x')", "NBP-FS-PATH", "/Volumes/prod/x"),
+    ("import posix\nposix.fork()", "NBP-OS-PROCESS", "os.fork"),
+    ("import posix\nposix.environ = {}", "NBP-OS-ENVIRON", "os.environ"),
+    ("from posix import system", "NBP-OS-PROCESS", "os.system"),
+    ("from posix import environ as _e", "NBP-OS-ENVIRON", "os.environ"),
+    ("from posix import *", "NBP-OS-ENVIRON", "os.*"),
+    ("import posix as p\np.popen('id')", "NBP-OS-PROCESS", "os.popen"),
+    ("import nt\nnt.system('id')", "NBP-OS-PROCESS", "os.system"),
+    ("import nt as n\nn.environ['X']", "NBP-OS-ENVIRON", "os.environ"),
+    # -- (2) the indirect route consults the same rule table as direct access
+    ("import asyncio\nasyncio.run(getattr(asyncio, 'create_subprocess_exec')('id'))", "NBP-OS-PROCESS",
+     "asyncio.create_subprocess_exec"),
+    ("import asyncio\nf = getattr(asyncio, 'create_subprocess_shell')", "NBP-OS-PROCESS",
+     "asyncio.create_subprocess_shell"),
+    ("import asyncio\nloop = asyncio.get_event_loop()\nloop.subprocess_exec(lambda: None, 'id')", "NBP-OS-PROCESS",
+     "loop.subprocess_exec"),
+    ("import asyncio\nloop = asyncio.get_event_loop()\ngetattr(loop, 'subprocess_shell')", "NBP-OS-PROCESS",
+     "loop.subprocess_shell"),
+    ("getattr(spark.sparkContext, 'addPyFile')('oci://b@ns/x/e.zip')", "NBP-BUILTIN-EXEC",
+     "spark.sparkContext.addPyFile"),
+    ("import os\nfrom os import system as run_cmd\nrun_cmd('id')", "NBP-OS-PROCESS", "os.system"),
+    # -- (3) str.format: templates are resolved and every field is walked
+    ("t = '{0.__class__.__mro__}'\nt.format(obj)", "NBP-DUNDER-ESCAPE", "{0.__class__.__mro__}"),
+    ("'{x.__init__.__globals__[os].environ}'.format_map(dict(x=obj))", "NBP-DUNDER-ESCAPE",
+     "{x.__init__.__globals__[os].environ}"),
+    ("t = '{x.__init__.__globals__}'\nt.format_map(dict(x=obj))", "NBP-DUNDER-ESCAPE", "{x.__init__.__globals__}"),
+    ("str.format('{0.__class__.__mro__}', obj)", "NBP-DUNDER-ESCAPE", "{0.__class__.__mro__}"),
+    ("str.format_map('{x.__globals__}', dict(x=f))", "NBP-DUNDER-ESCAPE", "{x.__globals__}"),
+    ("import string\nstring.Formatter().format('{0.__subclasses__}', obj)", "NBP-DUNDER-ESCAPE",
+     "{0.__subclasses__}"),
+    ("import string\nstring.Formatter().vformat('{0.__code__}', (f,), {})", "NBP-DUNDER-ESCAPE", "{0.__code__}"),
+    ("import textwrap\ntextwrap.dedent('  {0.__class__.__mro__}').format(obj)", "NBP-DUNDER-ESCAPE",
+     "{0.__class__.__mro__}"),
+    ("('{0.__class__.' + '__mro__}').format(obj)", "NBP-DUNDER-ESCAPE", "{0.__class__.__mro__}"),
+    ("'{0:{1.__class__.__mro__}}'.format(a, b)", "NBP-DUNDER-ESCAPE", "{1.__class__.__mro__}"),   # nested spec
+    ("'{0.f_globals}'.format(frame)", "NBP-DUNDER-ESCAPE", "{0.f_globals}"),
+    ("tpl = dbutils.widgets.get('tpl')\ntpl.format(obj)", "NBP-DUNDER-ESCAPE", "<dynamic>"),        # fail closed
+    ("TEMPLATES['x'].format(row=row)", "NBP-DUNDER-ESCAPE", "<dynamic>"),
+    ("tpl = 'a {0}'\ntpl = 'b {0}'\ntpl.format(obj)", "NBP-DUNDER-ESCAPE", "<dynamic>"),            # rebound: unknown
+    # -- (4) local file reads through library readers (literal local path outside the prefix)
+    ("import pandas as pd\npd.read_csv('/etc/passwd')", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("import pandas as pd\npd.read_parquet('~/.oci/config')", "NBP-OPEN-PATH", "~/.oci/config"),
+    ("import pandas as pd\npd.read_json(path_or_buf='/Workspace/.oci/config')", "NBP-OPEN-PATH",
+     "/Workspace/.oci/config"),
+    ("import pandas as pd\npd.read_csv('C:\\\\Users\\\\x\\\\secret.csv')", "NBP-OPEN-PATH", "C:\\Users\\x\\secret.csv"),
+    ("from pandas import read_csv\nread_csv('/etc/passwd')", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("import pandas as pd\nP = '/etc/passwd'\npd.read_csv(P)", "NBP-OPEN-PATH", "/etc/passwd"),      # resolved constant
+    ("spark.read.text('file:///etc/passwd')", "NBP-OPEN-PATH", "file:///etc/passwd"),
+    ("spark.read.csv('/dbfs/mnt/prod/x.csv')", "NBP-OPEN-PATH", "/dbfs/mnt/prod/x.csv"),
+    ("spark.read.format('csv').load('/Workspace/.oci/config')", "NBP-OPEN-PATH", "/Workspace/.oci/config"),
+    ("spark.read.option('path', '/etc/passwd').load()", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("spark.read.options(path='/etc/passwd').load()", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("spark.read.load(path='/etc/passwd')", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("spark.readStream.parquet('/tmp/other/in')", "NBP-OPEN-PATH", "/tmp/other/in"),
+    ("rdr = spark.read\nrdr.json('/etc/x.json')", "NBP-OPEN-PATH", "/etc/x.json"),
+    ("sc.textFile('/etc/passwd')", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("spark.sparkContext.wholeTextFiles('/Volumes/prod/docs')", "NBP-OPEN-PATH", "/Volumes/prod/docs"),
+    ("import numpy as np\nnp.loadtxt('/etc/passwd')", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("import numpy as np\nnp.load('/Volumes/prod/a.npy')", "NBP-OPEN-PATH", "/Volumes/prod/a.npy"),
+    ("import pyarrow.parquet as pq\npq.read_table('/Volumes/prod/x.parquet')", "NBP-OPEN-PATH",
+     "/Volumes/prod/x.parquet"),
+    ("import polars as pl\npl.scan_csv('/etc/passwd')", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("from PIL import Image\nImage.open('/Workspace/.ssh/id_rsa')", "NBP-OPEN-PATH", "/Workspace/.ssh/id_rsa"),
+    ("import xml.etree.ElementTree as ET\nET.parse('/etc/x.xml')", "NBP-OPEN-PATH", "/etc/x.xml"),
+    ("import h5py\nh5py.File('/Volumes/prod/m.h5', 'r')", "NBP-OPEN-PATH", "/Volumes/prod/m.h5"),
+    ("open('~/.oci/config').read()", "NBP-OPEN-PATH", "~/.oci/config"),
+    ("open('C:\\\\Users\\\\x\\\\.oci\\\\config').read()", "NBP-OPEN-PATH", "C:\\Users\\x\\.oci\\config"),
+    # -- (c) a dynamic spark.sql statement needs a LITERAL read-keyword head
+    ("spark.sql(f'{verb} TABLE prod.t')", "NBP-SQL-DYNAMIC", "<dynamic>"),
+    ("spark.sql('  ' + q)", "NBP-SQL-DYNAMIC", "<dynamic>"),
+    ("spark.sql('/* c */ ' + q)", "NBP-SQL-DYNAMIC", "<dynamic>"),
+    ("spark.sql('-- c\\n' + q)", "NBP-SQL-DYNAMIC", "<dynamic>"),
+    ("spark.sql(f'USE {db}')", "NBP-SQL-DYNAMIC", "<dynamic>"),
+    ("spark.sql(verb + ' TABLE prod.t')", "NBP-SQL-DYNAMIC", "<dynamic>"),
+    ("spark.sql('SELECTX ' + q)", "NBP-SQL-DYNAMIC", "<dynamic>"),
+]
+
+
+@pytest.mark.parametrize("source,rule,target", ROUND2_GAP_CELLS,
+                         ids=[c[1] + ":" + c[0][:30] for c in ROUND2_GAP_CELLS])
+def test_round2_gap_cells_are_refused(tmp_path, sandbox_env, source, rule, target):
+    _assert_refused(tmp_path, [source], rule, target)
+
+
+def test_posix_alias_bound_in_an_earlier_cell_is_followed(sandbox_env):
+    # (scanned, not executed: ``posix`` only exists on POSIX hosts)
+    ctx = npol.ScanContext()
+    assert npol.scan_source("import posix as p", context=ctx) == []
+    assert [(v.rule, v.target) for v in npol.scan_source("p.system('id')", context=ctx)] \
+        == [("NBP-OS-PROCESS", "os.system")]
+    ctx = npol.ScanContext()
+    assert npol.scan_source("import nt", context=ctx) == []
+    assert [(v.rule, v.target) for v in npol.scan_source("nt.environ['X']", context=ctx)] \
+        == [("NBP-OS-ENVIRON", "os.environ")]
+
+
+def test_format_template_bound_in_an_earlier_cell_is_resolved(tmp_path, sandbox_env):
+    _assert_refused(tmp_path, ["TPL = 'kind: {0.__class__.__mro__}'", "TPL.format(obj)"], "NBP-DUNDER-ESCAPE",
+                    "{0.__class__.__mro__}", cell_index=1)
+
+
+# (10) False refusals fixed: legitimate code the gate wrongly refused.
+CLEAN_CELLS_3 = [
+    # (a) format fields consult _DUNDER_ALLOW
+    "'{0.__class__.__name__}'.format(obj)",
+    "'{0.__class__}'.format(obj)",
+    "'{x[__class__]}'.format(x=d)",                                           # item lookup, not attribute access
+    "'{0:>{1}}'.format(a, 8)",
+    "msg = 'rows: {n}'\nout = msg.format(n=count)",
+    "import textwrap\nmsg = textwrap.dedent('''\n  rows: {n}''').format(n=count)",
+    "w = df.write.mode('overwrite')\nw.format('delta').save('oci://b@ns/sbx/x')",
+    "fmt = 'delta'\nw = df.write.mode('overwrite')\nw.format(fmt).save('oci://b@ns/sbx/x')",
+    "df.write.format(fmt).save('oci://b@ns/sbx/x')",
+    "spark.read.format(fmt).load(src)",
+    # (b) getattr on a Spark object with a literal public name
+    "getattr(spark, 'version')",
+    "v = getattr(spark, 'version')",
+    "n = getattr(sc, 'defaultParallelism')",
+    "getattr(spark.conf, 'get')('spark.app.name')",
+    # (c) dynamic read-only SQL with a literal read-keyword head
+    "q = 'SELECT * FROM sbx.t WHERE id=' + str(cid)\nspark.sql(q)",
+    "for cid in ids:\n    q = 'SELECT * FROM sbx.t WHERE id=' + str(cid)\n    spark.sql(q)",
+    "if flag:\n    q = f'SELECT count(*) FROM sbx.t WHERE d={d}'\n    spark.sql(q)",
+    "spark.sql('SELECT * FROM sbx.t WHERE id=' + str(cid))",
+    "spark.sql(f'WITH c AS (SELECT 1) SELECT * FROM c WHERE x={v}')",
+    "spark.sql('SHOW TABLES IN {}'.format(s))",
+    "spark.sql('-- filter\\nSELECT 1 FROM {}'.format(s))",
+    "spark.sql('/* cols */ DESCRIBE {}'.format(s))",
+    "spark.sql('DESC ' + t)",
+    "spark.sql('EXPLAIN ' + q)",
+    # (4) dynamic, object-storage, catalog and relative reads stay allowed
+    "import pandas as pd\npdf = pd.read_csv(src_path)",
+    "spark.read.csv(path, header=True)",
+    "spark.read.format('parquet').load(src)",
+    "import pandas as pd\npdf = pd.read_csv('oci://b@ns/prod/x.csv')",
+    "spark.read.parquet('abfss://c@a.dfs.core.windows.net/prod/in')",
+    "spark.read.parquet('s3://bucket/prod/in')",
+    "spark.read.parquet('oci://b@ns/sbx/in')",
+    "spark.read.table('prod.t')",
+    "import pandas as pd\npdf = pd.read_csv('data/local.csv')",
+    "import pandas as pd\npdf = pd.read_sql('SELECT 1', con)",
+    "import numpy as np\na = np.load('a.npy')",
+]
+
+
+@pytest.mark.parametrize("source", CLEAN_CELLS_3, ids=[c[:40] for c in CLEAN_CELLS_3])
+def test_round2_false_refusals_pass_the_gate(sandbox_env, source):
+    assert npol.scan_source(source) == []
+
+
+def test_local_reads_inside_the_sandbox_prefix_are_allowed(sandbox_env):
+    inside = sandbox_env["local_prefix"] + "in.csv"
+    assert npol.scan_source(f"import pandas as pd\npdf = pd.read_csv({inside!r})") == []
+    pol = SandboxPolicy(catalog="default", schema="sbx", prefix="oci://b@ns/sbx/", extra_prefixes=("/tmp/sbx/",))
+    assert npol.scan_source("spark.read.csv('file:///tmp/sbx/in.csv')", policy=pol) == []
+    assert npol.scan_source("spark.read.csv('/tmp/sbx/in.csv')", policy=pol) == []
+    assert [v.rule for v in npol.scan_source("spark.read.csv('file:///tmp/other/in.csv')", policy=pol)] \
+        == ["NBP-OPEN-PATH"]
+
+
+def test_unverified_reads_are_allowed_and_recorded(sandbox_env):
+    src = ("import pandas as pd\n"
+           "pdf = pd.read_csv(src_path)\n"
+           "rows = spark.sql('SELECT * FROM sbx.t WHERE id=' + str(cid))")
+    assert npol.scan_source(src) == []
+    assert npol.enforce_cell_policy(src, notebook_path="nb", cell_index=3) == []
+    notes = [e for e in npol.get_policy_log() if e["event"] in npol.POLICY_NOTES]
+    assert [(e["event"], e["target"], e["cell_index"], e["notebook_path"]) for e in notes] == [
+        ("unverified_read_path", "pandas.read_csv(<dynamic>)", 3, "nb"),
+        ("unverified_sql_read", "SELECT * FROM sbx.t WHERE id=", 3, "nb"),
+    ]
+    assert [e["detail"]["line"] for e in notes] == [2, 3]
+    assert all(e["rule"] == "" and e["remediation"] == "" for e in notes)
+    assert "unverified_read_path" in npol.policy_log_markdown()
+    assert [e for e in npol.get_policy_log() if e["event"] in ("refused", "allowed_exception")] == []
+
+
+def test_verified_reads_are_not_recorded(sandbox_env):
+    npol.enforce_cell_policy("x = spark.read.parquet('oci://b@ns/prod/in')\ny = spark.sql('SELECT 1')",
+                             notebook_path="nb", cell_index=0)
+    assert [e for e in npol.get_policy_log() if e["event"] in npol.POLICY_NOTES] == []
+
+
+# (11) Review-derived gap classes (automated review of the round-2 commits plus
+#      a probe run against edcb186), each closed as a CLASS of route:
+#      A  a gated module / Spark object handed around as a value;
+#      B  a process / introspection sink name on a receiver the gate cannot resolve;
+#      C  RDD.pipe(cmd) and string-typed .pipe() arguments;
+#      D  string-keyed attribute accessors (attrgetter / methodcaller / reduce(getattr) /
+#         inspect.getattr_static / getmembers);
+#      E  re-rooting at a module named mid-chain (shutil.os, pd.io.common.os, self.spark);
+#      F  deserialisers: pickle deny-by-default, private attributes of gated modules,
+#         torch.load at any depth, numpy allow_pickle, yaml loaders / constructors / hooks;
+#      G  globals()[k] with a tainted / alias / protected key or a dereferenced result;
+#      H  open() with *args / **kwargs; I  pydoc joins the process modules.
+#      The 100 probe cells below are the acceptance test, verbatim, with the first
+#      refusal the runner reports; every entry passed the gate at edcb186 or was
+#      refused for the wrong reason there.
+REVIEW_GAP_CELLS = [
+    ("f = os\nf.system('id')", 'NBP-OS-PROCESS', 'os.system'),
+    ("[os][0].system('id')", 'NBP-INDIRECT', '<expr>.system'),
+    ("(os if True else sys).system('id')", 'NBP-INDIRECT', '<expr>.system'),
+    ("def run(m):\n    m.system('id')\nrun(os)", 'NBP-INDIRECT', 'm.system'),
+    ("m = {'a': os}['a']\nm.system('id')", 'NBP-INDIRECT', 'os'),
+    ("def get():\n    return os\nget().system('id')", 'NBP-INDIRECT', 'os'),
+    ("(lambda: os)().system('id')", 'NBP-INDIRECT', '<expr>.system'),
+    ("import os as _o\nd = dict(m=_o)\nd['m'].system('id')", 'NBP-INDIRECT', 'os'),
+    ("for m in (os,):\n    m.system('id')", 'NBP-INDIRECT', 'os'),
+    ("mods = [os]\nmods[0].popen('id')", 'NBP-INDIRECT', 'os'),
+    ("helper().system('id')", 'NBP-INDIRECT', 'helper.system'),
+    ("obj.popen('id')", 'NBP-INDIRECT', 'obj.popen'),
+    ("thing.open('/etc/passwd').read()", 'NBP-OPEN-PATH', '/etc/passwd'),
+    ('pickle._loads(b)', 'NBP-DESERIALIZE', 'pickle._loads'),
+    ('pickle._load(f)', 'NBP-DESERIALIZE', 'pickle._load'),
+    ('pickle._Unpickler(f).load()', 'NBP-DESERIALIZE', 'pickle._Unpickler'),
+    ('pickle.Unpickler(f).load()', 'NBP-DESERIALIZE', 'pickle.Unpickler'),
+    ('import yaml\nL = yaml.Loader\nyaml.load(s, Loader=L)', 'NBP-DESERIALIZE', 'yaml.Loader'),
+    ("yaml.load(s, Loader=getattr(yaml, 'Loader'))", 'NBP-DESERIALIZE', 'yaml.load'),
+    ('yaml.load(s, yaml.UnsafeLoader)', 'NBP-DESERIALIZE', 'yaml.load'),
+    ('yaml.full_load(s)', 'NBP-DESERIALIZE', 'yaml.full_load'),
+    ('yaml.unsafe_load(s)', 'NBP-DESERIALIZE', 'yaml.unsafe_load'),
+    ('yaml.load_all(s)', 'NBP-DESERIALIZE', 'yaml.load_all'),
+    ('yaml.full_load_all(s)', 'NBP-DESERIALIZE', 'yaml.full_load_all'),
+    ('torch.load(p)', 'NBP-DESERIALIZE', 'torch.load'),
+    ('torch.load(p, weights_only=flag)', 'NBP-DESERIALIZE', 'torch.load'),
+    ('torch.serialization.load(p)', 'NBP-DESERIALIZE', 'torch.serialization.load'),
+    ('torch.jit.load(p)', 'NBP-DESERIALIZE', 'torch.jit.load'),
+    ('np.load(p, allow_pickle=flag)', 'NBP-DESERIALIZE', 'np.load(allow_pickle=<dynamic>)'),
+    ('np.load(p, allow_pickle=not False)', 'NBP-DESERIALIZE', 'np.load(allow_pickle=<dynamic>)'),
+    ('marshal.loads(b)', 'NBP-DESERIALIZE', 'marshal.loads'),
+    ('shelve.open(p)', 'NBP-DESERIALIZE', 'shelve.open'),
+    ('dill.loads(b)', 'NBP-DESERIALIZE', 'dill.loads'),
+    ('cloudpickle.loads(b)', 'NBP-DESERIALIZE', 'cloudpickle.loads'),
+    ('jsonpickle.decode(s)', 'NBP-DESERIALIZE', 'jsonpickle.decode'),
+    ('pd.read_pickle(p)', 'NBP-DESERIALIZE', 'pd.read_pickle'),
+    ('joblib.load(p)', 'NBP-DESERIALIZE', 'joblib.load'),
+    ("sc.parallelize(['x']).pipe('id').collect()", 'NBP-OS-PROCESS', 'sc.parallelize.pipe()'),
+    ("rdd.pipe('id')", 'NBP-OS-PROCESS', 'rdd.pipe()'),
+    ("spark.sparkContext.textFile('/tmp/x').pipe('id')", 'NBP-OPEN-PATH', '/tmp/x'),
+    ("import pydoc\npydoc.pipepager('x', 'id')", 'NBP-IMPORT-PROCESS', 'pydoc'),
+    ("pydoc.tempfilepager('x', 'id')", 'NBP-OS-PROCESS', 'pydoc.tempfilepager'),
+    ("pydoc.pager('x')", 'NBP-OS-PROCESS', 'pydoc.pager'),
+    ("o = os\nglobals()['o'].system('id')", 'NBP-INDIRECT', '<expr>.system'),
+    ("s = spark\nglobals()['s']._jvm", 'NBP-INDIRECT', 'globals()'),
+    ("import importlib as il\nglobals()['il'].import_module('os').system('id')", 'NBP-INDIRECT', 'importlib'),
+    ("b = __builtins__\nglobals()['b']['open']('/etc/passwd')", 'NBP-INDIRECT', 'globals()'),
+    ('from yaml import Loader\nyaml.load(s, Loader)', 'NBP-DESERIALIZE', 'yaml.Loader'),
+    ('from yaml import Loader as SafeLoader\nyaml.load(s, Loader=SafeLoader)', 'NBP-DESERIALIZE', 'yaml.Loader'),
+    ('yaml.load(s, Loader=yaml.loader.Loader)', 'NBP-DESERIALIZE', 'yaml.load'),
+    ('yaml.load(s, Loader=yaml.loader.UnsafeLoader)', 'NBP-DESERIALIZE', 'yaml.load'),
+    ("class L(yaml.SafeLoader):\n    pass\nL.add_constructor('!x', lambda l, n: __import__('os').system('id'))\n"
+     "yaml.load(s, Loader=L)", 'NBP-DESERIALIZE', 'yaml.SafeLoader'),
+    ('class C(yaml.constructor.UnsafeConstructor):\n    pass', 'NBP-DESERIALIZE', 'yaml.constructor.UnsafeConstructor'),
+    ('yaml.constructor.FullConstructor', 'NBP-DESERIALIZE', 'yaml.constructor'),
+    ("getattr(pickle, 'loads')(b)", 'NBP-DESERIALIZE', 'pickle.loads'),
+    ('torch.serialization._load(p)', 'NBP-DESERIALIZE', 'torch.serialization._load'),
+    ("import operator\noperator.attrgetter('_jvm')(spark).java.lang.Runtime.getRuntime().exec('id')",
+     'NBP-INDIRECT', 'spark'),
+    ("operator.attrgetter('__class__.__base__.__subclasses__')(())()", 'NBP-DUNDER-ESCAPE', '<expr>.__base__'),
+    ("operator.methodcaller('system', 'id')(os)", 'NBP-INDIRECT', "operator.methodcaller('system')"),
+    ("from operator import attrgetter\nattrgetter('system')(os)('id')", 'NBP-INDIRECT', "operator.attrgetter('system')"),
+    ("ag = operator.attrgetter\nag('_gateway')(sc)", 'NBP-INDIRECT', 'sc'),
+    ("import shutil\nshutil.os.system('id')", 'NBP-OS-PROCESS', 'os.system'),
+    ("import subprocess\nsubprocess.os.system('id')", 'NBP-IMPORT-PROCESS', 'subprocess'),
+    ("import pathlib\npathlib.os.system('id')", 'NBP-OS-PROCESS', 'os.system'),
+    ("import pandas as pd\npd.io.common.os.system('id')", 'NBP-OS-PROCESS', 'os.system'),
+    ("import numpy\nnumpy.os.system('id')", 'NBP-OS-PROCESS', 'os.system'),
+    ("vars(os)['system']('id')", 'NBP-INDIRECT', 'os'),
+    ("vars(shutil)['os'].system('id')", 'NBP-INDIRECT', '<expr>.system'),
+    ("kw = {'file': '/etc/passwd'}\nopen(**kw).read()", 'NBP-OPEN-DYNAMIC', '<dynamic>'),
+    ("args = ['/etc/passwd']\nopen(*args).read()", 'NBP-OPEN-DYNAMIC', '<dynamic>'),
+    ('io.open(**kw)', 'NBP-OPEN-DYNAMIC', '<dynamic>'),
+    ("for m in [os]:\n    m.system('id')", 'NBP-INDIRECT', 'os'),
+    ("with os as m:\n    m.system('id')", 'NBP-INDIRECT', 'os'),
+    ("[m.system('id') for m in (os,)]", 'NBP-INDIRECT', 'm.system'),
+    ("def f(m=os):\n    m.system('id')\nf()", 'NBP-INDIRECT', 'os'),
+    ("(m := os).system('id')", 'NBP-INDIRECT', '<expr>.system'),
+    ("import functools\nfunctools.reduce(getattr, ['_jvm', 'java', 'lang', 'Runtime'], spark).getRuntime().exec('id')",
+     'NBP-INDIRECT', 'functools.reduce(getattr, ...)'),
+    ("import inspect\ninspect.getattr_static(spark, '_jvm')", 'NBP-INDIRECT', 'spark'),
+    ("dict(inspect.getmembers(spark))['_jvm']", 'NBP-INDIRECT', 'inspect.getmembers'),
+    ('inspect.getmembers(os)', 'NBP-INDIRECT', 'inspect.getmembers'),
+    ("open(p, 'w').write(data)", 'NBP-OPEN-DYNAMIC', '<dynamic>'),
+    ('open(p, mode).write(data)', 'NBP-OPEN-DYNAMIC', '<dynamic>'),
+    ('with open(f"{work_dir}/out.txt", \'a\') as fh:\n    fh.write(data)', 'NBP-OPEN-DYNAMIC', '<dynamic>'),
+    ("p = '/etc/' + 'passwd'\nopen(p).read()", 'NBP-OPEN-PATH', '/etc/passwd'),
+    ("parts = ['/etc', 'passwd']\nopen('/'.join(parts)).read()", 'NBP-OPEN-PATH', '/etc/passwd'),
+    ("open('/etc/passwd', 'r').read()", 'NBP-OPEN-PATH', '/etc/passwd'),
+    ("io.open(path_var, 'wb').write(data)", 'NBP-OPEN-DYNAMIC', '<dynamic>'),
+    # open() with a path the gate cannot resolve is refused in EVERY mode: a read of an
+    # arbitrary local file leaves the sandbox as much as a write (the library-reader
+    # scope decision does not extend to open() and its stdlib / pathlib twins)
+    ('open(path_var).read()', 'NBP-OPEN-DYNAMIC', '<dynamic>'),
+    ('import json\nwith open(f"{work_dir}/manifest.json") as fh:\n    manifest = json.load(fh)',
+     'NBP-OPEN-DYNAMIC', '<dynamic>'),
+    ("open(path_var, 'r').read()", 'NBP-OPEN-DYNAMIC', '<dynamic>'),
+    ('io.open(path_var).read()', 'NBP-OPEN-DYNAMIC', '<dynamic>'),
+    ("import codecs\ncodecs.open(path_var, encoding='utf-8').read()", 'NBP-OPEN-DYNAMIC', '<dynamic>'),
+    ('from pathlib import Path\nPath(path_var).open().read()', 'NBP-OPEN-DYNAMIC', '<dynamic>'),
+    ('Path(path_var).read_text()', 'NBP-OPEN-DYNAMIC', '<dynamic>'),
+    # re-rooting through a module's re-export of os, public or private (tempfile._os, random._os)
+    ("import tempfile\ntempfile._os.system('id')", 'NBP-OS-PROCESS', 'os.system'),
+    ("import random\nrandom._os.system('id')", 'NBP-OS-PROCESS', 'os.system'),
+    ("import glob\nglob.os.system('id')", 'NBP-OS-PROCESS', 'os.system'),
+    ("import posixpath\nposixpath.os.system('id')", 'NBP-OS-PROCESS', 'os.system'),
+    ("import platform\nplatform.os.system('id')", 'NBP-OS-PROCESS', 'os.system'),
+    ("import tarfile\ntarfile.os.environ['X']", 'NBP-OS-ENVIRON', 'os.environ'),
+]
+
+# Further cells per class, so each rule is exercised on its own and not only
+# through the first refusal of a probe.
+REVIEW_GAP_CELLS_2 = [
+    # A: value positions
+    ("run(*[spark])", "NBP-INDIRECT", "spark"),
+    ("def get_session():\n    return spark", "NBP-INDIRECT", "spark"),
+    ("mods = {'o': sys}", "NBP-INDIRECT", "sys"),
+    ("import pickle\nloaders = (pickle,)", "NBP-INDIRECT", "pickle"),
+    ("fn = lambda: dbutils", "NBP-INDIRECT", "dbutils"),
+    # B: sinks on unresolved receivers
+    ("get_module().putenv('A', 'b')", "NBP-INDIRECT", "get_module.putenv"),
+    ("mods[0].execvp('id', ['id'])", "NBP-INDIRECT", "<expr>.execvp"),
+    ("x.fork()", "NBP-INDIRECT", "x.fork"),
+    ("x.getattr_static(spark, 'version')", "NBP-INDIRECT", "x.getattr_static"),
+    ("platform.system()", "NBP-INDIRECT", "platform.system"),      # no import in view: unknown root
+    ("fs.open('/etc/passwd').read()", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("fs.open('/Volumes/prod/' + name)", "NBP-OPEN-PATH", "/Volumes/prod/"),
+    # C: .pipe
+    ("spark.sparkContext.textFile('oci://b@ns/x').pipe('id')", "NBP-OS-PROCESS", "spark.sparkContext.textFile.pipe()"),
+    ("rdd = sc.parallelize(xs)\nrdd.pipe(fn)", "NBP-OS-PROCESS", "rdd.pipe()"),
+    ("r = df.rdd\nr.pipe(fn)", "NBP-OS-PROCESS", "df.rdd.pipe()"),       # alias followed
+    ("df.rdd.pipe(fn)", "NBP-OS-PROCESS", "df.rdd.pipe()"),
+    ("cmd = 'id'\ndf.pipe(cmd)", "NBP-OS-PROCESS", "df.pipe()"),
+    ("df.pipe(f'{tool} -x')", "NBP-OS-PROCESS", "df.pipe()"),
+    ("df.pipe('/bin/' + tool)", "NBP-OS-PROCESS", "df.pipe()"),
+    ("df.pipe('{} -x'.format(tool))", "NBP-OS-PROCESS", "df.pipe()"),
+    ("df.pipe(' '.join(argv))", "NBP-OS-PROCESS", "df.pipe()"),
+    # D: string-keyed accessors
+    ("import operator\noperator.attrgetter(name)(obj)", "NBP-INDIRECT", "operator.attrgetter(<dynamic>)"),
+    ("import operator\noperator.methodcaller('__reduce__')(obj)", "NBP-DUNDER-ESCAPE", "<expr>.__reduce__"),
+    ("import operator\noperator.attrgetter('a.f_globals')(obj)", "NBP-DUNDER-ESCAPE", "<expr>.f_globals"),
+    ("import operator\noperator.attrgetter('_conf')(sc)", "NBP-INDIRECT", "operator.attrgetter('_conf')"),
+    ("import operator\noperator.attrgetter('x._secret')(obj)", "NBP-INDIRECT", "operator.attrgetter('x._secret')"),
+    ("from functools import reduce\nreduce(getattr, path, obj)", "NBP-INDIRECT", "functools.reduce(getattr, ...)"),
+    ("import functools, operator\nfunctools.reduce(operator.attrgetter, path, obj)", "NBP-INDIRECT",
+     "functools.reduce(getattr, ...)"),
+    ("import inspect\ninspect.getattr_static(os, 'system')", "NBP-INDIRECT", "os"),
+    ("import inspect\ninspect.getattr_static(obj, name)", "NBP-INDIRECT", "getattr(obj, <dynamic>)"),
+    ("from inspect import getmembers\ngetmembers(obj)", "NBP-INDIRECT", "inspect.getmembers"),
+    ("obj.__getattribute__('x')", "NBP-DUNDER-ESCAPE", "obj.__getattribute__"),
+    # E: re-rooting and vars()
+    ("self.spark._jvm", "NBP-POLICY-TAMPER", "spark._jvm"),
+    ("ctx.sc.addPyFile('oci://b@ns/x/e.zip')", "NBP-BUILTIN-EXEC", "sc.addPyFile"),
+    ("import pandas as pd\npd.io.common.os.environ['X']", "NBP-OS-ENVIRON", "os.environ"),
+    ("import shutil\nshutil.sys.modules['os']", "NBP-INDIRECT", "sys.modules"),
+    ("import pickle\nvars(pickle)['loads']", "NBP-INDIRECT", "pickle"),
+    ("import yaml\nvars(yaml)", "NBP-INDIRECT", "yaml"),
+    ("vars(sc)", "NBP-INDIRECT", "sc"),
+    # F: deserialisers
+    ("import pickle\npickle.Unpickler", "NBP-DESERIALIZE", "pickle.Unpickler"),
+    ("import pickle\npickle.load_session(p)", "NBP-DESERIALIZE", "pickle.load_session"),
+    ("import dill\ndill.load_module(p)", "NBP-DESERIALIZE", "dill.load_module"),
+    ("import pickle\npickle._getattribute(obj, 'x')", "NBP-DESERIALIZE", "pickle._getattribute"),
+    ("import yaml\nyaml._x", "NBP-DESERIALIZE", "yaml._x"),
+    ("import operator\noperator._compare_digest", "NBP-INDIRECT", "operator._compare_digest"),
+    ("import torch\ntorch.jit.load(p, map_location='cpu')", "NBP-DESERIALIZE", "torch.jit.load"),
+    ("import torch\ntorch.serialization.load(p, weights_only=False)", "NBP-DESERIALIZE", "torch.serialization.load"),
+    ("import numpy as np\nnp.load(p, allow_pickle=cfg['pickle'])", "NBP-DESERIALIZE", "numpy.load(allow_pickle=<dynamic>)"),
+    ("import yaml\nyaml.load(s, Loader=SafeLoader)", "NBP-DESERIALIZE", "yaml.load"),      # unresolved name
+    ("import yaml\nSL = yaml.FullLoader\nyaml.load(s, Loader=SL)", "NBP-DESERIALIZE", "yaml.FullLoader"),
+    ("import yaml\nyaml.add_constructor('!x', ctor)", "NBP-DESERIALIZE", "yaml.add_constructor"),
+    ("import yaml\nyaml.SafeLoader.add_constructor('!x', ctor)", "NBP-DESERIALIZE", "yaml.SafeLoader.add_constructor"),
+    ("import yaml\nyaml.add_multi_constructor('!', ctor)", "NBP-DESERIALIZE", "yaml.add_multi_constructor"),
+    ("import yaml\nclass L(yaml.loader.SafeLoader):\n    pass", "NBP-DESERIALIZE", "yaml.loader.SafeLoader"),
+    ("from yaml import SafeLoader\nclass L(SafeLoader):\n    pass", "NBP-DESERIALIZE", "yaml.SafeLoader"),
+    ("import yaml\nyaml.loader.SafeLoader", "NBP-DESERIALIZE", "yaml.loader"),
+    ("import yaml\nyaml.constructor.SafeConstructor", "NBP-DESERIALIZE", "yaml.constructor"),
+    ("from yaml import load_all", "NBP-DESERIALIZE", "yaml.load_all"),
+    ("from yaml import FullLoader", "NBP-DESERIALIZE", "yaml.FullLoader"),
+    ("from yaml import UnsafeConstructor", "NBP-DESERIALIZE", "yaml.UnsafeConstructor"),
+    ("import yaml\nyaml.load_all(s, Loader=yaml.SafeLoader)", "NBP-DESERIALIZE", "yaml.load_all"),
+    # G: namespace subscripts
+    ("v = globals()['my_var'].attr", "NBP-INDIRECT", "globals()"),
+    ("globals()['my_fn']()", "NBP-INDIRECT", "globals()"),
+    ("globals()['my_var']['k']", "NBP-INDIRECT", "globals()"),
+    ("import os as o\nlocals()['o']", "NBP-INDIRECT", "locals()"),
+    ("globals()['spark']", "NBP-INDIRECT", "globals()"),
+    ("globals()['open']", "NBP-INDIRECT", "globals()"),
+    ("globals()['pickle']", "NBP-INDIRECT", "globals()"),
+    # H: *args / **kwargs on the open family
+    ("import codecs\ncodecs.open(**kw)", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("open(*parts, mode='r')", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\nPath('/tmp/x').open(**kw)", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    # I: pydoc
+    ("import pydoc", "NBP-IMPORT-PROCESS", "pydoc"),
+    ("from pydoc import pipepager", "NBP-IMPORT-PROCESS", "pydoc"),
+    # read-mode open: the literal head and folded literals are still path-checked
+    ("open(f'/etc/{name}').read()", "NBP-OPEN-PATH", "/etc/"),
+    ("open('/Volumes/prod/' + name, 'rb').read()", "NBP-OPEN-PATH", "/Volumes/prod/"),
+    ("import os\nopen(os.path.join('/etc', 'passwd')).read()", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("p = '/'.join(['/Workspace', '.oci', 'config'])\nopen(p).read()", "NBP-OPEN-PATH", "/Workspace/.oci/config"),
+    ("open(p, 'r+').read()", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("open(p, mode='w')", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("m = 'w'\nopen(p, m)", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\nPath(p).open('w')", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\nPath(p).read_text()", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+]
+
+
+@pytest.mark.parametrize("source,rule,target", REVIEW_GAP_CELLS + REVIEW_GAP_CELLS_2,
+                         ids=[c[1] + ":" + c[0][:30] for c in REVIEW_GAP_CELLS + REVIEW_GAP_CELLS_2])
+def test_review_gap_cells_are_refused(tmp_path, sandbox_env, source, rule, target):
+    _assert_refused(tmp_path, [source], rule, target)
+
+
+def test_review_gap_cell_count():
+    assert len(REVIEW_GAP_CELLS) == 100
+
+
+# Coverage round 1 on the d44b776 gate: the tester's ten gap cells verbatim (first
+# entry of each block) and the rest of the class each one belongs to. Every cell
+# passed the gate at d44b776.
+REVIEW_GAP_CELLS_3 = [
+    # J: a list literal mutated in place is no longer the literal it was bound to
+    #    (subscript store, append / insert / extend / pop, aliasing, a helper call, *parts)
+    ("p=['oci://bucket@ns/sandbox','a']\np[0]='/etc'\ndf.write.parquet('/'.join(p))",
+     "NBP-PATH-WRITE-DYNAMIC", "<dynamic>"),
+    ("parts=['oci://bucket@ns/sandbox']\nparts.insert(1,'..')\nopen('/'.join(parts)).read()",
+     "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("parts = ['oci://bucket@ns/sandbox', 'x.txt']\nparts[0] = '/etc'\nparts[1] = 'passwd'\n"
+     "open('/'.join(parts)).read()", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("parts = ['oci://bucket@ns/sandbox']\nparts.append('..')\nparts.append('..')\nparts.append('etc')\n"
+     "parts.append('passwd')\nopen('/'.join(parts)).read()", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("parts = ['oci://bucket@ns/sandbox']\nparts.extend(['..', '..', 'etc', 'passwd'])\nopen('/'.join(parts)).read()",
+     "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("parts = ['oci://bucket@ns/sandbox', 'a', 'b']\nparts.pop()\nparts[1] = '..'\nopen('/'.join(parts))",
+     "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("parts = ['oci://bucket@ns/sandbox', 'a']\ndel parts[0]\nopen('/'.join(parts))", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("parts = ['oci://bucket@ns/sandbox', 'a']\nq = parts\nq[0] = '/etc'\nopen('/'.join(parts))",
+     "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("parts = ['oci://bucket@ns/sandbox', 'a']\nrewrite(parts)\nopen('/'.join(parts))", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("parts = ['oci://bucket@ns/sandbox', 'a']\nparts.__setitem__(0, '/etc')\nopen('/'.join(parts))",
+     "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("parts = ['oci://bucket@ns/sandbox', 'a']\nfor i in range(2):\n    parts[i] = '/etc'\nopen('/'.join(parts))",
+     "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("import os\nparts = ['oci://bucket@ns/sandbox', 'a']\nparts[0] = '/etc'\nopen(os.path.join(*parts))",
+     "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("p = ['oci://bucket@ns/sandbox', 'a']\np[0] = '/etc'\ndbutils.fs.rm('/'.join(p))", "NBP-DBFS-DYNAMIC", "<dynamic>"),
+    ("import shutil\np = ['oci://bucket@ns/sandbox', 'a']\np[0] = '/etc'\nshutil.move('a.txt', '/'.join(p))",
+     "NBP-FS-DYNAMIC", "<dynamic>"),
+    ("p = ['oci://bucket@ns/sandbox', 'a']\np[0] = '/etc'\ndf.write.option('path', '/'.join(p)).save()",
+     "NBP-PATH-WRITE-DYNAMIC", "<dynamic>"),
+    # K: keyword-gated loaders with the switch passed positionally or hidden in a splat
+    ("import numpy as np\nnp.load(p, None, True)", "NBP-DESERIALIZE", "numpy.load(<positional>)"),
+    ("import numpy as np\nnp.load(p, **kw)", "NBP-DESERIALIZE", "numpy.load(<dynamic>)"),
+    ("import numpy as np\nnp.load(p, None, flag)", "NBP-DESERIALIZE", "numpy.load(<positional>)"),
+    ("import numpy as np\nnp.load(p, *rest)", "NBP-DESERIALIZE", "numpy.load(<dynamic>)"),
+    ("import numpy\nnumpy.load(p, None, 1)", "NBP-DESERIALIZE", "numpy.load(<positional>)"),
+    ("from numpy import load\nload(p, None, True)", "NBP-DESERIALIZE", "numpy.load(<positional>)"),
+    ("np.load(p, None, True)", "NBP-DESERIALIZE", "np.load(<positional>)"),          # no import in view
+    ("np.load(p, **kw)", "NBP-DESERIALIZE", "np.load(<dynamic>)"),
+    ("loader.load(p, **kw)", "NBP-DESERIALIZE", "loader.load(<dynamic>)"),            # receiver never bound
+    ("import torch\ntorch.load(p, pickle_module=evil, weights_only=True)", "NBP-DESERIALIZE", "torch.load"),
+    ("import torch\ntorch.load(p, None, evil, weights_only=True)", "NBP-DESERIALIZE", "torch.load(<positional>)"),
+    ("import torch\ntorch.load(p, weights_only=True, **kw)", "NBP-DESERIALIZE", "torch.load(<dynamic>)"),
+    ("import torch\ntorch.load(p, **kw)", "NBP-DESERIALIZE", "torch.load(<dynamic>)"),
+    ("import torch\ntorch.serialization.add_safe_globals([evil])", "NBP-DESERIALIZE", "torch.serialization.add_safe_globals"),
+    ("from torch.serialization import add_safe_globals", "NBP-DESERIALIZE", "torch.serialization.add_safe_globals"),
+    ("import torch\nwith torch.serialization.safe_globals([evil]):\n    m = torch.load(p, weights_only=True)",
+     "NBP-DESERIALIZE", "torch.serialization.safe_globals"),
+    # L: the state of a gated module is read-only (a deserialiser's constructor registry first)
+    ("import yaml\nyaml.SafeLoader.yaml_constructors['!x']=handler\nyaml.safe_load(s)",
+     "NBP-DESERIALIZE", "yaml.SafeLoader.yaml_constructors"),
+    ("yaml.SafeLoader.yaml_multi_constructors[''] = handler\nyaml.safe_load(s)",
+     "NBP-DESERIALIZE", "yaml.SafeLoader.yaml_multi_constructors"),
+    ("import yaml\nL = yaml.SafeLoader\nL.yaml_constructors['!x'] = handler",
+     "NBP-DESERIALIZE", "yaml.SafeLoader.yaml_constructors"),
+    ("import yaml\nyaml.SafeLoader.yaml_constructors.update({'!x': handler})",
+     "NBP-DESERIALIZE", "yaml.SafeLoader.yaml_constructors.update"),
+    ("import yaml\nyaml.SafeLoader.yaml_constructors.setdefault('!x', handler)",
+     "NBP-DESERIALIZE", "yaml.SafeLoader.yaml_constructors.setdefault"),
+    ("import yaml\nyaml.SafeLoader.yaml_implicit_resolvers.pop('!')",
+     "NBP-DESERIALIZE", "yaml.SafeLoader.yaml_implicit_resolvers.pop"),
+    ("import yaml\nyaml.SafeLoader.yaml_constructors = {'!x': handler}", "NBP-DESERIALIZE", "yaml.SafeLoader.yaml_constructors"),
+    ("import yaml\ndel yaml.SafeLoader.yaml_constructors['!x']", "NBP-DESERIALIZE", "yaml.SafeLoader.yaml_constructors"),
+    ("import yaml\nsetattr(yaml.SafeLoader, 'yaml_constructors', {})", "NBP-POLICY-TAMPER", "yaml.SafeLoader"),
+    ("import yaml\ngetattr(yaml.SafeLoader, 'yaml_constructors')['!x'] = handler",
+     "NBP-DESERIALIZE", "yaml.SafeLoader.yaml_constructors"),
+    ("import yaml\nyaml.safe_load = yaml.unsafe_load", "NBP-DESERIALIZE", "yaml.safe_load"),
+    ("import torch\ntorch.serialization.DEFAULT_PROTOCOL = 0", "NBP-DESERIALIZE", "torch.serialization.DEFAULT_PROTOCOL"),
+    ("import torch\ntorch.backends.registry['x'] = evil", "NBP-DESERIALIZE", "torch.backends.registry"),
+    ("import operator\noperator.attrgetter = evil", "NBP-POLICY-TAMPER", "operator.attrgetter"),
+    ("import asyncio\nasyncio.events._event_loop_policy = evil", "NBP-INDIRECT", "asyncio.events._event_loop_policy"),
+    ("import functools\nfunctools.WRAPPER_ASSIGNMENTS = ()", "NBP-POLICY-TAMPER", "functools.WRAPPER_ASSIGNMENTS"),
+    # M: a sink name on an imported module the gate has no rules for (it may re-export os)
+    ("import mymod\nmymod.popen('id')", "NBP-INDIRECT", "mymod.popen"),
+    ("import mymod\nmymod.system('id')", "NBP-INDIRECT", "mymod.system"),
+    ("import helpers\nhelpers.fork()", "NBP-INDIRECT", "helpers.fork"),
+    ("import mymod\nmymod.sub.popen('id')", "NBP-INDIRECT", "mymod.sub.popen"),
+    ("import mymod\nmymod.execvp('id', ['id'])", "NBP-INDIRECT", "mymod.execvp"),
+    ("import mymod\nmymod.putenv('A', 'b')", "NBP-INDIRECT", "mymod.putenv"),
+    # N: private attributes of ANY imported module, and a private segment makes the receiver opaque
+    ("import mymod\nmymod._run('id')", "NBP-INDIRECT", "mymod._run"),
+    ("import numpy as np\nnp._core.multiarray", "NBP-INDIRECT", "numpy._core"),
+    ("from mymod import _helper", "NBP-INDIRECT", "mymod._helper"),
+    ("import mymod\nmymod.sub._impl.system('id')", "NBP-INDIRECT", "mymod.sub._impl"),
+    ("import pandas as pd\npd._libs.system('id')", "NBP-INDIRECT", "pandas._libs"),
+    ("import tempfile\ntempfile._os.system('id')", "NBP-OS-PROCESS", "os.system"),       # re-rooted, still os
+    ("import mymod\nmymod._sys.modules", "NBP-INDIRECT", "sys.modules"),
+    ("import mymod\nmymod._subprocess.run('id')", "NBP-OS-PROCESS", "subprocess.run"),
+    # O: code loaded from a path at run time (site .pth processing, pip)
+    ("import site\nsite.addsitedir('/tmp/evil')", "NBP-BUILTIN-EXEC", "site"),
+    ("site.addsitedir(d)", "NBP-BUILTIN-EXEC", "site.addsitedir"),                     # import out of view
+    ("from site import addsitedir", "NBP-BUILTIN-EXEC", "site"),
+    ("import site as s\ns.addsitedir(d)", "NBP-BUILTIN-EXEC", "site"),
+    ("import pip\npip.main(['install', 'evil'])", "NBP-BUILTIN-EXEC", "pip"),
+    ("pip.main(['install', 'evil'])", "NBP-BUILTIN-EXEC", "pip.main"),
+    ("import ensurepip\nensurepip.bootstrap()", "NBP-BUILTIN-EXEC", "ensurepip"),
+    ("import sitecustomize", "NBP-BUILTIN-EXEC", "sitecustomize"),
+    # P: a receiver the notebook never bound, with an argument the gate cannot type
+    ("thing.open(path_var).read()", "NBP-OPEN-DYNAMIC", "thing.open(<dynamic>)"),
+    ("result = thing.pipe(cmd)", "NBP-OS-PROCESS", "thing.pipe()"),
+    ("cfg.fs.open(name)", "NBP-OPEN-DYNAMIC", "cfg.fs.open(<dynamic>)"),
+    ("with fs.open(object_path, 'rb') as fh:\n    payload = fh.read()", "NBP-OPEN-DYNAMIC", "fs.open(<dynamic>)"),
+]
+
+
+@pytest.mark.parametrize("source,rule,target", REVIEW_GAP_CELLS_3,
+                         ids=[c[1] + ":" + c[0][:30] for c in REVIEW_GAP_CELLS_3])
+def test_coverage_round1_gap_cells_are_refused(tmp_path, sandbox_env, source, rule, target):
+    _assert_refused(tmp_path, [source], rule, target)
+
+
+def test_list_literal_mutated_in_an_earlier_cell_is_not_folded(sandbox_env):
+    ctx = npol.ScanContext()
+    assert npol.scan_source("parts = ['oci://bucket@ns/sandbox', 'a']", context=ctx) == []
+    assert npol.scan_source("parts.insert(1, '..')", context=ctx) == []
+    assert [v.rule for v in npol.scan_source("open('/'.join(parts)).read()", context=ctx)] == ["NBP-OPEN-DYNAMIC"]
+    ctx = npol.ScanContext()
+    assert npol.scan_source("parts = ['oci://b@ns/sbx', 'a']", context=ctx) == []
+    assert npol.scan_source("df.write.parquet('/'.join(parts))", context=ctx) == []      # join-only use: folded
+    assert npol.scan_source("parts.append('..')", context=ctx) == []
+    assert [v.rule for v in npol.scan_source("df.write.parquet('/'.join(parts))", context=ctx)] \
+        == ["NBP-PATH-WRITE-DYNAMIC"]
+
+
+def test_sink_on_an_imported_module_is_refused_across_cells(sandbox_env):
+    ctx = npol.ScanContext()
+    assert npol.scan_source("import mymod", context=ctx) == []
+    assert [(v.rule, v.target) for v in npol.scan_source("mymod.system('id')", context=ctx)] \
+        == [("NBP-INDIRECT", "mymod.system")]
+    assert npol.scan_source("mymod.run('id')", context=ctx) == []
+    assert [(v.rule, v.target) for v in npol.scan_source("mymod._run('id')", context=ctx)] \
+        == [("NBP-INDIRECT", "mymod._run")]
+
+
+# Everyday code next to each round-1 class that must not become a false refusal.
+CLEAN_CELLS_6 = [
+    # J: list literals used only for the join still fold; mutation without a path sink is fine
+    "parts = ['oci://bucket@ns/sandbox', 'a']\ndf.write.parquet('/'.join(parts))",
+    "parts = ['data', 'in.csv']\nrows = open('/'.join(parts)).read()",
+    "items = []\nitems.append(1)\nitems.insert(0, 2)\nitems[0] = 3\nitems.extend([4])\nprint(len(items))",
+    "cols = ['a', 'b']\ncols.append('c')\nout = df.select(*cols)",
+    # K: loaders with their switch as a literal keyword, or positional False / None
+    "import numpy as np\narr = np.load(array_path, None, False)",
+    "import numpy as np\narr = np.load(array_path, 'r')",
+    "import numpy as np\narr = np.load(array_path, mmap_mode='r', allow_pickle=False)",
+    "import torch\nm = torch.load('m.pt', map_location='cpu', weights_only=True)",
+    "import json\ncfg = json.load(fh, **opts)",
+    "spark.read.format('csv').load(src_path, **options)",
+    "spark.read.load(src_path, 'parquet')",
+    # L: reading a gated module's state, torch configuration flags, pandas options
+    "import yaml\ntags = list(yaml.SafeLoader.yaml_constructors)",
+    "import torch\ntorch.backends.cudnn.benchmark = True\ntorch.set_grad_enabled(False)",
+    "import pandas as pd\npd.options.display.max_columns = 50",
+    "import sys\nsys.path.insert(0, '/Workspace/Repos/x')\nsys.path.append(lib_dir)",
+    # M / N: public names on imported modules, homonyms
+    "import platform\nosname = platform.system()",
+    "import mymod\nmymod.run('id')\nresult = mymod.process(df)",
+    "import helpers as h\nout = h.clean(df)",
+    "from mymod import helper\nhelper(df)",
+    # O: a variable that happens to be called site
+    "site = row['site']\nname = site.lower()\nprint(site)",
+    # P: receivers the notebook bound
+    "import fsspec\nfs = fsspec.filesystem('oci')\nwith fs.open(object_path, 'rb') as fh:\n    payload = fh.read()",
+    "fs = get_filesystem()\ndata = fs.open(object_path).read()",
+    "import zipfile\nwith zipfile.ZipFile('rel.zip') as zf:\n    data = zf.open(member).read()",
+    "def transform(frame):\n    return frame.pipe(step)",
+    "import pandas as pd\ndf = pd.read_parquet(src_path)\nout = df.pipe(clean_frame).pipe(add_keys, keys=['id'])",
+    "for frame in frames:\n    out = frame.pipe(step)",
+]
+
+
+@pytest.mark.parametrize("source", CLEAN_CELLS_6, ids=[c[:40] for c in CLEAN_CELLS_6])
+def test_coverage_round1_adjacent_everyday_code_passes_the_gate(source):
+    assert npol.scan_source(source, policy=REVIEW_POLICY) == []
+
+
+# The 19 ordinary notebook cells from the same review, which must stay allowed
+# (scanned with the review's sandbox: catalog sbx / schema mig / prefix oci://bucket@ns/sandbox/).
+REVIEW_POLICY = SandboxPolicy(catalog="sbx", schema="mig", prefix="oci://bucket@ns/sandbox/")
+CLEAN_CELLS_4 = [
+    "import pandas as pd\ndf = pd.read_csv(source_path)\ndf = df.pipe(clean_frame).pipe(add_keys, keys=['id'])",
+    'items = [1, 2, 3]\nitems.remove(2)',
+    "print(getattr(spark, 'version'))",
+    'label = "{0.__class__.__name__}".format(obj)',
+    'import yaml\ncfg = yaml.safe_load(text)\ncfg2 = yaml.load(text, Loader=yaml.SafeLoader)',
+    'import numpy as np\narr = np.load(array_path, allow_pickle=False)',
+    "import operator\nrows.sort(key=operator.itemgetter(1))\nnames = list(map(operator.attrgetter('name'), rows))",
+    'import functools\ntotal = functools.reduce(lambda a, b: a + b, values, 0)',
+    'import inspect\nsig = inspect.signature(transform)',
+    'q = "SELECT id, amount FROM sbx.mig.orders WHERE region = \'" + region + "\'"\nspark.sql(q).show()',
+    "df.write.mode('overwrite').saveAsTable('sbx.mig.orders_clean')",
+    "spark.read.table('sbx.mig.orders').filter('amount > 0').write.format('delta')"
+    ".save('oci://bucket@ns/sandbox/orders_pos')",
+    'from dataclasses import dataclass\nfrom typing import Optional\n@dataclass\nclass Row:\n    id: int\n'
+    '    name: Optional[str] = None\n    def __repr__(self):\n        return f"Row({self.id})"',
+    "import fsspec\nfs = fsspec.filesystem('oci')\nwith fs.open(object_path, 'rb') as fh:\n    payload = fh.read()",
+    "import matplotlib.pyplot as plt\nplt.plot(df['x'], df['y']); plt.show()",
+    'rdd = sc.parallelize(range(10)).map(lambda x: x * 2)\nprint(rdd.collect())',
+    'result = spark.sql("SHOW TABLES IN sbx.mig")',
+    'import datetime, re, math\nts = datetime.datetime.now(datetime.timezone.utc).isoformat()',
+]
+# Everyday code next to each closed class that must not become a false refusal.
+CLEAN_CELLS_5 = [
+    # A: tolerated value positions
+    "x = spark",
+    "print(spark)",
+    "spark",
+    "ok = isinstance(session, SparkSession)",
+    "t = type(sc)",
+    "has = hasattr(dbutils, 'secrets')",
+    "import os\nsep = os.sep\nhome = os.path.expanduser('~')",
+    "import functools\n@functools.lru_cache(maxsize=None)\ndef f(x):\n    return x",
+    "import operator\nfrom operator import add, itemgetter\ntotal = functools.reduce(add, values)\nkey = itemgetter(0)",
+    # B: homonyms on resolved or everyday receivers
+    "import platform\nosname = platform.system()",
+    "cursor.execute(q)\ncursor.executemany(q, rows)",
+    "loader.load()\nmodel.load_state()",
+    "import pyarrow as pa\nok = pa.types.is_string(t)",
+    "from scipy import signal\nb, a = signal.butter(1, 0.5)",
+    "code = resp.code\nprofile = user.profile.name",
+    "fs = get_filesystem()\nwith fs.open(object_path, 'wb') as fh:\n    fh.write(payload)",
+    "import zipfile\nwith zipfile.ZipFile('rel.zip') as z:\n    data = z.open('member.txt').read()",
+    # C: DataFrame.pipe with a callable
+    "import pandas as pd\nout = df.pipe(lambda d: d.dropna())",
+    "def clean(d):\n    return d.dropna()\nout = df.pipe(clean)",
+    "out = df.pipe(helpers.clean, keep='first')",
+    # D: everyday operator / functools / inspect
+    "import operator\ngetter = operator.attrgetter('name', 'id')\nvals = [getter(r) for r in rows]",
+    "import operator\ncall = operator.methodcaller('strip')\nvals = list(map(call, names))",
+    "import functools\np = functools.partial(int, base=2)",
+    "import inspect\nsrc_ok = inspect.isfunction(transform)",
+    # F: the dump side and safe loaders
+    "import pickle\npickle.dump(obj, fh)\nb = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)",
+    "import pickle\npickle.Pickler(fh).dump(obj)",
+    "import joblib\njoblib.dump(model, 'model.joblib')\nres = joblib.Parallel(n_jobs=2)(joblib.delayed(f)(x) for x in xs)",
+    "import yaml\ndocs = list(yaml.safe_load_all(text))\nout = yaml.safe_dump(cfg)",
+    "from yaml import SafeLoader\nimport yaml\ncfg = yaml.load(text, Loader=SafeLoader)",
+    "import yaml\ncfg = yaml.load(text, yaml.CSafeLoader)",
+    "import torch\nm = torch.load('m.pt', weights_only=True)\nd = torch.device('cpu')",
+    "import numpy as np\na = np.load('a.npy', allow_pickle=False)\nb = np.load(p)",
+    # G: the tolerated namespace read
+    "v = globals()['my_var']",
+    "present = 'my_var' in globals()",
+    # folded literal paths that stay relative / inside the sandbox
+    "with open('/'.join(['data', 'in.csv'])) as fh:\n    rows = fh.read()",
+    "import os\nwith open(os.path.join('data', 'in.csv')) as fh:\n    rows = fh.read()",
+    "p = 'data/' + 'in.csv'\nrows = open(p).read()",
+]
+
+
+@pytest.mark.parametrize("source", CLEAN_CELLS_4, ids=[c[:40] for c in CLEAN_CELLS_4])
+def test_review_legit_cells_pass_the_gate(source):
+    assert npol.scan_source(source, policy=REVIEW_POLICY) == []
+
+
+@pytest.mark.parametrize("source", CLEAN_CELLS_5, ids=[c[:40] for c in CLEAN_CELLS_5])
+def test_review_adjacent_everyday_code_passes_the_gate(sandbox_env, source):
+    assert npol.scan_source(source) == []
+
+
+def test_dynamic_open_is_refused_in_every_mode(sandbox_env):
+    for src in ("open(p)", "open(p).read()", "open(p, 'r')", "open(p, 'rb')", "open(p, 'w')", "open(p, 'a')",
+                "open(p, mode)", "open(p, mode='wb')", "open(f'{d}/x.json')", "import io\nio.open(p)",
+                "import codecs\ncodecs.open(p, encoding='utf-8')", "from pathlib import Path\nPath(p).open()",
+                "from pathlib import Path\nPath(p).read_text()"):
+        assert [v.rule for v in npol.scan_source(src)] == ["NBP-OPEN-DYNAMIC"], src
+
+
+def test_open_on_a_bound_receiver_is_recorded_not_refused(sandbox_env):
+    # <object-store fs>.open(path) on a receiver the notebook bound: not the builtin, not a
+    # Path; a literal local path is still checked, a dynamic one is allowed and recorded
+    # (the receiver is not the local filesystem).
+    src = "import fsspec\nfs = fsspec.filesystem('oci')\nwith fs.open(object_path, 'rb') as fh:\n    payload = fh.read()"
+    assert npol.scan_source(src) == []
+    assert npol.enforce_cell_policy(src, notebook_path="nb", cell_index=2) == []
+    notes = [e for e in npol.get_policy_log() if e["event"] == "unverified_read_path"]
+    assert [(e["target"], e["detail"]["line"], e["cell_index"]) for e in notes] == [("fs.open(<dynamic>)", 3, 2)]
+    ctx = npol.ScanContext()
+    assert npol.scan_source("fs = get_filesystem()", context=ctx) == []       # bound in an earlier cell
+    assert npol.scan_source("data = fs.open(object_path).read()", context=ctx) == []
+    assert [(v.rule, v.target) for v in npol.scan_source("fs.open('/etc/passwd')")] == [("NBP-OPEN-PATH", "/etc/passwd")]
+    assert [(v.rule, v.target) for v in npol.scan_source("fs = get_filesystem()\nfs.open(**kw)")] \
+        == [("NBP-OPEN-DYNAMIC", "<dynamic>")]
+
+
+def test_open_on_a_receiver_the_notebook_never_bound_is_refused(sandbox_env):
+    # thing.open(path_var): the receiver is a name the run never bound, so the gate cannot
+    # tell it from the builtin or a Path and the dynamic path is refused as for open().
+    for src in ("thing.open(path_var).read()", "with fs.open(object_path, 'rb') as fh:\n    payload = fh.read()",
+                "cfg.fs.open(name)"):
+        assert [v.rule for v in npol.scan_source(src)] == ["NBP-OPEN-DYNAMIC"], src
+        assert not [e for e in npol.get_policy_log() if e["event"] == "unverified_read_path"]
+
+
+def test_pipe_residual_is_recorded(sandbox_env):
+    src = "import pandas as pd\ndf = pd.read_parquet(src_path)\nout = df.pipe(clean_frame)"
+    assert npol.scan_source(src) == []
+    npol.enforce_cell_policy(src, notebook_path="nb", cell_index=1)
+    notes = [e for e in npol.get_policy_log() if e["event"] == "unverified_pipe_callable"]
+    assert [(e["target"], e["detail"]["line"]) for e in notes] == [("df.pipe(clean_frame)", 3)]
+    assert "unverified_pipe_callable" in npol.POLICY_NOTES
+
+
+def test_pipe_on_a_receiver_the_notebook_never_bound_is_refused(sandbox_env):
+    # thing.pipe(cmd): neither the receiver nor the argument can be typed; RDD.pipe(cmd) is a shell
+    assert [(v.rule, v.target) for v in npol.scan_source("result = thing.pipe(cmd)")] \
+        == [("NBP-OS-PROCESS", "thing.pipe()")]
+    ctx = npol.ScanContext()
+    assert npol.scan_source("frame = load_frame()", context=ctx) == []
+    assert npol.scan_source("out = frame.pipe(step)", context=ctx) == []        # bound earlier: recorded
+
+
+def test_module_value_rule_follows_aliases_across_cells(sandbox_env):
+    ctx = npol.ScanContext()
+    assert npol.scan_source("import os as o", context=ctx) == []
+    assert [(v.rule, v.target) for v in npol.scan_source("mods = [o]", context=ctx)] == [("NBP-INDIRECT", "os")]
+    ctx = npol.ScanContext()
+    assert npol.scan_source("sp = spark", context=ctx) == []
+    assert [(v.rule, v.target) for v in npol.scan_source("run(sp)", context=ctx)] == [("NBP-INDIRECT", "spark")]
+
+
+def test_rdd_alias_bound_in_an_earlier_cell_cannot_pipe(sandbox_env):
+    ctx = npol.ScanContext()
+    assert npol.scan_source("rdd = sc.parallelize(xs)", context=ctx) == []
+    assert [(v.rule, v.target) for v in npol.scan_source("rdd.pipe(fn)", context=ctx)] \
+        == [("NBP-OS-PROCESS", "rdd.pipe()")]
+
+
+def test_imported_module_receiver_is_resolved_across_cells(sandbox_env):
+    ctx = npol.ScanContext()
+    assert npol.scan_source("import platform", context=ctx) == []
+    assert npol.scan_source("osname = platform.system()", context=ctx) == []
+
+
+# Coverage round 2 on the cfe1b79 gate: the tester's gap cells verbatim (first entry
+# of each block) and the rest of the class each one belongs to. Every cell passed
+# the gate at cfe1b79.
+REVIEW_GAP_CELLS_4 = [
+    # Q: local-filesystem writes through module-rooted library writers (the mirror of the reader table);
+    #    a literal local path outside the prefix is NBP-PATH-WRITE, a dynamic one NBP-PATH-WRITE-DYNAMIC
+    ("import numpy as np\nnp.save('/etc/evil.npy', a)", "NBP-PATH-WRITE", "/etc/evil.npy"),
+    ("import numpy as np\nnp.savez('/etc/evil.npz', a=a)", "NBP-PATH-WRITE", "/etc/evil.npz"),
+    ("import numpy as np\nnp.savez_compressed('/etc/evil.npz', a)", "NBP-PATH-WRITE", "/etc/evil.npz"),
+    ("import numpy as np\nnp.savetxt('/etc/evil.txt', a)", "NBP-PATH-WRITE", "/etc/evil.txt"),
+    ("np.save('/etc/evil.npy', a)", "NBP-PATH-WRITE", "/etc/evil.npy"),                   # import out of view
+    ("from numpy import save\nsave('/etc/evil.npy', a)", "NBP-PATH-WRITE", "/etc/evil.npy"),
+    ("import torch\ntorch.save(model, '/etc/evil.pt')", "NBP-PATH-WRITE", "/etc/evil.pt"),
+    ("import torch\ntorch.save(model, f='/etc/evil.pt')", "NBP-PATH-WRITE", "/etc/evil.pt"),
+    ("import torch\ntorch.jit.save(scripted, '/etc/evil.pt')", "NBP-PATH-WRITE", "/etc/evil.pt"),
+    ("import joblib\njoblib.dump(obj, '/etc/evil.joblib')", "NBP-PATH-WRITE", "/etc/evil.joblib"),
+    ("import scipy.io\nscipy.io.savemat('/etc/evil.mat', d)", "NBP-PATH-WRITE", "/etc/evil.mat"),
+    ("from scipy.io import savemat\nsavemat('/etc/evil.mat', d)", "NBP-PATH-WRITE", "/etc/evil.mat"),
+    ("import cv2\ncv2.imwrite('/etc/evil.png', img)", "NBP-PATH-WRITE", "/etc/evil.png"),
+    ("import matplotlib.pyplot as plt\nplt.savefig('/etc/evil.png')", "NBP-PATH-WRITE", "/etc/evil.png"),
+    ("from matplotlib import pyplot as plt\nplt.savefig('/etc/evil.png')", "NBP-PATH-WRITE", "/etc/evil.png"),
+    ("import imageio\nimageio.imwrite('/etc/evil.png', img)", "NBP-PATH-WRITE", "/etc/evil.png"),
+    ("import pyarrow.parquet as pq\npq.write_table(table, '/etc/evil.parquet')", "NBP-PATH-WRITE",
+     "/etc/evil.parquet"),
+    ("import pandas as pd\nwriter = pd.ExcelWriter('/etc/evil.xlsx')", "NBP-PATH-WRITE", "/etc/evil.xlsx"),
+    ("import mlflow.sklearn\nmlflow.sklearn.save_model(model, '/etc/evil')", "NBP-PATH-WRITE", "/etc/evil"),
+    ("import numpy as np\nnp.save('~/evil.npy', a)", "NBP-PATH-WRITE", "~/evil.npy"),
+    ("import numpy as np\nnp.save('file:///etc/evil.npy', a)", "NBP-PATH-WRITE", "file:///etc/evil.npy"),
+    ("import numpy as np\nnp.save('oci://b@ns/prod/x.npy', a)", "NBP-PATH-WRITE", "oci://b@ns/prod/x.npy"),
+    ("import numpy as np\nout = '/etc/evil.npy'\nnp.save(out, a)", "NBP-PATH-WRITE", "/etc/evil.npy"),
+    ("import numpy as np\nnp.save(f'/etc/{name}.npy', a)", "NBP-PATH-WRITE", "/etc/"),
+    ("import numpy as np\nnp.save(out_path, a)", "NBP-PATH-WRITE-DYNAMIC", "<dynamic>"),
+    ("import torch\ntorch.save(model, ckpt)", "NBP-PATH-WRITE-DYNAMIC", "<dynamic>"),
+    ("import numpy as np\nnp.save(*args)", "NBP-PATH-WRITE-DYNAMIC", "<dynamic>"),
+    # R: receiver-typed frame writers (pandas / polars / xarray / numpy / matplotlib / plotly methods)
+    ("df.to_csv('/etc/evil.csv')", "NBP-PATH-WRITE", "/etc/evil.csv"),
+    ("import pandas as pd\npd.DataFrame(x).to_csv('/etc/out.csv')", "NBP-PATH-WRITE", "/etc/out.csv"),
+    ("df.to_parquet('/etc/evil.parquet')", "NBP-PATH-WRITE", "/etc/evil.parquet"),
+    ("df.to_pickle('/etc/evil.pkl')", "NBP-PATH-WRITE", "/etc/evil.pkl"),
+    ("df.to_json('/etc/evil.json')", "NBP-PATH-WRITE", "/etc/evil.json"),
+    ("df.to_hdf('/etc/evil.h5', key='df')", "NBP-PATH-WRITE", "/etc/evil.h5"),
+    ("df.to_excel('/etc/evil.xlsx')", "NBP-PATH-WRITE", "/etc/evil.xlsx"),
+    ("df.to_csv(path_or_buf='/etc/evil.csv')", "NBP-PATH-WRITE", "/etc/evil.csv"),
+    ("df.to_csv('/dbfs/mnt/prod/' + name)", "NBP-PATH-WRITE", "/dbfs/mnt/prod/"),
+    ("pl_df.write_parquet('/etc/evil.parquet')", "NBP-PATH-WRITE", "/etc/evil.parquet"),
+    ("ds.to_netcdf('/etc/evil.nc')", "NBP-PATH-WRITE", "/etc/evil.nc"),
+    ("arr.tofile('/etc/evil.bin')", "NBP-PATH-WRITE", "/etc/evil.bin"),
+    ("fig.savefig('/etc/evil.png')", "NBP-PATH-WRITE", "/etc/evil.png"),
+    ("fig.write_html('/etc/evil.html')", "NBP-PATH-WRITE", "/etc/evil.html"),
+    ("df.to_csv(out_path)", "NBP-PATH-WRITE-DYNAMIC", "<dynamic>"),
+    ("df.to_parquet(f'{out_dir}/x.parquet')", "NBP-PATH-WRITE-DYNAMIC", "<dynamic>"),
+    ("df.to_csv(**kw)", "NBP-PATH-WRITE-DYNAMIC", "<dynamic>"),
+    # S: generic .save(path) receivers (openpyxl / Keras / PIL / transformers / docx) with a literal local path
+    ("import openpyxl\nwb.save('/etc/evil.xlsx')", "NBP-PATH-WRITE", "/etc/evil.xlsx"),
+    ("model.save('/etc/evil.h5')", "NBP-PATH-WRITE", "/etc/evil.h5"),
+    ("img.save('/etc/evil.png')", "NBP-PATH-WRITE", "/etc/evil.png"),
+    ("model.save_pretrained('/etc/evil')", "NBP-PATH-WRITE", "/etc/evil"),
+    ("model.export('/etc/evil')", "NBP-PATH-WRITE", "/etc/evil"),
+    ("wb.save(filename='/etc/evil.xlsx')", "NBP-PATH-WRITE", "/etc/evil.xlsx"),
+    ("doc.save('/Workspace/Shared/evil.docx')", "NBP-PATH-WRITE", "/Workspace/Shared/evil.docx"),
+    ("wb.save('/etc/' + name)", "NBP-PATH-WRITE", "/etc/"),
+    # T: tempfile creation outside the sandbox (literal dir= / absolute prefix= / tempfile.tempdir)
+    ("import tempfile\ntempfile.NamedTemporaryFile(dir='/etc')", "NBP-FS-PATH", "/etc"),
+    ("import tempfile\ntempfile.TemporaryFile(dir='/etc')", "NBP-FS-PATH", "/etc"),
+    ("import tempfile\ntempfile.mkstemp(dir='/etc')", "NBP-FS-PATH", "/etc"),
+    ("import tempfile\ntempfile.mkdtemp(dir='/etc')", "NBP-FS-PATH", "/etc"),
+    ("import tempfile\ntempfile.mkdtemp('', 'x', '/etc')", "NBP-FS-PATH", "/etc"),
+    ("import tempfile\ntempfile.TemporaryDirectory(dir='/etc')", "NBP-FS-PATH", "/etc"),
+    ("import tempfile\ntempfile.NamedTemporaryFile(prefix='/etc/evil')", "NBP-FS-PATH", "/etc/evil"),
+    ("import tempfile\ntempfile.mkstemp(dir='/etc/' + sub)", "NBP-FS-PATH", "/etc/"),
+    ("import tempfile as tf\ntf.mkdtemp(dir='/etc')", "NBP-FS-PATH", "/etc"),
+    ("from tempfile import NamedTemporaryFile\nNamedTemporaryFile(dir='/etc')", "NBP-FS-PATH", "/etc"),
+    ("import tempfile\ntempfile.tempdir = '/etc'", "NBP-FS-PATH", "/etc"),
+    ("import tempfile\ntempfile.tempdir = d", "NBP-FS-DYNAMIC", "<dynamic>"),
+    # U: live frame / traceback dumps (faulthandler, traceback.walk_*, capture_locals, Task.get_stack)
+    ("import faulthandler\nfaulthandler.dump_traceback_later(1)", "NBP-INDIRECT", "faulthandler"),
+    ("faulthandler.dump_traceback()", "NBP-INDIRECT", "faulthandler.dump_traceback"),    # import out of view
+    ("from faulthandler import dump_traceback", "NBP-INDIRECT", "faulthandler"),
+    ("import traceback\nframes = list(traceback.walk_stack(None))", "NBP-INDIRECT", "traceback.walk_stack"),
+    ("import traceback\ntraceback.walk_tb(tb)", "NBP-INDIRECT", "traceback.walk_tb"),
+    ("from traceback import walk_stack\nwalk_stack(None)", "NBP-INDIRECT", "traceback.walk_stack"),
+    ("import traceback\ns = traceback.StackSummary.extract(gen, capture_locals=True)", "NBP-INDIRECT",
+     "traceback.StackSummary.extract(capture_locals=True)"),
+    ("import traceback\nte = traceback.TracebackException(t, v, tb, capture_locals=True)", "NBP-INDIRECT",
+     "traceback.TracebackException(capture_locals=True)"),
+    ("task.get_stack()", "NBP-INDIRECT", "task.get_stack"),
+]
+
+
+@pytest.mark.parametrize("source,rule,target", REVIEW_GAP_CELLS_4,
+                         ids=[c[1] + ":" + c[0][:30] for c in REVIEW_GAP_CELLS_4])
+def test_coverage_round2_gap_cells_are_refused(tmp_path, sandbox_env, source, rule, target):
+    _assert_refused(tmp_path, [source], rule, target)
+
+
+def test_coverage_round2_gap_cell_count():
+    assert len(REVIEW_GAP_CELLS_4) >= 70
+
+
+def test_writer_path_bound_in_an_earlier_cell_is_resolved(sandbox_env):
+    ctx = npol.ScanContext()
+    assert npol.scan_source("out = '/etc/evil.npy'", context=ctx) == []
+    assert [(v.rule, v.target) for v in npol.scan_source("import numpy as np\nnp.save(out, a)", context=ctx)] \
+        == [("NBP-PATH-WRITE", "/etc/evil.npy")]
+    ctx = npol.ScanContext()
+    assert npol.scan_source("out = 'oci://b@ns/sbx/arr.npy'", context=ctx) == []
+    assert npol.scan_source("import numpy as np\nnp.save(out, a)", context=ctx) == []
+
+
+def test_write_handle_bound_in_an_earlier_cell_is_followed_until_rebound(sandbox_env):
+    ctx = npol.ScanContext()
+    assert npol.scan_source("import io\nbuf = io.StringIO()", context=ctx) == []
+    assert npol.scan_source("df.to_csv(buf)", context=ctx) == []
+    assert npol.scan_source("buf = resolve_target()", context=ctx) == []
+    assert [v.rule for v in npol.scan_source("df.to_csv(buf)", context=ctx)] == ["NBP-PATH-WRITE-DYNAMIC"]
+
+
+def test_tempfile_inside_the_sandbox_prefix_is_allowed(sandbox_env):
+    local = sandbox_env["local_prefix"] + "stage"
+    assert npol.scan_source(f"import tempfile\ntempfile.mkdtemp(dir={local!r})") == []
+    assert npol.scan_source("import tempfile\ntempfile.mkdtemp(dir='oci://b@ns/sbx/tmp')") == []
+    assert npol.scan_source(f"import tempfile\ntempfile.tempdir = {local!r}") == []
+
+
+# Everyday code next to each round-2 class that must not become a false refusal.
+CLEAN_CELLS_7 = [
+    # Q / R: writes under the sandbox prefix or to a relative path, in-memory buffers, no-path forms
+    "import numpy as np\nnp.save('oci://bucket@ns/sandbox/arr.npy', a)",
+    "import numpy as np\nnp.save('arr.npy', a)\nnp.savetxt('out/arr.txt', a)",
+    "import joblib\njoblib.dump(model, 'model.joblib')",
+    "import torch\ntorch.save(model.state_dict(), 'ckpt.pt')",
+    "out = 'oci://bucket@ns/sandbox/out.npy'\nimport numpy as np\nnp.save(out, a)",
+    "df.to_csv('oci://bucket@ns/sandbox/out.csv', index=False)",
+    "df.to_parquet('out/part.parquet')",
+    "csv_text = df.to_csv(index=False)\njs = df.to_json(orient='records')",
+    "import io\nbuf = io.StringIO()\ndf.to_csv(buf)",
+    "from io import BytesIO\nfig.savefig(BytesIO(), format='png')",
+    "import pandas as pd\nwith pd.ExcelWriter('oci://bucket@ns/sandbox/report.xlsx') as writer:\n"
+    "    df.to_excel(writer, sheet_name='a')",
+    "import matplotlib.pyplot as plt\nplt.plot([1, 2]); plt.savefig('plot.png')",
+    "import sys\ndf.to_csv(sys.stdout)",
+    "import cv2\ncv2.imwrite('oci://bucket@ns/sandbox/img.png', img)",
+    # S: generic .save receivers with a dynamic / relative / absent path
+    "model.save(model_uri)\nrow.save()\nwb.save('report.xlsx')",
+    # T: tempfile defaults, a dir the gate cannot resolve, a relative dir
+    "import tempfile\ntmp = tempfile.mkdtemp()\nd = tempfile.gettempdir()",
+    "import tempfile\nwith tempfile.TemporaryDirectory() as d:\n    print(d)",
+    "import tempfile\nfh = tempfile.NamedTemporaryFile(dir=work_dir, suffix='.csv')",
+    "import tempfile\npath = tempfile.mkstemp(prefix='stage_', dir='.')[1]",
+    # U: everyday traceback use returns text, not frames
+    "import traceback\ntry:\n    run()\nexcept Exception:\n    traceback.print_exc()\n    msg = traceback.format_exc()",
+    "import traceback\nframes = traceback.extract_stack()\nlines = traceback.format_exception(e)",
+]
+
+
+@pytest.mark.parametrize("source", CLEAN_CELLS_7, ids=[c[:40] for c in CLEAN_CELLS_7])
+def test_coverage_round2_adjacent_everyday_code_passes_the_gate(source):
+    assert npol.scan_source(source, policy=REVIEW_POLICY) == []
+
+
+# Coverage round 3 (on 26a717b): a re-export back to the chain's own root, a DataFrameWriter /
+# DataFrameReader held in a variable (builder-call result, alias of it, streaming writer) and the
+# server modules; each gap cell verbatim plus the rest of its class.
+REVIEW_GAP_CELLS_5 = [
+    # V: os.path re-exports os; a segment that names the chain's own root re-roots the chain
+    ("import os.path as op\nop.os.system('id')", "NBP-OS-PROCESS", "os.system"),
+    ("import os.path as op\nop.os.environ['X']", "NBP-OS-ENVIRON", "os.environ"),
+    ("import os.path as op\nop.os.popen('id')", "NBP-OS-PROCESS", "os.popen"),
+    ("import os.path\nos.path.os.system('id')", "NBP-OS-PROCESS", "os.system"),
+    ("import os\nos.path.genericpath.os.system('id')", "NBP-OS-PROCESS", "os.system"),
+    ("import os\nos.path.os.system('id')", "NBP-OS-PROCESS", "os.system"),
+    ("from os.path import os as o\no.system('id')", "NBP-OS-PROCESS", "os.system"),
+    ("from os import path\npath.os.system('id')", "NBP-OS-PROCESS", "os.system"),
+    ("from os import path as p\np.os.environ['X']", "NBP-OS-ENVIRON", "os.environ"),
+    ("import glob\nglob.os.system('id')", "NBP-OS-PROCESS", "os.system"),
+    ("import posixpath\nposixpath.os.system('id')", "NBP-OS-PROCESS", "os.system"),
+    ("import tempfile\ntempfile._os.system('id')", "NBP-OS-PROCESS", "os.system"),
+    ("import random\nrandom._os.system('id')", "NBP-OS-PROCESS", "os.system"),
+    # W: a DataFrameWriter / DataFrameReader held in a variable (builder-call result, alias, streaming)
+    ("wr = df.write.mode('overwrite')\nwr.parquet('/etc/x')", "NBP-PATH-WRITE", "/etc/x"),
+    ("wr = df.write.mode('overwrite').option('x', 'y')\nwr.csv('/etc/x')", "NBP-PATH-WRITE", "/etc/x"),
+    ("wr = df.write.format('delta')\nwr.save('/etc/x')", "NBP-PATH-WRITE", "/etc/x"),
+    ("wr = df.coalesce(1).write\nwr.parquet('/etc/x')", "NBP-PATH-WRITE", "/etc/x"),
+    ("wr = df.write.mode('overwrite')\nwr.saveAsTable('otherc.s.t')", "NBP-TABLE-TARGET", "otherc.s.t"),
+    ("wr = df.write.mode('overwrite')\nwr.format('delta').saveAsTable('otherc.s.t')", "NBP-TABLE-TARGET",
+     "otherc.s.t"),
+    ("wr = df.write.mode('overwrite')\nwr.option('path', '/etc/x').save()", "NBP-PATH-WRITE", "/etc/x"),
+    ("wr = df.write.mode('overwrite')\nwr.parquet(dest)", "NBP-PATH-WRITE-DYNAMIC", "<dynamic>"),
+    ("wr = df.write.mode('overwrite')\nw2 = wr\nw2.parquet('/etc/x')", "NBP-PATH-WRITE", "/etc/x"),
+    ("wr = df.writeTo('otherc.s.t').using('delta')\nwr.createOrReplace()", "NBP-TABLE-TARGET", "otherc.s.t"),
+    ("rd = spark.read.format('csv')\nrd.load('/etc/passwd')", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("wr = df.writeStream.format('delta')\nwr.option('path', '/etc/x').start()", "NBP-PATH-WRITE", "/etc/x"),
+    ("df.writeStream.format('delta').option('path', '/etc/x').start()", "NBP-PATH-WRITE", "/etc/x"),
+    ("df.writeStream.format('delta').start('/etc/x')", "NBP-PATH-WRITE", "/etc/x"),
+    ("df.writeStream.toTable('otherc.s.t')", "NBP-TABLE-TARGET", "otherc.s.t"),
+    ("df.writeStream.format('delta').option('checkpointLocation', '/etc/ck').start()", "NBP-PATH-WRITE", "/etc/ck"),
+    ("df.writeStream.options(checkpointLocation='/etc/ck').start()", "NBP-PATH-WRITE", "/etc/ck"),
+    ("df.writeStream.start(path_var)", "NBP-PATH-WRITE-DYNAMIC", "<dynamic>"),
+    # X: servers bind a listening socket; the dotted network modules are judged at every door
+    ("import http.server\nhttp.server.HTTPServer(('',0),h)", "NBP-IMPORT-NETWORK", "http.server"),
+    ("from http.server import HTTPServer", "NBP-IMPORT-NETWORK", "http.server"),
+    ("import http.server as hs", "NBP-IMPORT-NETWORK", "http.server"),
+    ("import http\nhttp.server.HTTPServer(('',0),h)", "NBP-IMPORT-NETWORK", "http.server"),
+    ("from http import server", "NBP-IMPORT-NETWORK", "http.server"),
+    ("import http\nhttp.client.HTTPConnection('h')", "NBP-IMPORT-NETWORK", "http.client"),
+    ("import wsgiref.simple_server as w\nw.make_server('', 0, app)", "NBP-IMPORT-NETWORK", "wsgiref.simple_server"),
+    ("from wsgiref.simple_server import make_server", "NBP-IMPORT-NETWORK", "wsgiref.simple_server"),
+    ("import wsgiref\nwsgiref.simple_server.make_server('', 0, app)", "NBP-IMPORT-NETWORK", "wsgiref.simple_server"),
+    ("import smtpd", "NBP-IMPORT-NETWORK", "smtpd"),
+    ("import flask", "NBP-IMPORT-NETWORK", "flask"),
+    ("from fastapi import FastAPI", "NBP-IMPORT-NETWORK", "fastapi"),
+    ("import uvicorn", "NBP-IMPORT-NETWORK", "uvicorn"),
+    ("import tornado.web", "NBP-IMPORT-NETWORK", "tornado"),
+]
+
+
+@pytest.mark.parametrize("source,rule,target", REVIEW_GAP_CELLS_5,
+                         ids=[c[1] + ":" + c[0][:30] for c in REVIEW_GAP_CELLS_5])
+def test_coverage_round3_gap_cells_are_refused(tmp_path, sandbox_env, source, rule, target):
+    _assert_refused(tmp_path, [source], rule, target)
+
+
+def test_coverage_round3_gap_cell_count():
+    assert len(REVIEW_GAP_CELLS_5) >= 40
+
+
+def test_writer_held_in_a_variable_is_followed_across_cells():
+    ctx = npol.ScanContext()
+
+    def scan(src):
+        return [(v.rule, v.target) for v in npol.scan_source(src, policy=REVIEW_POLICY, context=ctx)]
+
+    assert scan("wr = df.write.mode('overwrite').format('delta')") == []
+    assert scan("wr.save('/etc/x')") == [("NBP-PATH-WRITE", "/etc/x")]
+    assert scan("wr.saveAsTable('otherc.s.t')") == [("NBP-TABLE-TARGET", "otherc.s.t")]
+    assert scan("wr.save('oci://bucket@ns/sandbox/out')") == []
+    assert scan("w2 = wr") == []
+    assert scan("w2.parquet(dest)") == [("NBP-PATH-WRITE-DYNAMIC", "<dynamic>")]
+    ctx = npol.ScanContext()
+    assert scan("rd = spark.read.format('csv').option('header', True)") == []
+    assert scan("rd.load('/etc/passwd')") == [("NBP-OPEN-PATH", "/etc/passwd")]
+    assert scan("df = rd.load(src_path)") == []
+
+
+def test_allow_network_lifts_the_server_modules_at_every_door():
+    open_policy = SandboxPolicy(catalog="sbx", schema="mig", prefix="oci://bucket@ns/sandbox/", allow_network=True)
+    for src in ("import http.server", "from http.server import HTTPServer", "from http import server",
+                "import http\nhttp.server.HTTPServer(('', 0), h)", "import wsgiref.simple_server as w",
+                "import wsgiref\nwsgiref.simple_server.make_server('', 0, app)", "import flask"):
+        assert npol.scan_source(src, policy=open_policy) == [], src
+
+
+# Everyday code next to each round-3 class that must not become a false refusal.
+CLEAN_CELLS_8 = [
+    # V: os.path through an alias is everyday path code; every re-root shortens the chain and ends
+    "import os.path as op\np = op.join(base, 'x')\nprint(op.basename(p), op.sep)",
+    "import os\nprint(os.path.sep, os.path.basename(p))",
+    "from os import path\nprint(path.join('a', 'b'))",
+    "import os\np = os.path.os.path.join('a', 'b')",
+    # W: writers / readers held in a variable that stay inside the sandbox; builders with run-time arguments
+    "wr = df.write.mode('overwrite')\nwr.parquet('oci://bucket@ns/sandbox/out')",
+    "wr = df.write.mode('overwrite').format('delta')\nwr.save('oci://bucket@ns/sandbox/out')",
+    "wr = df.write.mode('overwrite')\nwr.format('delta').saveAsTable('sbx.mig.t')",
+    "wr = df.write.mode('overwrite')\nwr.option('compression', 'snappy').parquet('oci://bucket@ns/sandbox/out')",
+    "writer = df.write.mode('overwrite')\nwriter.format(fmt).save('oci://bucket@ns/sandbox/out')",
+    "w = df.write.mode('overwrite')\nw.partitionBy('d').parquet('oci://bucket@ns/sandbox/out')",
+    "wr = df.coalesce(1).write\nwr.mode('overwrite').csv('oci://bucket@ns/sandbox/out')",
+    "wr = df.write.mode('overwrite')\nwr.saveAsTable('sbx.mig.out')",
+    "rd = spark.read.format('csv').option('header', True)\ndf = rd.load(src_path)",
+    "rd = spark.read.format('csv')\ndf = rd.load('oci://bucket@ns/prod/in.csv')",
+    "q = df.writeStream.format('delta').option('checkpointLocation', 'oci://bucket@ns/sandbox/ck')"
+    ".start('oci://bucket@ns/sandbox/out')",
+    "df.writeStream.format('console').start()",
+    "df.writeStream.toTable('sbx.mig.events')",
+    "wr = df.writeStream.format('delta').outputMode('append')\n"
+    "wr.option('checkpointLocation', 'oci://bucket@ns/sandbox/ck').start('oci://bucket@ns/sandbox/out')",
+    "q = df.writeStream.foreachBatch(fn).start()\nq.awaitTermination()",
+    "import threading\nt = threading.Thread(target=run)\nt.start()",
+    # X: the harmless parents of the dotted network modules
+    "import http\nprint(http.HTTPStatus.OK)",
+    "from http import HTTPStatus",
+    "import wsgiref.util",
+]
+
+
+@pytest.mark.parametrize("source", CLEAN_CELLS_8, ids=[c[:40] for c in CLEAN_CELLS_8])
+def test_coverage_round3_adjacent_everyday_code_passes_the_gate(source):
+    assert npol.scan_source(source, policy=REVIEW_POLICY) == []
+
+
+# Regression review on a069dd6: Path.open() / .rename() / .replace() on a Path the gate
+# did not recognise as one (a Path-returning step, a derived Path, a name bound to either)
+# fell through to the generic <object>.open(path) rule, which read the MODE string as the
+# path and allowed the call. Every receiver rooted at a Path is a Path: the identity steps
+# keep the constructor literal (judged as NBP-OPEN-PATH / NBP-FS-PATH), everything else is
+# an unresolvable path and fails closed (NBP-OPEN-DYNAMIC / NBP-FS-DYNAMIC) in every mode.
+# The reviewer's thirteen cells come first, verbatim.
+REVIEW_GAP_CELLS_6 = [
+    ("from pathlib import Path\nPath(p).resolve().open('r')", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\nq = Path(p).resolve()\nq.open('r')", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\nPath(p).parent.open('r')", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\nPath('/etc/passwd').resolve().open()", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("from pathlib import Path\nPath('/etc/passwd').absolute().open('r')", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("from pathlib import Path\nPath('/etc/passwd').expanduser().open('r')", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("from pathlib import Path\n(Path('/etc') / 'passwd').open('r')", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\nPath('/etc').joinpath('passwd').open('r')", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\nPath('/etc/passwd').with_name('shadow').open()", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\nwith Path('/etc/cron.d/job').absolute().open('w') as f:\n    f.write('x')",
+     "NBP-OPEN-PATH", "/etc/cron.d/job"),
+    ("from pathlib import Path\nPath('/etc/passwd').absolute().rename('/tmp/x')", "NBP-FS-PATH", "/etc/passwd"),
+    ("from pathlib import Path\nPath('/tmp/x').absolute().replace('/etc/passwd')", "NBP-FS-PATH", "/tmp/x"),
+    ("from pathlib import Path\nPath(p).resolve().rename(t)", "NBP-FS-DYNAMIC", "<dynamic>"),
+    # the same routes through the module, an alias, the classmethods and the other derived steps
+    ("import pathlib\npathlib.Path(p).resolve().open('r').read()", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path as P\nP(p).resolve().open('r')", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\nPath.cwd().open('r')", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\nPath.home().joinpath('.ssh', 'id_rsa').open('r')", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\nPath().open('r')", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\nPath('~root/.ssh/id_rsa').expanduser().open('r')", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\nPath(p).parents[1].open('r')", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\nPath(p).parent.parent.open('r')", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\n('/etc' / Path('passwd')).open('r')", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\nPath(p).with_suffix('.bak').open('w')", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\nPath(p).with_suffix('.bak').replace(t)", "NBP-FS-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\nPath('/etc').joinpath('passwd').rename(t)", "NBP-FS-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\n(Path('/tmp') / name).replace('/etc/passwd')", "NBP-FS-DYNAMIC", "<dynamic>"),
+    # a name bound to a derived Path, rebound, bound by a loop / comprehension, or annotated
+    ("from pathlib import Path\nq = Path('/etc') / 'passwd'\nq.open('r')", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\nq = Path.home()\nq.joinpath('.ssh', 'id_rsa').open('r')", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\nq = Path(a)\nq = q.resolve()\nq.open('r')", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\nq = Path('/etc/passwd').absolute()\nq.open()", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("from pathlib import Path\nq = Path('/etc/passwd').resolve()\nq.rename('/tmp/x')", "NBP-FS-PATH", "/etc/passwd"),
+    ("from pathlib import Path\nfor f in Path('/etc').iterdir():\n    f.open('r').read()", "NBP-OPEN-DYNAMIC",
+     "<dynamic>"),
+    ("from pathlib import Path\n[f.open('r').read() for f in Path('/etc').glob('*')]", "NBP-OPEN-DYNAMIC",
+     "<dynamic>"),
+    ("from pathlib import Path\ndef dump(src: Path):\n    return src.open('r').read()", "NBP-OPEN-DYNAMIC",
+     "<dynamic>"),
+    ("from pathlib import Path\ndef move(src: Path, dst):\n    src.rename(dst)", "NBP-FS-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\nq: Path = Path(p).resolve()\nq.open('r')", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\na, b = Path(p).resolve(), 'x'\na.open('r')", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    # a splat on a derived receiver still hides the mode and path
+    ("from pathlib import Path\nPath('/tmp/x').resolve().open(*mode)", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+]
+
+
+@pytest.mark.parametrize("source,rule,target", REVIEW_GAP_CELLS_6,
+                         ids=[c[1] + ":" + c[0][:30] for c in REVIEW_GAP_CELLS_6])
+def test_derived_path_receivers_are_refused(tmp_path, sandbox_env, source, rule, target):
+    _assert_refused(tmp_path, [source], rule, target)
+
+
+def test_derived_path_receiver_cell_count():
+    assert len(REVIEW_GAP_CELLS_6) >= 38
+
+
+def test_path_bound_in_an_earlier_cell_is_followed():
+    ctx = npol.ScanContext()
+
+    def scan(src):
+        return [(v.rule, v.target) for v in npol.scan_source(src, policy=REVIEW_POLICY, context=ctx)]
+
+    assert scan("from pathlib import Path\nq = Path(src_dir).resolve()") == []
+    assert scan("q.open('r')") == [("NBP-OPEN-DYNAMIC", "<dynamic>")]
+    assert scan("q.joinpath('x').open('r')") == [("NBP-OPEN-DYNAMIC", "<dynamic>")]
+    assert scan("q.rename(dst)") == [("NBP-FS-DYNAMIC", "<dynamic>")]
+    assert scan("p = Path('/etc/passwd').absolute()") == []
+    assert scan("p.open()") == [("NBP-OPEN-PATH", "/etc/passwd")]
+    assert scan("p = p.resolve()") == []
+    assert scan("p.open()") == [("NBP-OPEN-DYNAMIC", "<dynamic>")]
+    # rebound to a string the name is a string again: str.replace is not a Path operation
+    assert scan("p = 'a-b'") == []
+    assert scan("p.replace('-', '_')") == []
+
+
+# Everyday pathlib / str / DataFrame code next to the class that must not become a false refusal.
+CLEAN_CELLS_9 = [
+    "s = 'a-b'\ns.replace('-', '_')",
+    "df.rename(columns={'a': 'b'})",
+    "df.replace({'a': 1})",
+    "from pathlib import Path\nstem = Path(p).stem.replace('-', '_')",
+    "from pathlib import Path\nname = Path(p).name\nname.replace('.csv', '')",
+    "from pathlib import Path\nprint(Path(p).resolve().name, Path(p).parent.stem, Path(p).suffix)",
+    "from pathlib import Path\nif Path(p).resolve().exists():\n    print(Path(p).stat().st_size)",
+    "from pathlib import Path\nfor f in Path(d).iterdir():\n    print(f.name, f.suffix)",
+    "from pathlib import Path\nnames = [f.name for f in Path(d).glob('*.csv')]",
+    "from pathlib import Path\nPath('oci://bucket@ns/sandbox/x').resolve().open('w')",
+    "from pathlib import Path\nq = Path('oci://bucket@ns/sandbox/out')\nq.absolute().open('w')",
+    "from pathlib import Path\nPath('oci://bucket@ns/sandbox/a').absolute().rename('oci://bucket@ns/sandbox/b')",
+    "from pathlib import Path\nPath('rel/x.txt').resolve().open()",
+    "from pathlib import Path\nPath('rel/x.txt').expanduser().read_text()",
+    "import zipfile\nzf = zipfile.ZipFile('oci://bucket@ns/sandbox/x.zip')\nzf.open(member)",
+    "import fsspec\nfs = fsspec.filesystem('oci')\nwith fs.open(object_path, 'rb') as fh:\n    data = fh.read()",
+]
+
+
+@pytest.mark.parametrize("source", CLEAN_CELLS_9, ids=[c[:40] for c in CLEAN_CELLS_9])
+def test_pathlib_adjacent_everyday_code_passes_the_gate(source):
+    assert npol.scan_source(source, policy=REVIEW_POLICY) == []

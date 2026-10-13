@@ -244,14 +244,77 @@ process / network modules (`subprocess`, `multiprocessing`, `ctypes`, `pty`, `so
 itself, or opens / removes / renames / writes (`open`, `pathlib`, `os.remove`, `shutil.move`,
 `saveAsTable`, `insertInto`, `writeTo`, `df.write.*` including `option("path")`, `CREATE TABLE`
 / `INSERT` / `DROP` / `MERGE` / `DELETE` / `LOCATION` / `OPTIONS (path ...)` via `spark.sql`,
-`dbutils.fs.rm/mv/cp/put/mkdirs`) a target outside the sandbox. A target that is a name bound
-once to a string literal earlier in the run is checked as that literal; any other non-literal
-target is refused unless its rule id is allowlisted. The gate matches these forms statically
-and is not a Python sandbox; the runtime assertions in `dbutils.fs.*`, `safe_io` and
+`dbutils.fs.rm/mv/cp/put/mkdirs`) a target outside the sandbox. The gate is deny-by-default for
+every route to the same capability, not only the direct spelling: the builtins namespace through
+`__builtins__` / `builtins` / `globals()` / `locals()` / `vars()` / `getattr`, `getattr` /
+`setattr` with a non-literal name, dunder and frame introspection chains (`__subclasses__`,
+`__globals__`, `__dict__`, `f_globals`, ...; `NBP-DUNDER-ESCAPE`), the IPython shell API and
+`%magic` / `!command` lines inside a cell (`get_ipython().system`, `InteractiveShell`;
+`NBP-IPYTHON-ESCAPE`), the Spark JVM / py4j bridge (`spark._jvm`, `sc._jsc`, `df._jdf`, `py4j`;
+`NBP-POLICY-TAMPER`), deserialisers that execute code (`pickle.loads`, `yaml.load` without a
+safe loader, `torch.load` without `weights_only=True`; `NBP-DESERIALIZE`), process / debugger /
+profiler modules, the stdlib open-equivalents (`io.open`, `os.open`, `gzip.open`, ...), and
+names that were bound to any of these and later rebound to something the gate cannot resolve.
+The same rule table serves every spelling: `posix` / `nt` are judged as `os`, `getattr(mod,
+"literal")` like `mod.literal`, and `str.format` / `format_map` templates (literal or bound once)
+are walked field by field (`{0.__class__.__mro__}` refused, `{0.__class__.__name__}` fine).
+Library readers (`pd.read_csv`, `spark.read.csv`, `np.load`, `sc.textFile`, ...) with a literal
+local path (`/etc/passwd`, `/dbfs/...`, `~`, `C:\`, `file://`) outside the prefix are refused.
+A target that is a name bound once to a string literal earlier in the run is checked as that
+literal; any other non-literal target is refused unless its rule id is allowlisted, with two
+scope decisions that are allowed and recorded in the policy log instead: a reader path the gate
+cannot resolve (`spark.read.parquet(src)`, `unverified_read_path`; reading source data through
+parameters is the normal migration case and object-storage / catalog reads are never
+path-checked) and a `spark.sql` statement whose literal head is `SELECT` / `WITH` / `SHOW` /
+`DESCRIBE` / `EXPLAIN` (`unverified_sql_read`; Spark runs one statement per call, so it cannot
+become a write), plus a `DataFrame.pipe(fn)` whose callable the gate cannot type, on a receiver
+the notebook bound (`unverified_pipe_callable`; `RDD.pipe(cmd)`, any string-typed `.pipe()`
+argument and a receiver the notebook never bound are refused). `open(path_var)` is not such a
+decision: a non-literal `open()` path is refused in read mode as well, and so is
+`thing.open(path_var)` on a receiver the notebook never bound (`fs.open(p)` on a bound
+object-store filesystem is recorded). The review-derived gap classes are closed as classes, not spellings: a gated
+module or Spark object handed around as a value (`[os][0]`, `run(os)`, `return os`,
+`lambda: os`, ...), a process sink name on a receiver the gate cannot resolve
+(`helper().system`, `obj.popen`), string-keyed accessors (`operator.attrgetter` /
+`methodcaller`, `functools.reduce(getattr, ..)`, `inspect.getattr_static` / `getmembers`),
+re-rooting at a module named mid-chain (`shutil.os.system`, `pd.io.common.os.environ`),
+deny-by-default deserialisers (the whole pickle family except the dump side, `torch.load` at
+any depth, `numpy` `allow_pickle`, every unsafe yaml loader / constructor / hook / subclass),
+`globals()[k]` with a tainted key or a dereferenced result, and `open(*a, **kw)`. The coverage
+round on top of that: a list literal is folded into a path only while its name is used for
+nothing but `sep.join(name)` (`p[0] = '/etc'`, `p.insert(..)`, `q = p`, `mutate(p)` make the
+join dynamic, fail closed); keyword-gated loaders fail closed when the switch is positional or
+hidden (`np.load(p, None, True)`, `np.load(p, **kw)`, `torch.load(.., pickle_module=..)` even
+with `weights_only=True`, `torch.serialization.add_safe_globals`); the state of a gated module
+is read-only (`yaml.SafeLoader.yaml_constructors[..] = h`, `.update(..)`, `setattr(yaml.SafeLoader,
+..)`; `sys.path` and `torch` flags stay settable); a process sink name (`mymod.system`) or a
+`_private` attribute (`mymod._run`, `np._core`) on an imported module the gate has no rules for
+is refused (`platform.system()` is the documented homonym); `site` / `pip` load code from a path
+and are refused like `addPyFile`. Library writers are the mirror of the readers and fail
+closed like every other write: `np.save`, `torch.save`, `joblib.dump`, `scipy.io.savemat`,
+`cv2.imwrite`, `plt.savefig`, `pq.write_table`, `pd.ExcelWriter`, `mlflow.*.save_model`, and
+`df.to_csv` / `to_parquet` / `to_pickle` / `write_parquet` / `savefig` / `tofile` on any receiver
+with a literal local path outside the prefix are `NBP-PATH-WRITE`, with a path the gate cannot
+resolve `NBP-PATH-WRITE-DYNAMIC` (a `StringIO` / `BytesIO` / `ExcelWriter` handle the notebook
+bound is not a path); generic `wb.save(..)` / `model.save(..)` / `img.save(..)` judge a literal
+path only. `tempfile` creators with a literal `dir=` or an absolute `prefix=` outside the prefix
+(and `tempfile.tempdir =`) are `NBP-FS-PATH`; `faulthandler`, `traceback.walk_stack` /
+`walk_tb`, `capture_locals=True` and `Task.get_stack()` are frame dumps (`NBP-INDIRECT`). A
+`DataFrameWriter` / `DataFrameReader` held in a variable (`wr = df.write.mode('overwrite')`,
+`w2 = wr`, `rd = spark.read.format('csv')`) is followed like the chain it was built from, also
+across cells; structured-streaming writers (`df.writeStream...start(p)` / `.toTable(t)` /
+`.option('checkpointLocation', p)`) are judged like `df.write`; a re-export back to the chain's own
+root (`os.path.os.system`, also via `import os.path as op`) is re-rooted like `shutil.os`; and
+`http.server` / `wsgiref.simple_server` / the Python web servers are network modules at every door
+(`import http; http.server.HTTPServer(..)` included). The gate
+matches these forms statically and is not a Python sandbox: a static AST gate over a full
+Python runtime is a mitigation layer, the platform-level control is the IAM scope of the
+cluster the notebook runs on, and the runtime assertions in `dbutils.fs.*`, `safe_io` and
 `dbutils.secrets` are the enforcement layer for writes that go through the compat helpers (see
-`engine/aidp_compat/SUPPORTED_OPERATIONS.md` section 8 for the rule table and what is not
-covered). Refusals and allowed exceptions are recorded and rendered into each task's test
-report under **Notebook Policy Log**. Scheduled jobs that keep using `aidp_compat` after
+`engine/aidp_compat/SUPPORTED_OPERATIONS.md` section 8 for the rule table, what is not covered
+and the known false refusals). Refusals, allowed exceptions and skipped magic-led cells are
+recorded and rendered into each task's test report under **Notebook Policy Log**. Scheduled
+jobs that keep using `aidp_compat` after
 migration must declare the same variables in their environment.
 
 **Secrets** (`dbutils.secrets`). Lookups go to OCI Vault only (`AIDP_VAULT_OCID`, secret named
