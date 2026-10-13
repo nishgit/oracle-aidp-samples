@@ -266,12 +266,21 @@ user; a write on the source, or a privilege that leads to one (`MANAGE GRANTS`,
 `OWNERSHIP` of a role or user, `CREATE ROLE`, `EXECUTE TASK`, owning a policy
 or tag in any database, ...), refuses the session; a system role anywhere in
 the hierarchy or granted to the user is refused unlisted; the `database:`
-scope excuses only a write the check can place on another database and whose
-reach stays on that object (never an escalation such as `MANAGE GRANTS`,
-whatever row reports it); and an unknown privilege, a blank or unknown class,
-a malformed row, an unreadable listing, or a user listing that names no role
-or omits the role the session runs as fails closed. In `preflight`, a failed
-gate skips the source checks after it, reported as skipped, not passed.
+scope excuses only a write the check can place on another database -- a name
+with exactly the parts `SHOW GRANTS` prints and no whitespace in an unquoted
+part -- and whose reach stays on that object (never an escalation such as
+`MANAGE GRANTS`, whatever row reports it, and never the privilege that runs
+an owner's-rights object: `OPERATE` on a task, pipe, alert, dynamic table or
+service, `USAGE` of a procedure, notebook or Streamlit app, whose body runs
+on its owner's grants, which the check never reads, and may write the source
+from any database); and an unknown privilege, a blank or unknown class, a
+malformed row or name, a role grant that names no role (blank, a blank part,
+or not the `NAME` / `DB.NAME` its class prints), an unreadable listing, or a
+user listing that names no role or omits the role the session runs as fails
+closed. A system role is matched by its stored name as the listings print
+it (exactly `SYSADMIN`; a distinct `"sysadmin"` is walked like any role). In
+`preflight`, a failed gate skips the source checks after it, reported as
+skipped, not passed.
 
 **I2 — Read back and compare; a 2xx is not the claim.** AIDP catalog creates
 are asynchronous: they return **202 Accepted** with an empty body and no

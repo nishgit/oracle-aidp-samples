@@ -61,24 +61,57 @@ grant the check can PLACE -- a database-contained source class
 (`SCOPED_SOURCE_CLASSES`) whose object name carries the database part --
 and only to a privilege whose reach is BOUNDED by that object: INSERT or
 OWNERSHIP on a table of another database is a write on that table and
-nothing more. A privilege whose reach is not bounded by what it is granted
-on -- one named in `ESCALATIONS`, or any `MANAGE ...`, `APPLY ...` or
-`EXECUTE ...` privilege -- is refused in whatever class and database a
-row reports it (`_escalates`): MANAGE GRANTS reported ON a database still
-lets the role grant itself anything. A refused privilege on any other
-class, or on a row whose class or name is blank or malformed, is a refusal
-whatever the scope too: an escalation on the account, the organisation, a
-listing or a class Snowflake adds tomorrow is never "another database".
-Class and privilege names are read with the
+nothing more. Two kinds of privilege reach past their object and are
+refused in whatever class and database a row reports them
+(`_reaches_past`). One is an escalation -- a privilege named in
+`ESCALATIONS`, or any `MANAGE ...`, `APPLY ...` or `EXECUTE ...`
+privilege: MANAGE GRANTS reported ON a database still lets the role grant
+itself anything. The other is the privilege that RUNS an owner's-rights
+object (`EXECUTABLE_CLASSES`): a task, pipe, alert, dynamic table or
+service runs its body with its OWNER's privileges, not the caller's, and
+OPERATE on one is what resumes, refreshes or executes it; a procedure,
+notebook or Streamlit app runs the same way and USAGE is what calls it.
+What such a body does is set by its owner's grants, which this check
+never reads, so a task in another database owned by a privileged role
+whose body writes the source is a write the session can trigger: OPERATE
+on it is refused wherever the task lives, and USAGE of a procedure
+OUTSIDE the migration's database is refused too (inside it, discovery
+needs it; see the allowances below). OWNERSHIP of a task or procedure in
+another database stays a reported write: an object the role owns runs
+with the role's own privileges, which this check is proving read-only. A
+refused privilege on any other class, or on a row
+whose class or name is blank or malformed, is a refusal whatever the
+scope too: an escalation on the account, the organisation, a listing or a
+class Snowflake adds tomorrow is never "another database".
+
+Placing a grant is strict, because a row that is excused is a row that is
+not judged. The name must have exactly the parts SHOW GRANTS prints for
+its class -- DB for a database, DB.SCHEMA for a schema, DB.SCHEMA.OBJECT
+for everything else (a future row names its container, DB.<TABLE> or
+DB.SCHEMA.<TABLE>, so two or three) -- and every unquoted part before the
+object part must be an identifier: an unquoted identifier cannot contain
+whitespace, so `SALES_DB .PUBLIC.ORDERS` or a two-part table name on a
+current grant is a malformed row, judged INSIDE the scope. An unquoted
+database part is compared with its whitespace removed and folded to upper
+case, a quoted one as written. Class and privilege names are read with the
 whitespace SHOW GRANTS never prints removed, so a padded or null column is
-not a loophole either: a blank class refuses the row, and a role-like class
-that is not exactly ROLE or DATABASE_ROLE (an application or instance
-role) is refused unwalked.
+not a loophole either: a blank class refuses the row, a role grant whose
+name is blank, has a blank part or does not have the parts its class
+prints (one for a role, DB.NAME for a database role) is refused rather
+than listed as `""`, and a role-like class that is not exactly ROLE or
+DATABASE_ROLE (an application or instance role) is refused unwalked.
 
 A system role (ACCOUNTADMIN, SECURITYADMIN, USERADMIN, SYSADMIN, ORGADMIN,
 GLOBALORGADMIN) anywhere in the walked hierarchy, or granted to the user,
 is refused without listing it: what those roles can do is set by
-Snowflake, not by the rows `SHOW GRANTS` returns for them.
+Snowflake, not by the rows `SHOW GRANTS` returns for them. The name is
+compared with the STORED name, case-sensitively: `current_role()`, the
+user listing and `SHOW GRANTS` all print a role's stored name unquoted,
+and Snowflake stores an unquoted identifier in upper case, so a role named
+exactly SYSADMIN is the system role and a distinct role created as
+`"sysadmin"` (stored in lower case) is not -- it is walked and judged by
+its grants like any other role. A quoted name, should a listing ever print
+one, is read as its stored text.
 
 Future grants are read too (`SHOW FUTURE GRANTS TO ROLE`, and `TO DATABASE
 ROLE` for a database role). A future INSERT on a schema is an INSERT on
@@ -90,11 +123,14 @@ account passes: a database the role creates -- empty, or a zero-copy
 CLONE of the source -- is the role's own and never a write on the source,
 and discovery is scoped to `database:`, so nothing in it is read; a clone
 is still a copy of the estate under the role's control, which is why the
-README asks the account owner not to grant it. USAGE on a PROCEDURE passes
-because discovery reads procedure DDL and needs it; a procedure that runs
-with its owner's rights would let a leaked credential CALL a write the
-owner can make, so the README asks that the migration role be granted no
-procedures it does not need.
+README asks the account owner not to grant it. USAGE on a PROCEDURE in the
+migration's database (or with no `database:` set) passes because discovery
+reads procedure DDL and needs it; a procedure that runs with its owner's
+rights would let a leaked credential CALL a write the owner can make, so
+the README asks that the migration role be granted no procedures it does
+not need. Discovery never reads a procedure in another database, so
+USAGE of one there is refused: nothing needs it, and its owner may write
+the source.
 
 The check fails CLOSED. A role whose grants or future grants cannot be
 read, a session with no current role, a secondary-roles setting that is
@@ -117,7 +153,8 @@ from .conn import AuthError
 
 __all__ = ["RoleNotReadOnly", "READ_PRIVILEGES", "WRITE_PRIVILEGES",
            "NON_SOURCE_PRIVILEGES", "NON_SOURCE_CLASSES", "ESCALATIONS",
-           "GOVERNANCE_CLASSES", "SCOPED_SOURCE_CLASSES", "SYSTEM_ROLES",
+           "GOVERNANCE_CLASSES", "SCOPED_SOURCE_CLASSES",
+           "EXECUTABLE_CLASSES", "SYSTEM_ROLES",
            "INHERITED_ROLE_CLASSES", "PUBLIC_ROLE", "SHOW_GRANTS_CAP",
            "read_role_grants", "assert_role_read_only",
            "describe_role_grants"]
@@ -246,8 +283,10 @@ GOVERNANCE_CLASSES = {
 # form DB.SCHEMA.OBJECT (DB.SCHEMA for a schema, DB for a database). Only
 # a refused privilege on one of these, naming a database other than the
 # migration's `database:`, is "outside this migration" and reported rather
-# than refused. A refused privilege on any other class is a refusal
-# whatever the scope. Reads on any class pass regardless.
+# than refused -- and only when its reach stays on that object (see
+# `EXECUTABLE_CLASSES` and `_reaches_past`). A refused privilege on any
+# other class is a refusal whatever the scope. Reads on any class pass
+# regardless.
 SCOPED_SOURCE_CLASSES = frozenset({
     "DATABASE", "SCHEMA", "TABLE", "VIEW", "MATERIALIZED_VIEW",
     "DYNAMIC_TABLE", "EXTERNAL_TABLE", "EVENT_TABLE", "HYBRID_TABLE",
@@ -257,6 +296,37 @@ SCOPED_SOURCE_CLASSES = frozenset({
     "SECRET", "SERVICE", "IMAGE_REPOSITORY", "GIT_REPOSITORY", "SNAPSHOT",
     "DBT_PROJECT",
 })
+
+# Source classes whose body runs with its OWNER's privileges rather than
+# the caller's, each with the privilege that RUNS it. A task is resumed or
+# executed with OPERATE (EXECUTE TASK, ALTER TASK ... RESUME), a pipe
+# refreshed or resumed, an alert resumed, a dynamic table refreshed or
+# resumed, a service resumed; a procedure is CALLed, a notebook or
+# Streamlit app run, with USAGE. What the body does is set by the owner's
+# grants, which this check never reads: whatever the object's owner may
+# write, the role that runs it writes too -- so a task in another
+# database owned by a privileged role whose body writes the source is a
+# write on the source the session can trigger, and the `database:` scope
+# never excuses the run privilege on one of these (`_reaches_past`). The
+# run privilege is judged by the ordinary rules inside the scope: OPERATE
+# on a task is a write there as before, and USAGE of a procedure,
+# notebook or Streamlit app in the migration's own database passes
+# because discovery reads their DDL. Outside the scope it is refused:
+# discovery reads nothing there, so nothing needs it. Any OTHER privilege
+# on these classes stays bounded by its object -- the owner of a task runs
+# it with the owner's own privileges, which are the ones this check is
+# proving read-only -- so OWNERSHIP of a task in another database is a
+# reported write like OWNERSHIP of a table there.
+EXECUTABLE_CLASSES: dict[str, str] = {
+    "TASK": "OPERATE",
+    "PIPE": "OPERATE",
+    "ALERT": "OPERATE",
+    "DYNAMIC_TABLE": "OPERATE",
+    "SERVICE": "OPERATE",
+    "PROCEDURE": "USAGE",
+    "NOTEBOOK": "USAGE",
+    "STREAMLIT": "USAGE",
+}
 
 # Why a privilege is refused when the reason is a known path from "not a
 # write" to "a write": each of these lets the role widen its own reach,
@@ -306,9 +376,25 @@ _NO_CLASS = ("a grants row with no object class cannot be placed or judged, "
 _ROLE_UNWALKED = ("USAGE of a role this check has not walked -- only ROLE "
                   "and DATABASE_ROLE are followed -- so what it holds is "
                   "unproven")
+_NO_ROLE_NAME = ("a role grant that names no role cannot be walked, so what "
+                 "the role holds is unproven and the row is refused")
+
+
+def _owners_rights(granted_on: str, privilege: str) -> str:
+    kind = granted_on.lower().replace("_", " ")
+    one = ("an " if kind[:1] in "aeiou" else "a ") + kind
+    verb = "call" if privilege == "USAGE" else "run"
+    return (f"{privilege} on {one} lets the role {verb} it, and {one} runs "
+            f"with its OWNER's privileges, not the role's, so what it does "
+            f"is set by grants this check does not read and may write the "
+            f"source; outside the migration's database nothing reads it, "
+            f"so the grant is refused in any scope")
 
 # Roles whose reach Snowflake defines; a session that is, holds or inherits
-# one is refused without reading its grants. Compared case-insensitively.
+# one is refused without reading its grants. Compared with the stored name
+# as the listings print it, case-sensitively: an unquoted identifier is
+# stored in upper case, so exactly SYSADMIN is the system role and a
+# distinct role created as "sysadmin" is not (`_refuse_system_role`).
 SYSTEM_ROLES = frozenset({
     "ACCOUNTADMIN", "SECURITYADMIN", "USERADMIN", "SYSADMIN", "ORGADMIN",
     "GLOBALORGADMIN",
@@ -354,8 +440,9 @@ def _quote_role(name: str) -> str:
     return '"' + str(name).replace('"', '""') + '"'
 
 
-def _split_identifier(name: str) -> list[str]:
-    """The parts of a dotted identifier as SHOW GRANTS prints it, unquoted.
+def _split_identifier_parts(name: str) -> list[tuple[str, bool]]:
+    """The parts of a dotted identifier as SHOW GRANTS prints it, each with
+    whether it was quoted.
 
     A quoted part is read up to its closing quote (a doubled quote inside
     is one quote) and kept as written; an unquoted part is kept as written
@@ -364,9 +451,10 @@ def _split_identifier(name: str) -> list[str]:
     stays inside it.
     """
     text = str(name or "").strip()
-    parts: list[str] = []
+    parts: list[tuple[str, bool]] = []
     buf: list[str] = []
     quoted = False
+    was_quoted = False
     i = 0
     while i < len(text):
         ch = text[i]
@@ -381,14 +469,22 @@ def _split_identifier(name: str) -> list[str]:
                 buf.append(ch)
         elif ch == '"':
             quoted = True
+            was_quoted = True
         elif ch == ".":
-            parts.append("".join(buf))
+            parts.append(("".join(buf), was_quoted))
             buf = []
+            was_quoted = False
         else:
             buf.append(ch)
         i += 1
-    parts.append("".join(buf))
+    parts.append(("".join(buf), was_quoted))
     return parts
+
+
+def _split_identifier(name: str) -> list[str]:
+    """The parts of a dotted identifier, unquoted (see
+    `_split_identifier_parts`)."""
+    return [part for part, _ in _split_identifier_parts(name)]
 
 
 def _sql_name(listed: str) -> str:
@@ -403,8 +499,11 @@ def _database_of(name: str) -> str:
     database `DB`, quoting any part that needs it. Only the database part
     is wanted here, so a quoted first part is read up to its closing quote
     and kept as written (a quoted identifier IS its case); an unquoted one
-    folds to upper case, as Snowflake resolves it. `_unquote` applies the
-    same rule to the config's `database:`, so the two compare equal.
+    folds to upper case, as Snowflake resolves it, with the whitespace an
+    unquoted identifier cannot contain removed (`_norm`), so a padded part
+    is the same database as an unpadded one and never "another database".
+    `_unquote` applies the same rule to the config's `database:`, so the
+    two compare equal.
     """
     text = str(name or "").strip()
     if text.startswith('"'):
@@ -418,23 +517,43 @@ def _database_of(name: str) -> str:
                 break
             i += 1
         return text[1:end].replace('""', '"') if end > 0 else text[1:]
-    return text.split(".", 1)[0].upper()
+    return _norm(text.split(".", 1)[0])
 
 
-def _outside_scope(granted_on: str, obj: str, scope: str) -> bool:
+def _outside_scope(granted_on: str, obj: str, scope: str, *,
+                   future: bool = False) -> bool:
     """True when the grant is provably on an object of ANOTHER database.
 
-    Only a database-contained source class, named with its database part
-    (`DB` for a database, `DB.X...` for the rest), can be placed. A grant
-    on any other class, or with a name too short to carry a database, is
-    judged inside the scope: it cannot be shown to be elsewhere.
+    Only a database-contained source class, named the way SHOW GRANTS
+    names one, can be placed: `DB` for a database, `DB.SCHEMA` for a
+    schema, `DB.SCHEMA.OBJECT` for everything else -- exactly that many
+    parts on a current grant, since SHOW GRANTS always prints the full
+    name; a future grant names the container the objects will be created
+    in (`DB.<TABLE>` or `DB.SCHEMA.<TABLE>`), so two or three. Every
+    unquoted part before the object part must be an identifier, and an
+    unquoted identifier cannot contain whitespace (the object part may: a
+    function's signature has `F(VARCHAR, NUMBER)`). A grant on any other
+    class, or whose name is blank, has the wrong number of parts or a
+    malformed container part, is judged inside the scope: it cannot be
+    shown to be elsewhere, and a row the check cannot place is a row it
+    must judge.
     """
     if granted_on not in SCOPED_SOURCE_CLASSES:
         return False
-    parts = _split_identifier(obj) if obj else []
-    need = 1 if granted_on == "DATABASE" else 2
-    if len(parts) < need or not parts[0]:
+    parts = _split_identifier_parts(obj) if obj else []
+    if granted_on == "DATABASE":
+        allowed = (1,)
+    elif granted_on == "SCHEMA":
+        allowed = (2,)
+    elif future:
+        allowed = (2, 3)
+    else:
+        allowed = (3,)
+    if len(parts) not in allowed:
         return False
+    for text, quoted in parts[:-1] or parts[:1]:
+        if not text or (not quoted and text.split() != [text]):
+            return False
     return _database_of(obj) != scope
 
 
@@ -453,17 +572,36 @@ def _escalates(privilege: str) -> bool:
             or privilege.startswith(_ESCALATION_PREFIXES))
 
 
-def _refusal(privilege: str, granted_on: str) -> str | None:
+def _runs_owner(privilege: str, granted_on: str) -> bool:
+    """True for the privilege that runs an owner's-rights object: OPERATE
+    on a task, pipe, alert, dynamic table or service, USAGE of a procedure,
+    notebook or Streamlit app (`EXECUTABLE_CLASSES`)."""
+    return EXECUTABLE_CLASSES.get(granted_on) == privilege
+
+
+def _reaches_past(privilege: str, granted_on: str) -> bool:
+    """True when the privilege's reach is not bounded by the object a row
+    reports it on, so the `database:` scope cannot excuse it: an
+    escalation (`_escalates`), or the run privilege of an owner's-rights
+    object (`_runs_owner`), whose body may write the source from any
+    database. The scope excuses only a write that stays on its object."""
+    return _escalates(privilege) or _runs_owner(privilege, granted_on)
+
+
+def _refusal(privilege: str, granted_on: str, *,
+             outside: bool = False) -> str | None:
     """Why a grant of `privilege` ON a `granted_on` is refused; None when it
-    cannot lead to a write on the source.
+    cannot lead to a write on the source. `outside` says the grant has been
+    placed on another database than the migration's.
 
     A blank class is refused on sight. A non-source class is judged by its
     allowlist; a role class the walk does not follow is refused unwalked;
-    a governance class (policy, tag, network rule) allows reads only; a
-    source class allows the read list, and names an escalation before a
-    write so the refusal says what the privilege reaches. Either way a
-    privilege the check does not know is refused: the burden of proof is
-    on the grant.
+    a governance class (policy, tag, network rule) allows reads only; the
+    run privilege of an owner's-rights object outside the migration's
+    database is refused with the owner named; a source class allows the
+    read list, and names an escalation before a write so the refusal says
+    what the privilege reaches. Either way a privilege the check does not
+    know is refused: the burden of proof is on the grant.
     """
     if not granted_on:
         return _NO_CLASS
@@ -494,6 +632,8 @@ def _refusal(privilege: str, granted_on: str) -> str | None:
         return (f"a {granted_on.lower().replace('_', ' ')} governs "
                 f"{governs}, in whichever database it lives, so owning or "
                 f"changing one is a write on the source")
+    if outside and _runs_owner(privilege, granted_on):
+        return _owners_rights(granted_on, privilege)
     if privilege in READ_PRIVILEGES:
         return None
     if privilege in ESCALATIONS:
@@ -504,16 +644,36 @@ def _refusal(privilege: str, granted_on: str) -> str | None:
 
 
 def _unquote(value) -> str:
+    """A configured name as Snowflake resolves it: a quoted identifier is
+    its text, an unquoted one folds to upper case. For `database:`, which
+    the user types; a name a listing PRINTS is already stored and goes
+    through `_stored_name` instead."""
     text = str(value or "").strip()
     if len(text) >= 2 and text[0] == text[-1] == '"':
         return text[1:-1].replace('""', '"')
     return text.upper()
 
 
+def _stored_name(value) -> str:
+    """A role name as a listing prints it, read as the stored name it is.
+
+    `current_role()`, `current_secondary_roles()`, `SHOW GRANTS TO USER`
+    and a `USAGE on ROLE` row all print the stored name unquoted, and a
+    stored name IS its case: SYSADMIN and a role created as `"sysadmin"`
+    are two roles. So nothing is folded. A quoted name, should a listing
+    ever print one, is read as its text."""
+    text = str(value or "").strip()
+    if len(text) >= 2 and text[0] == text[-1] == '"':
+        return text[1:-1].replace('""', '"')
+    return text
+
+
 def _refuse_system_role(name: str, described: str) -> None:
     """Stop if `name` is a system role. `described` names it and says where
-    in the hierarchy it was found."""
-    if _unquote(name).upper() not in SYSTEM_ROLES:
+    in the hierarchy it was found. The stored name is compared as printed,
+    case-sensitively: exactly SYSADMIN is the system role, `sysadmin` is a
+    role someone created and is walked like any other."""
+    if _stored_name(name) not in SYSTEM_ROLES:
         return
     raise RoleNotReadOnly(
         f"{described} is a system role: what a system role can do is set by "
@@ -586,8 +746,10 @@ def _roles_granted_to_user(run_sql: Callable[..., list], held: list[str]
                 f"provably read-only. {_USER_HELP}")
         if name not in listed:
             listed.append(name)
+    # (exactly PUBLIC, the stored name: a role created as "public" is a
+    #  role the user was granted, and the listing has to name it)
     unnamed = [name for name in held
-               if name not in listed and _unquote(name).upper() != PUBLIC_ROLE]
+               if name not in listed and _stored_name(name) != PUBLIC_ROLE]
     if unnamed:
         raise RoleNotReadOnly(
             f"the grants of user {user} do not name {', '.join(unnamed)}, "
@@ -739,6 +901,19 @@ def read_role_grants(run_sql: Callable[..., list], *,
                         and privilege == "USAGE" and not future):
                     # Another role this one holds: its grants are ours too.
                     sub_kind = INHERITED_ROLE_CLASSES[granted_on]
+                    parts = _split_identifier(obj)
+                    if (len(parts) != (1 if sub_kind == "role" else 2)
+                            or any(not part.strip() for part in parts)):
+                        # A role grant that names no role -- a blank name,
+                        # a blank part (`SALES_DB.""`), or not the parts
+                        # its class prints (NAME for a role, DB.NAME for a
+                        # database role): nothing to walk, so nothing
+                        # proven. Refused, not listed as `""`.
+                        writes.append({"role": held_by, "privilege": privilege,
+                                       "granted_on": granted_on, "name": obj,
+                                       "via": via, "future": future,
+                                       "reason": _NO_ROLE_NAME})
+                        continue
                     sub_sql = _sql_name(obj)
                     if (sub_kind, sub_sql) not in seen:
                         seen.add((sub_kind, sub_sql))
@@ -754,7 +929,13 @@ def read_role_grants(run_sql: Callable[..., list], *,
                                         f"{sub_kind} {obj} (granted to role "
                                         f"{held_by})"))
                     continue
-                reason = _refusal(privilege, granted_on)
+                # Only a grant that can be PLACED on another database is
+                # outside the migration; a blank, short or malformed name,
+                # a class that is not database-contained, a policy or a
+                # tag is judged as inside it.
+                outside = bool(scope) and _outside_scope(
+                    granted_on, obj, scope, future=future)
+                reason = _refusal(privilege, granted_on, outside=outside)
                 if granted_on in NON_SOURCE_CLASSES:
                     # Not a source object: not counted among the source
                     # privileges, refused only when it leads somewhere.
@@ -764,15 +945,14 @@ def read_role_grants(run_sql: Callable[..., list], *,
                                        "via": via, "future": future,
                                        "reason": reason})
                     continue
-                # Only a grant that can be PLACED on another database is
-                # outside the migration; a blank or short name, a class
-                # that is not database-contained, a policy or a tag is
-                # judged as inside it. And only a privilege whose reach
-                # stays on its object is excused there: MANAGE GRANTS
-                # reported ON another database still reaches every grant
-                # in the account, so an escalation is refused in any scope.
-                if (scope and _outside_scope(granted_on, obj, scope)
-                        and not (reason is not None and _escalates(privilege))):
+                # And only a privilege whose reach stays on its object is
+                # excused there: MANAGE GRANTS reported ON another database
+                # still reaches every grant in the account, and OPERATE on
+                # a task there runs its owner's body, which may write the
+                # source -- so an escalation or the run privilege of an
+                # owner's-rights object is refused in any scope.
+                if (outside and not (reason is not None
+                                     and _reaches_past(privilege, granted_on))):
                     if reason is not None:
                         out_of_scope += 1
                     continue

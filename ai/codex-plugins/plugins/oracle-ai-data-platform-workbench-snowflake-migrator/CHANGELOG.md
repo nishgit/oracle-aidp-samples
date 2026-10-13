@@ -97,11 +97,38 @@ migrator Codex plugin, newest first. The format loosely follows
   passes because a created database, even a `CLONE` of the source, is not a
   write on the source (a clone is still a copy of the estate under the
   role's control, so the README asks that it be withheld); `USAGE` on a
-  procedure passes because discovery reads procedure DDL (an owner's-rights
-  procedure is a write the credential could call, so the README asks that
-  none be granted that is not needed).
+  procedure in the migration's database passes because discovery reads
+  procedure DDL (an owner's-rights procedure is a write the credential could
+  call, so the README asks that none be granted that is not needed).
 - `OPERATE` on a task, pipe, alert or dynamic table and `APPLY` on a policy
   or tag count as writes on the source (OPERATE stays a read on a warehouse).
+- The privilege that runs an owner's-rights object is refused in any
+  database: `OPERATE` on a task, pipe, alert, dynamic table or service and
+  `USAGE` of a procedure, notebook or Streamlit app outside `database:`
+  each run a body with its owner's privileges, which the check never reads
+  and which may write the source, so the scope no
+  longer excuses them as writes on another database (and discovery never
+  reads a procedure there). `OWNERSHIP` of such an object in another
+  database stays reported only: it would then run as the read-only role.
+- Placing a grant on another database is strict: the name must have exactly
+  the parts `SHOW GRANTS` prints for its class (`DB`, `DB.SCHEMA`,
+  `DB.SCHEMA.OBJECT`; a future row names its container, two or three) and
+  no whitespace in an unquoted database or schema part; a padded
+  (`SALES_DB .PUBLIC.ORDERS`), two-part or four-part name on a current grant
+  is judged inside the scope rather than excused. An unquoted database part
+  is compared with its whitespace removed.
+- A role grant that names no role -- a null or blank name, a blank part
+  (`SALES_DB.""`), or not the parts its class prints (`NAME` for a role,
+  `DB.NAME` for a database role) -- is refused rather than listed as
+  `show grants to role ""`.
+- System-role names are compared with the stored name, case-sensitively:
+  `current_role()`, the user listing and `SHOW GRANTS` print a stored name
+  unquoted, and Snowflake stores an unquoted identifier in upper case, so
+  exactly `SYSADMIN` is the system role and a distinct role created as
+  `"sysadmin"` is no longer refused as one -- it is walked and judged by
+  its grants like any other role (a false refusal before this change).
+  The same holds for `PUBLIC`: a role created as `"public"` is a role the
+  user was granted, and the user listing has to name it.
 - `init-config` no longer says the config "will hold live credentials": it
   names the credential files, and those are what to keep out of git and chat.
 - `preflight`, every stage and `PROVISION.md` print the credential's source

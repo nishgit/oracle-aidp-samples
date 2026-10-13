@@ -111,7 +111,9 @@ Rules that come with the credential files, and they are not optional:
   ALTER, DROP, INSERT, UPDATE, DELETE, MERGE, TRUNCATE or OWNERSHIP on the
   source database, a privilege that leads to a write (MANAGE GRANTS on the
   account, OWNERSHIP of a role, user, policy or tag, CREATE ROLE, EXECUTE
-  TASK, an APPLY ... POLICY privilege — wherever a row reports it), a system
+  TASK, an APPLY ... POLICY privilege — wherever a row reports it), the
+  privilege that runs an owner's-rights object in another database (OPERATE
+  on a task, pipe, alert or dynamic table, USAGE of a procedure there), a system
   role such as SYSADMIN or ACCOUNTADMIN anywhere in its hierarchy or granted
   to the user, a privilege the check does not know, or if the grants cannot
   be read or the user's listing does not name the role the session runs as.

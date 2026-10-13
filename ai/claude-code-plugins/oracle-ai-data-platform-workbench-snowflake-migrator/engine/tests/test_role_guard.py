@@ -702,12 +702,30 @@ def test_a_session_whose_own_role_is_a_system_role_is_refused_unlisted():
         assert_role_read_only(cur, database="SALES_DB")
 
 
-def test_a_system_role_name_is_matched_case_insensitively():
-    cur = FakeCursor(READ_ONLY + [_grant("USAGE", "ROLE", "sysadmin")],
-                     by_role={"sysadmin": []})
-    with pytest.raises(RoleNotReadOnly, match="role sysadmin, granted .*is a "
-                                              "system role"):
-        assert_role_read_only(cur, database="SALES_DB")
+def test_a_system_role_name_is_matched_against_the_stored_name():
+    """SHOW GRANTS prints a role's STORED name unquoted, and a stored name
+    is its case: `GRANT ROLE SYSADMIN` lists `SYSADMIN`, while a role
+    created as `"sysadmin"` lists `sysadmin` and is a different role. So
+    the inherited lower-case role is not the system role: it is walked
+    and judged by what it holds (it used to be refused unwalked)."""
+    clean = FakeCursor(READ_ONLY + [_grant("USAGE", "ROLE", "sysadmin")],
+                       by_role={"sysadmin": []})
+    evidence = assert_role_read_only(clean, database="SALES_DB")
+    assert evidence["read_only"] is True
+    assert "role sysadmin" in evidence["inherited_roles"]
+    assert 'show grants to role "sysadmin"' in clean.calls, "walked"
+    dirty = FakeCursor(READ_ONLY + [_grant("USAGE", "ROLE", "sysadmin")],
+                       by_role={"sysadmin": [
+                           _grant("INSERT", "TABLE", "SALES_DB.PUBLIC.ORDERS")]})
+    with pytest.raises(RoleNotReadOnly, match="INSERT on TABLE .*via sysadmin"):
+        assert_role_read_only(dirty, database="SALES_DB")
+    # ...while the stored upper-case name is the system role, quoted or not.
+    for listed in ("SYSADMIN", '"SYSADMIN"', " SYSADMIN "):
+        cur = FakeCursor(READ_ONLY + [_grant("USAGE", "ROLE", listed)],
+                         by_role={"SYSADMIN": []})
+        with pytest.raises(RoleNotReadOnly, match="is a system role"):
+            assert_role_read_only(cur, database="SALES_DB")
+        assert not any('"SYSADMIN"' in c for c in cur.calls), "never listed"
 
 
 # --- future grants: a write on every object created later -------------------
@@ -1106,3 +1124,261 @@ def test_monitor_on_a_user_passes_and_anything_else_on_one_does_not():
     cur = FakeCursor(READ_ONLY + [_grant("APPLYBUDGET", "USER", "SVC")])
     with pytest.raises(RoleNotReadOnly, match="APPLYBUDGET on USER SVC"):
         assert_role_read_only(cur, database="SALES_DB")
+
+
+# --- owner's-rights objects: the run privilege reaches past the object ----
+
+@pytest.mark.parametrize("granted_on,name", [
+    ("TASK", "OTHER_DB.S.T"),
+    ("PIPE", "OTHER_DB.S.P"),
+    ("ALERT", "OTHER_DB.S.A"),
+    ("DYNAMIC_TABLE", "OTHER_DB.S.DT"),
+    ("DYNAMIC TABLE", "OTHER_DB.S.DT"),             # class with a space
+    ("SERVICE", "OTHER_DB.S.SVC"),
+    ("task", "OTHER_DB.S.T"),                       # folded class
+    ("TASK", '"other_db"."s"."t"'),                 # quoted, other case
+])
+def test_operate_on_a_task_in_another_database_is_refused(granted_on, name):
+    """A task runs with its OWNER's privileges, and OPERATE is what runs it
+    (EXECUTE TASK, ALTER TASK ... RESUME); the same for a pipe's REFRESH or
+    resume, an alert's, a dynamic table's or a service's refresh or resume.
+    What the body does is set by the owner's grants, which the check never
+    reads, so a task in OTHER_DB owned by a privileged role whose body
+    writes SALES_DB is a source write the session can trigger, and the
+    `database:` scope must not excuse it as a write on another database.
+    It used to: out_of_scope_writes=1, PASS."""
+    cur = FakeCursor(LEGITIMATE + [_grant("OPERATE", granted_on, name)])
+    with pytest.raises(RoleNotReadOnly) as caught:
+        assert_role_read_only(cur, database="SALES_DB")
+    message = str(caught.value)
+    assert f"OPERATE on {granted_on.upper().replace(' ', '_')} {name}" in message
+    assert "OWNER's privileges" in message
+    assert "other databases" not in message
+    evidence = read_role_grants(cur, database="SALES_DB")
+    assert evidence["read_only"] is False
+    assert evidence["out_of_scope_writes"] == 0
+    # ...and in the source database or with no scope it is a write as before.
+    with pytest.raises(RoleNotReadOnly, match="OPERATE on"):
+        assert_role_read_only(cur)
+    on_source = FakeCursor(LEGITIMATE + [
+        _grant("OPERATE", granted_on, "SALES_DB.PUBLIC.X")])
+    with pytest.raises(RoleNotReadOnly, match="OPERATE on"):
+        assert_role_read_only(on_source, database="SALES_DB")
+
+
+def test_owning_or_monitoring_a_task_in_another_database_stays_bounded():
+    """The contrast: OWNERSHIP of a task in OTHER_DB is a write on that
+    task, and a task the role owns runs with the role's own privileges --
+    the ones this check is proving read-only -- so the scope still only
+    reports it; MONITOR on it is a read anywhere."""
+    cur = FakeCursor(LEGITIMATE + [_grant("OWNERSHIP", "TASK", "OTHER_DB.S.T"),
+                                   _grant("OWNERSHIP", "PIPE", "OTHER_DB.S.P"),
+                                   _grant("MONITOR", "TASK", "OTHER_DB.S.T"),
+                                   _grant("MONITOR", "PIPE", "OTHER_DB.S.P")])
+    evidence = assert_role_read_only(cur, database="SALES_DB")
+    assert evidence["read_only"] is True
+    assert evidence["out_of_scope_writes"] == 2
+
+
+@pytest.mark.parametrize("granted_on,name", [
+    ("PROCEDURE", "OTHER_DB.S.LOAD(VARCHAR)"),
+    ("PROCEDURE", "OTHER_DB.S.LOAD(VARCHAR, NUMBER)"),
+    ("PROCEDURE", '"other_db"."s"."Load"(VARCHAR)'),
+    ("NOTEBOOK", "OTHER_DB.S.NB"),
+    ("STREAMLIT", "OTHER_DB.S.APP"),
+])
+def test_usage_of_a_procedure_outside_the_migration_database_is_refused(
+        granted_on, name):
+    """Discovery reads procedure DDL only inside `database:`, so USAGE of a
+    procedure in another database serves nothing -- and an owner's-rights
+    procedure there whose body writes SALES_DB is one CALL away. It used to
+    pass as a plain read, not even counted among the out-of-scope rows."""
+    cur = FakeCursor(LEGITIMATE + [_grant("USAGE", granted_on, name)])
+    with pytest.raises(RoleNotReadOnly) as caught:
+        assert_role_read_only(cur, database="SALES_DB")
+    message = str(caught.value)
+    assert f"USAGE on {granted_on} {name}" in message
+    assert "OWNER's privileges" in message and "call" in message
+    assert "other databases" not in message
+    evidence = read_role_grants(cur, database="SALES_DB")
+    assert evidence["read_only"] is False
+    assert evidence["out_of_scope_writes"] == 0
+
+
+@pytest.mark.parametrize("database", ["SALES_DB", "sales_db", None])
+def test_usage_of_a_procedure_the_discovery_reads_still_passes(database):
+    """In the migration's database, or with no scope, discovery needs the
+    procedure DDL and USAGE passes as before (the README asks that no
+    procedure be granted that is not needed)."""
+    cur = FakeCursor(LEGITIMATE + [
+        _grant("USAGE", "PROCEDURE", "SALES_DB.PUBLIC.P(VARCHAR, NUMBER)"),
+        _grant("USAGE", "NOTEBOOK", "SALES_DB.PUBLIC.NB"),
+        _grant("USAGE", "STREAMLIT", "SALES_DB.PUBLIC.APP"),
+        _grant("MONITOR", "TASK", "SALES_DB.PUBLIC.T"),
+        _grant("MONITOR", "PIPE", "SALES_DB.PUBLIC.P")])
+    evidence = assert_role_read_only(cur, database=database)
+    assert evidence["read_only"] is True
+    assert evidence["out_of_scope_writes"] == 0
+
+
+# --- placing a grant is strict: a malformed name is judged inside ---------
+
+@pytest.mark.parametrize("name", [
+    "SALES_DB .PUBLIC.ORDERS",      # space after the database part
+    " SALES_DB.PUBLIC.ORDERS",      # leading space
+    "SALES_DB\t.PUBLIC.ORDERS",     # tab in the database part
+    "SALES _DB.PUBLIC.ORDERS",      # space inside the database part
+    "sales_db .public.orders",      # lower case, padded
+    "OTHER_DB. PUBLIC.ORDERS",      # space in the schema part
+    "OTHER _DB.PUBLIC.ORDERS",      # malformed database part, other name
+])
+def test_a_padded_unquoted_name_part_is_not_another_database(name):
+    """An unquoted identifier cannot contain whitespace, so a row whose
+    database or schema part does is malformed and cannot be placed: it is
+    judged inside the scope. `SALES_DB .PUBLIC.ORDERS` used to compare as
+    `SALES_DB ` != `SALES_DB` and be excused as another database."""
+    cur = FakeCursor(LEGITIMATE + [_grant("INSERT", "TABLE", name)])
+    with pytest.raises(RoleNotReadOnly, match="INSERT on TABLE"):
+        assert_role_read_only(cur, database="SALES_DB")
+    evidence = read_role_grants(cur, database="SALES_DB")
+    assert evidence["out_of_scope_writes"] == 0
+
+
+def test_a_quoted_name_part_may_contain_whitespace():
+    """A quoted identifier IS its text, spaces included: `"SALES DB"` is a
+    database that can be placed, inside or outside the scope as written."""
+    cur = FakeCursor(LEGITIMATE + [_grant("INSERT", "TABLE",
+                                          '"SALES DB"."PUBLIC"."ORDERS"')])
+    with pytest.raises(RoleNotReadOnly, match="INSERT on TABLE"):
+        assert_role_read_only(cur, database='"SALES DB"')
+    evidence = assert_role_read_only(cur, database="SALES_DB")
+    assert evidence["read_only"] is True
+    assert evidence["out_of_scope_writes"] == 1
+
+
+@pytest.mark.parametrize("granted_on,name", [
+    ("TABLE", "OTHER_DB.ORDERS"),           # two parts on a three-part class
+    ("TABLE", "OTHER_DB.S.T.EXTRA"),        # four parts
+    ("VIEW", "OTHER_DB.V"),
+    ("FUNCTION", "OTHER_DB.F(VARCHAR)"),
+    ("SCHEMA", "OTHER_DB.S.X"),             # three parts on a two-part class
+    ("DATABASE", "OTHER_DB.S"),             # two parts on a one-part class
+])
+def test_a_current_grant_with_the_wrong_number_of_name_parts_is_judged_inside(
+        granted_on, name):
+    """SHOW GRANTS always prints DB.SCHEMA.OBJECT for a table, DB.SCHEMA
+    for a schema and DB for a database; a current grant whose name has
+    another number of parts is malformed and cannot be placed with
+    confidence. `INSERT on TABLE OTHER_DB.ORDERS` used to be placed by its
+    first part and excused."""
+    cur = FakeCursor(LEGITIMATE + [_grant("INSERT", granted_on, name)])
+    with pytest.raises(RoleNotReadOnly, match="INSERT on"):
+        assert_role_read_only(cur, database="SALES_DB")
+    evidence = read_role_grants(cur, database="SALES_DB")
+    assert evidence["out_of_scope_writes"] == 0
+
+
+def test_a_future_grant_names_its_container_and_is_still_placed():
+    """A future grant is printed on the container the objects will be
+    created in -- `DB.<TABLE>` at database level, `DB.S.<TABLE>` at schema
+    level -- so two or three parts place it; a current grant needs three."""
+    cur = FakeCursor(LEGITIMATE, future_by_role={"READER": [
+        _future("INSERT", "TABLE", "OTHER_DB.<TABLE>"),
+        _future("INSERT", "TABLE", "OTHER_DB.S.<TABLE>"),
+        _future("CREATE TABLE", "SCHEMA", "OTHER_DB.<SCHEMA>")]})
+    evidence = assert_role_read_only(cur, database="SALES_DB")
+    assert evidence["read_only"] is True
+    assert evidence["out_of_scope_writes"] == 3
+    # ...a future row with a malformed container part is judged inside too.
+    padded = FakeCursor(LEGITIMATE, future_by_role={"READER": [
+        _future("INSERT", "TABLE", "SALES_DB .<TABLE>")]})
+    with pytest.raises(RoleNotReadOnly, match="future INSERT on TABLE"):
+        assert_role_read_only(padded, database="SALES_DB")
+
+
+# --- a role grant that names no role is refused, not listed as "" ---------
+
+@pytest.mark.parametrize("granted_on,name", [
+    ("ROLE", None), ("ROLE", ""), ("ROLE", "   "), ("ROLE", '""'),
+    ("ROLE", '"".""'), ("ROLE", '" "'),
+    ("ROLE", "A.B"),                        # two parts on a one-part class
+    ("DATABASE_ROLE", None), ("DATABASE_ROLE", ""), ("DATABASE_ROLE", '""'),
+    ("DATABASE_ROLE", 'SALES_DB.""'),       # a blank part
+    ("DATABASE_ROLE", "SALES_DB."), ("DATABASE_ROLE", ".WRITER"),
+    ("DATABASE_ROLE", "WRITER"),            # one part on a two-part class
+    ("DATABASE_ROLE", "SALES_DB.S.WRITER"), # three parts
+])
+def test_a_role_grant_that_names_no_role_is_refused_unlisted(granted_on, name):
+    """`USAGE on ROLE` with a blank name used to issue `show grants to role
+    ""`, which errors on Snowflake (fail closed) but walks nothing on a
+    lenient cursor and passes. A name that is blank, has a blank part or
+    does not have the parts its class prints (NAME, DB.NAME) names no
+    role, so the row is refused as such and nothing is listed for it."""
+    cur = FakeCursor(LEGITIMATE + [{"privilege": "USAGE",
+                                    "granted_on": granted_on, "name": name}])
+    with pytest.raises(RoleNotReadOnly, match="names no role"):
+        assert_role_read_only(cur, database="SALES_DB")
+    assert not any('""' in c for c in cur.calls), cur.calls
+    assert not any(c.lower().startswith("show grants to database role")
+                   for c in cur.calls), cur.calls
+    assert len([c for c in cur.calls
+                if c.lower().startswith("show grants to role")]) == 2, \
+        "READER and PUBLIC only"
+    evidence = read_role_grants(cur, database="SALES_DB")
+    assert evidence["read_only"] is False
+    assert evidence["write_grants"][0]["granted_on"] == granted_on
+    assert "names no role" in evidence["write_grants"][0]["reason"]
+
+
+# --- a system role is the STORED name; "sysadmin" is someone's role --------
+
+@pytest.mark.parametrize("where", ["session", "secondary", "user"])
+def test_a_role_created_as_quoted_lower_case_sysadmin_is_not_a_system_role(
+        where):
+    """`CREATE ROLE "sysadmin"` makes a role distinct from SYSADMIN, and
+    `current_role()`, `current_secondary_roles()` and the user listing all
+    print its stored name, `sysadmin`, unquoted. It used to be refused as
+    a system role because the comparison folded it to upper case; it is a
+    role like any other, read-only when its grants are."""
+    if where == "session":
+        cur = FakeCursor(LEGITIMATE, role="sysadmin", user_roles=["sysadmin"])
+    elif where == "secondary":
+        cur = FakeCursor(LEGITIMATE, secondary="sysadmin",
+                         user_roles=["READER", "sysadmin"])
+    else:
+        cur = FakeCursor(LEGITIMATE, user_roles=["READER", "sysadmin"])
+    evidence = assert_role_read_only(cur, database="SALES_DB")
+    assert evidence["read_only"] is True
+    assert 'show grants to role "sysadmin"' in cur.calls, "walked, not refused"
+    # ...its grants are judged, so a write it holds still refuses the session.
+    dirty = FakeCursor(LEGITIMATE, role="sysadmin", user_roles=["sysadmin"],
+                       by_role={"sysadmin": LEGITIMATE + [
+                           _grant("INSERT", "TABLE", "SALES_DB.PUBLIC.ORDERS")]})
+    with pytest.raises(RoleNotReadOnly, match="INSERT on TABLE"):
+        assert_role_read_only(dirty, database="SALES_DB")
+    # ...and the stored upper-case name is the system role wherever it is.
+    for upper in (FakeCursor(LEGITIMATE, role="SYSADMIN",
+                             user_roles=["SYSADMIN"]),
+                  FakeCursor(LEGITIMATE, secondary="SYSADMIN",
+                             user_roles=["READER", "SYSADMIN"]),
+                  FakeCursor(LEGITIMATE, user_roles=["READER", "SYSADMIN"])):
+        with pytest.raises(RoleNotReadOnly, match="SYSADMIN.*is a system role"):
+            assert_role_read_only(upper, database="SALES_DB")
+        assert not any('"SYSADMIN"' in c for c in upper.calls), "never listed"
+    # ...while a role whose name merely contains one is not a system role.
+    assert assert_role_read_only(
+        FakeCursor(LEGITIMATE, role="SYSADMIN_READER",
+                   user_roles=["SYSADMIN_READER"]),
+        database="SALES_DB")["read_only"]
+
+
+def test_a_session_running_as_a_role_named_public_in_lower_case_is_a_user_role():
+    """PUBLIC is the one role no user listing names, so a session running
+    as PUBLIC is excused from finding it there. A role created as
+    `"public"` is not PUBLIC: the user was granted it, the listing names
+    it, and a listing that does not is cut or filtered."""
+    cur = FakeCursor(LEGITIMATE, role="public", user_roles=["public"])
+    assert assert_role_read_only(cur, database="SALES_DB")["read_only"]
+    cut = FakeCursor(LEGITIMATE, role="public", user_rows=[])
+    with pytest.raises(RoleNotReadOnly, match="do not name public"):
+        assert_role_read_only(cut, database="SALES_DB")
