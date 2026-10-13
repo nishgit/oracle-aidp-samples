@@ -315,6 +315,15 @@ _SHUTIL_FS_ATTRS = frozenset({"move", "copy", "copy2", "copyfile", "copytree"})
 _PATHLIB_IO_ATTRS = frozenset({"read_text", "read_bytes", "write_text", "write_bytes"})
 _PATHLIB_FS_ATTRS = frozenset({"unlink", "rmdir", "mkdir", "touch", "symlink_to", "hardlink_to"})
 _PATHLIB_RESOLVED_ONLY_ATTRS = frozenset({"open", "rename", "replace"})   # too generic without a Path receiver
+# The pathlib classes, the steps that keep the path a Path(..) was built from
+# (judged on that literal), the steps that derive another Path from one (an
+# unresolvable Path: fail closed) and the Path-valued classmethods.
+_PATH_CLASSES = frozenset({"Path", "PurePath", "PosixPath", "WindowsPath", "PurePosixPath", "PureWindowsPath"})
+_PATH_IDENTITY_STEPS = frozenset({"resolve", "absolute", "expanduser"})
+_PATH_DERIVED_STEPS = frozenset({"parent", "parents", "joinpath", "with_name", "with_suffix", "with_stem",
+                                 "with_segments", "relative_to", "readlink", "rename", "replace",
+                                 "iterdir", "glob", "rglob", "walk"})
+_PATH_CLASS_CTORS = frozenset({"cwd", "home"})
 _DYNAMIC_BUILTINS = frozenset({"eval", "exec", "compile", "__import__", "breakpoint"})
 _INTROSPECT_BUILTINS = frozenset({"getattr", "vars"})
 _MUTATE_BUILTINS = frozenset({"setattr", "delattr"})
@@ -1024,6 +1033,12 @@ class ScanContext:
     # Names bound once to an in-memory buffer / writer handle (``buf = io.StringIO()``,
     # ``with pd.ExcelWriter(p) as w``): a non-path argument for the frame writers.
     handles: Set[str] = field(default_factory=set)
+    # Names bound to a pathlib.Path value (``Path(..)``, a Path-returning step on
+    # one, ``Path.cwd()`` / ``Path.home()``, an ``iterdir`` / ``glob`` loop target,
+    # a Path-annotated parameter): the node when bound once at module level,
+    # ``None`` when the gate cannot resolve the path (rebound, loop / parameter).
+    # ``.open`` / ``.rename`` / ``.replace`` on such a name are Path operations.
+    paths: Dict[str, Optional[ast.AST]] = field(default_factory=dict)
 
     def forget(self, name: str) -> None:
         """``name`` is (re)bound in the current cell: drop what it stood for."""
@@ -1034,6 +1049,7 @@ class ScanContext:
         self.functions.discard(name)
         self.rdd_names.discard(name)
         self.handles.discard(name)
+        self.paths.pop(name, None)
         self.constants[name] = None
 
     def is_bound(self, name: str) -> bool:
@@ -1403,6 +1419,30 @@ class _PolicyScanner(ast.NodeVisitor):
                     if isinstance(elt, ast.Name):
                         self.ctx.tainted.add(elt.id)
 
+        # Names bound anywhere in the cell to a pathlib.Path value (``q = Path(p).resolve()``,
+        # ``for f in Path(d).iterdir()``, ``def run(src: Path)``): ``q.open()`` / ``.rename()``
+        # / ``.replace()`` on them are Path operations whatever else the name was, so the
+        # three generic method names cannot slip through as str / DataFrame / zip methods.
+        path_tainted: Set[str] = set()
+
+        def path_taint(target: ast.AST) -> None:
+            for elt in (target.elts if isinstance(target, (ast.Tuple, ast.List)) else [target]):
+                if isinstance(elt, ast.Name):
+                    path_tainted.add(elt.id)
+                    self.ctx.paths.setdefault(elt.id, None)
+
+        def path_assignment(targets: Sequence[ast.AST], value: Optional[ast.AST]) -> None:
+            if value is None:
+                return
+            for t in targets:
+                if isinstance(t, (ast.Tuple, ast.List)) and isinstance(value, ast.Tuple) \
+                        and len(t.elts) == len(value.elts):
+                    for elt, val in zip(t.elts, value.elts):        # a, b = Path(x), Path(y)
+                        if self._path_receiver(val)[0]:
+                            path_taint(elt)
+                elif self._path_receiver(value)[0]:
+                    path_taint(t)
+
         defined: Set[str] = set()
         # Names read in any position other than the operand of ``sep.join(name)``:
         # a list literal bound to such a name may have been mutated in place
@@ -1422,6 +1462,11 @@ class _PolicyScanner(ast.NodeVisitor):
                     defined.add(node.name)
             elif isinstance(node, ast.arg):
                 bind(node.arg)
+                if node.annotation is not None and self._is_path_class(node.annotation):
+                    path_taint(ast.Name(id=node.arg, ctx=ast.Store()))      # def run(src: Path)
+            elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
+                if self._path_receiver(node.iter)[0]:
+                    path_taint(node.target)                                 # for f in Path(d).iterdir()
             elif isinstance(node, ast.Import):
                 for alias in node.names:
                     local = alias.asname or _module_root(alias.name)
@@ -1443,10 +1488,16 @@ class _PolicyScanner(ast.NodeVisitor):
                     bind(n)
             elif isinstance(node, ast.Assign):
                 taint_assignment(node.targets, node.value)
+                path_assignment(node.targets, node.value)
             elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)):
                 taint_assignment([node.target], node.value)
+                path_assignment([node.target], node.value)
+                if isinstance(node, ast.AnnAssign) and self._is_path_class(node.annotation):
+                    path_taint(node.target)                                 # p: Path = ..
         for name in bound:
             self.ctx.forget(name)
+        for name in path_tainted:
+            self.ctx.paths[name] = None       # a Path the gate cannot resolve until bound once below
         self.ctx.functions.update(n for n in defined if bound.get(n, 0) == 1)
         for node in _module_level_statements(tree):
             if isinstance(node, ast.Import):
@@ -1508,6 +1559,10 @@ class _PolicyScanner(ast.NodeVisitor):
                         self.ctx.rdd_names.add(name)         # rdd = sc.parallelize(..).map(..)
                     if self._is_write_handle_ctor(node.value):
                         self.ctx.handles.add(name)           # buf = io.StringIO()
+                if self._path_receiver(node.value)[0]:
+                    # q = Path(p).resolve() / Path('/etc') / 'x' / Path.home(): the name is that
+                    # Path; its literal (if any) is folded where q.open() / .rename() is judged
+                    self.ctx.paths[name] = node.value
             elif isinstance(node, (ast.With, ast.AsyncWith)):
                 for item in node.items:
                     target = item.optional_vars
@@ -1582,14 +1637,72 @@ class _PolicyScanner(ast.NodeVisitor):
     def _chain(self, node: ast.AST) -> List[str]:
         return self.ctx.resolve(_attr_chain(node))
 
+    def _is_path_class(self, node: Optional[ast.AST]) -> bool:
+        """``Path`` / ``pathlib.Path`` / ``PurePosixPath`` .. (also through an alias)."""
+        if not isinstance(node, (ast.Name, ast.Attribute)):
+            return False
+        chain = self._chain(node)
+        return bool(chain) and chain[-1] in _PATH_CLASSES and (len(chain) == 1 or chain[0] == "pathlib")
+
     def _path_ctor_arg(self, node: ast.AST) -> Optional[ast.AST]:
         """``Path("x")`` / ``pathlib.Path("x")`` -> the path argument node."""
-        if isinstance(node, ast.Call):
-            chain = self._chain(node.func)
-            if chain and chain[-1] in ("Path", "PurePath", "PosixPath") and \
-                    (len(chain) == 1 or chain[0] == "pathlib"):
-                return _first_arg(node, ()) if node.args else None
+        if isinstance(node, ast.Call) and self._is_path_class(node.func):
+            return _first_arg(node, ()) if node.args else None
         return None
+
+    def _path_receiver(self, node: Optional[ast.AST],
+                       seen: Optional[Set[str]] = None) -> Tuple[bool, Optional[ast.AST]]:
+        """Is ``node`` a ``pathlib.Path`` value, and which constructor argument fixes its path?
+
+        ``(True, arg)``: ``Path(arg)``, or ``.resolve()`` / ``.absolute()`` /
+        ``.expanduser()`` (on an absolute literal) on one, directly or through a
+        name bound once to it: the path is judged on ``arg``.
+        ``(True, None)``: a Path whose path the gate cannot resolve: ``Path()`` /
+        ``Path.cwd()`` / ``Path.home()``, ``.parent`` / ``.parents[i]`` /
+        ``.joinpath()`` / ``.with_name()`` / ``Path(..) / x`` / .., a rebound or
+        loop-bound name, a Path-annotated parameter (fail closed).
+        ``(False, None)``: not a Path the gate can see.
+        """
+        if node is None:
+            return False, None
+        if isinstance(node, ast.Name):
+            if node.id in self.ctx.paths:
+                bound = self.ctx.paths[node.id]
+                seen = set() if seen is None else seen
+                if bound is None or node.id in seen:
+                    return True, None
+                seen.add(node.id)
+                return self._path_receiver(bound, seen)
+            bound = self.ctx.constants.get(node.id)          # P = Path('/x') is also a constant
+            arg = self._path_ctor_arg(bound) if bound is not None else None
+            return (True, arg) if arg is not None else (False, None)
+        if isinstance(node, ast.Call):
+            if self._is_path_class(node.func):
+                return True, (_first_arg(node, ()) if node.args else None)   # Path(x) / Path()
+            if isinstance(node.func, ast.Attribute):
+                attr = node.func.attr
+                if attr in _PATH_CLASS_CTORS and self._is_path_class(node.func.value):
+                    return True, None                                        # Path.cwd() / Path.home()
+                if attr in _PATH_IDENTITY_STEPS or attr in _PATH_DERIVED_STEPS:
+                    is_path, arg = self._path_receiver(node.func.value, seen)
+                    if not is_path:
+                        return False, None
+                    if attr in _PATH_DERIVED_STEPS:
+                        return True, None                                    # Path(x).joinpath(y) / .with_name(..)
+                    if attr == "expanduser":
+                        lit = self._resolve_literal(arg) if arg is not None else None
+                        if lit is None or lit.startswith("~"):
+                            return True, None                                # Path('~u/x').expanduser(): the home is unknown
+                    return True, arg                                         # Path(x).resolve() / .absolute()
+            return False, None
+        if isinstance(node, ast.Attribute) and node.attr in _PATH_DERIVED_STEPS:
+            return (True, None) if self._path_receiver(node.value, seen)[0] else (False, None)   # Path(x).parent
+        if isinstance(node, ast.Subscript):
+            return (True, None) if self._path_receiver(node.value, seen)[0] else (False, None)   # Path(x).parents[1]
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+            if self._path_receiver(node.left, seen)[0] or self._path_receiver(node.right, seen)[0]:
+                return True, None                                            # Path('/etc') / 'passwd'
+        return False, None
 
     def _is_protected_root(self, chain: Sequence[str]) -> bool:
         """Interpreter / compat / shim roots (after alias resolution)."""
@@ -2824,12 +2937,14 @@ class _PolicyScanner(ast.NodeVisitor):
         receiver = node.func.value if isinstance(node.func, ast.Attribute) else None
         if receiver is None:
             return False
-        path_arg = self._path_ctor_arg(receiver)
-        if path_arg is None and isinstance(receiver, ast.Name):
-            bound = self.ctx.constants.get(receiver.id)
-            path_arg = self._path_ctor_arg(bound) if bound is not None else None
+        # Any receiver rooted at a Path (constructor, Path-returning step, Path.cwd() /
+        # home(), a name bound to one) is a Path: a literal the identity steps keep is
+        # judged, everything else is an unresolvable path and fails closed. Only a
+        # receiver that is not a Path at all leaves .open / .rename / .replace to the
+        # generic (str / DataFrame / zip member) handling.
+        is_path, path_arg = self._path_receiver(receiver)
         resolved_receiver = path_arg is not None
-        if attr in _PATHLIB_RESOLVED_ONLY_ATTRS and not resolved_receiver:
+        if attr in _PATHLIB_RESOLVED_ONLY_ATTRS and not is_path:
             return False  # str.replace / df.rename / zipfile.open ... not a path operation
         call_name = f"Path.{attr}()"
         if attr in _PATHLIB_IO_ATTRS or attr == "open":

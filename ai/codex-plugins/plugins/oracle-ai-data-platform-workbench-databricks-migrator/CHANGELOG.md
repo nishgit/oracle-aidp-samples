@@ -261,6 +261,29 @@ All notable changes to this plugin are documented here. Format loosely follows [
   `AIDP_SANDBOX_ALLOW_NETWORK=1` lifts all of it. The three gap cells are in the test suite
   verbatim with per-class refused and allowed cells; the new tests fail against the 26a717b
   scanner, and the probe files (now 225 refused / 62 allowed cells) are green.
+- **Sandbox gate: `Path.open()` / `.rename()` / `.replace()` on a derived Path receiver was
+  fail-open** (regression review on a069dd6; present since d877d90). `_check_pathlib` only
+  recognised a Path receiver on the bare constructor (`Path(x).open()`) or a name bound once to
+  one, so `Path(p).resolve().open('r')`, `q = Path(p).resolve(); q.open('r')`,
+  `Path(p).parent.open('r')`, `Path('/etc/passwd').resolve() / .absolute() / .expanduser()
+  .open()`, `(Path('/etc') / 'passwd').open('r')`, `Path('/etc').joinpath('passwd').open('r')`,
+  `Path(..).with_name('shadow').open()`, `Path('/etc/cron.d/job').absolute().open('w')`,
+  `Path('/etc/passwd').absolute().rename('/tmp/x')`, `Path('/tmp/x').absolute()
+  .replace('/etc/passwd')` and `Path(p).resolve().rename(t)` fell through to the generic
+  `<object>.open(path)` rule, which read the MODE string as the path and allowed the call
+  (`.read_text()` / `.write_text()` on the same chains were already refused). Every receiver
+  rooted at a Path is now a Path: the identity steps (`.resolve()` / `.absolute()` /
+  `.expanduser()` on an absolute literal) keep the constructor literal and are judged on it
+  (`NBP-OPEN-PATH` / `NBP-FS-PATH`); a derived Path (`.parent` / `.parents[i]` / `.joinpath()` /
+  `.with_name()` / `.with_suffix()` / `Path(..) / x`), `Path()` / `Path.cwd()` / `Path.home()`,
+  `.expanduser()` on a `~` literal, a `Path`-annotated parameter, an `iterdir` / `glob` loop or
+  comprehension target and a name bound to any of these (bound once, rebound, or in an earlier
+  cell through `ScanContext.paths`) is an unresolvable Path and fails closed (`NBP-OPEN-DYNAMIC`
+  / `NBP-FS-DYNAMIC`) in every mode. Only a receiver that is not a Path at all (`str.replace`,
+  `df.rename`, `zf.open(member)`, `fs.open(p)`) reaches the generic rule. The thirteen review
+  cells are in the test suite verbatim with the rest of the class (REVIEW_GAP_CELLS_6, a
+  cross-cell test, CLEAN_CELLS_9 for the adjacent everyday code); 40 of the new cases fail
+  against the a069dd6 scanner, and the probe files (now 253 refused / 62 allowed cells) are green.
 - Python 3.9 floor: `cluster_lifecycle.py` and `fuse_package_analyzer.py` used PEP 604
   `X | None` annotations evaluated at import time; `from __future__ import annotations` added.
 - **Secrets shim is Vault-only by default** (`engine/aidp_compat/secrets.py`,

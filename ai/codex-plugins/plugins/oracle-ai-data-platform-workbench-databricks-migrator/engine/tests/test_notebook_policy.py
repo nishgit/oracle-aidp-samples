@@ -2310,3 +2310,114 @@ CLEAN_CELLS_8 = [
 @pytest.mark.parametrize("source", CLEAN_CELLS_8, ids=[c[:40] for c in CLEAN_CELLS_8])
 def test_coverage_round3_adjacent_everyday_code_passes_the_gate(source):
     assert npol.scan_source(source, policy=REVIEW_POLICY) == []
+
+
+# Regression review on a069dd6: Path.open() / .rename() / .replace() on a Path the gate
+# did not recognise as one (a Path-returning step, a derived Path, a name bound to either)
+# fell through to the generic <object>.open(path) rule, which read the MODE string as the
+# path and allowed the call. Every receiver rooted at a Path is a Path: the identity steps
+# keep the constructor literal (judged as NBP-OPEN-PATH / NBP-FS-PATH), everything else is
+# an unresolvable path and fails closed (NBP-OPEN-DYNAMIC / NBP-FS-DYNAMIC) in every mode.
+# The reviewer's thirteen cells come first, verbatim.
+REVIEW_GAP_CELLS_6 = [
+    ("from pathlib import Path\nPath(p).resolve().open('r')", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\nq = Path(p).resolve()\nq.open('r')", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\nPath(p).parent.open('r')", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\nPath('/etc/passwd').resolve().open()", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("from pathlib import Path\nPath('/etc/passwd').absolute().open('r')", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("from pathlib import Path\nPath('/etc/passwd').expanduser().open('r')", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("from pathlib import Path\n(Path('/etc') / 'passwd').open('r')", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\nPath('/etc').joinpath('passwd').open('r')", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\nPath('/etc/passwd').with_name('shadow').open()", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\nwith Path('/etc/cron.d/job').absolute().open('w') as f:\n    f.write('x')",
+     "NBP-OPEN-PATH", "/etc/cron.d/job"),
+    ("from pathlib import Path\nPath('/etc/passwd').absolute().rename('/tmp/x')", "NBP-FS-PATH", "/etc/passwd"),
+    ("from pathlib import Path\nPath('/tmp/x').absolute().replace('/etc/passwd')", "NBP-FS-PATH", "/tmp/x"),
+    ("from pathlib import Path\nPath(p).resolve().rename(t)", "NBP-FS-DYNAMIC", "<dynamic>"),
+    # the same routes through the module, an alias, the classmethods and the other derived steps
+    ("import pathlib\npathlib.Path(p).resolve().open('r').read()", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path as P\nP(p).resolve().open('r')", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\nPath.cwd().open('r')", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\nPath.home().joinpath('.ssh', 'id_rsa').open('r')", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\nPath().open('r')", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\nPath('~root/.ssh/id_rsa').expanduser().open('r')", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\nPath(p).parents[1].open('r')", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\nPath(p).parent.parent.open('r')", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\n('/etc' / Path('passwd')).open('r')", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\nPath(p).with_suffix('.bak').open('w')", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\nPath(p).with_suffix('.bak').replace(t)", "NBP-FS-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\nPath('/etc').joinpath('passwd').rename(t)", "NBP-FS-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\n(Path('/tmp') / name).replace('/etc/passwd')", "NBP-FS-DYNAMIC", "<dynamic>"),
+    # a name bound to a derived Path, rebound, bound by a loop / comprehension, or annotated
+    ("from pathlib import Path\nq = Path('/etc') / 'passwd'\nq.open('r')", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\nq = Path.home()\nq.joinpath('.ssh', 'id_rsa').open('r')", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\nq = Path(a)\nq = q.resolve()\nq.open('r')", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\nq = Path('/etc/passwd').absolute()\nq.open()", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("from pathlib import Path\nq = Path('/etc/passwd').resolve()\nq.rename('/tmp/x')", "NBP-FS-PATH", "/etc/passwd"),
+    ("from pathlib import Path\nfor f in Path('/etc').iterdir():\n    f.open('r').read()", "NBP-OPEN-DYNAMIC",
+     "<dynamic>"),
+    ("from pathlib import Path\n[f.open('r').read() for f in Path('/etc').glob('*')]", "NBP-OPEN-DYNAMIC",
+     "<dynamic>"),
+    ("from pathlib import Path\ndef dump(src: Path):\n    return src.open('r').read()", "NBP-OPEN-DYNAMIC",
+     "<dynamic>"),
+    ("from pathlib import Path\ndef move(src: Path, dst):\n    src.rename(dst)", "NBP-FS-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\nq: Path = Path(p).resolve()\nq.open('r')", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    ("from pathlib import Path\na, b = Path(p).resolve(), 'x'\na.open('r')", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+    # a splat on a derived receiver still hides the mode and path
+    ("from pathlib import Path\nPath('/tmp/x').resolve().open(*mode)", "NBP-OPEN-DYNAMIC", "<dynamic>"),
+]
+
+
+@pytest.mark.parametrize("source,rule,target", REVIEW_GAP_CELLS_6,
+                         ids=[c[1] + ":" + c[0][:30] for c in REVIEW_GAP_CELLS_6])
+def test_derived_path_receivers_are_refused(tmp_path, sandbox_env, source, rule, target):
+    _assert_refused(tmp_path, [source], rule, target)
+
+
+def test_derived_path_receiver_cell_count():
+    assert len(REVIEW_GAP_CELLS_6) >= 38
+
+
+def test_path_bound_in_an_earlier_cell_is_followed():
+    ctx = npol.ScanContext()
+
+    def scan(src):
+        return [(v.rule, v.target) for v in npol.scan_source(src, policy=REVIEW_POLICY, context=ctx)]
+
+    assert scan("from pathlib import Path\nq = Path(src_dir).resolve()") == []
+    assert scan("q.open('r')") == [("NBP-OPEN-DYNAMIC", "<dynamic>")]
+    assert scan("q.joinpath('x').open('r')") == [("NBP-OPEN-DYNAMIC", "<dynamic>")]
+    assert scan("q.rename(dst)") == [("NBP-FS-DYNAMIC", "<dynamic>")]
+    assert scan("p = Path('/etc/passwd').absolute()") == []
+    assert scan("p.open()") == [("NBP-OPEN-PATH", "/etc/passwd")]
+    assert scan("p = p.resolve()") == []
+    assert scan("p.open()") == [("NBP-OPEN-DYNAMIC", "<dynamic>")]
+    # rebound to a string the name is a string again: str.replace is not a Path operation
+    assert scan("p = 'a-b'") == []
+    assert scan("p.replace('-', '_')") == []
+
+
+# Everyday pathlib / str / DataFrame code next to the class that must not become a false refusal.
+CLEAN_CELLS_9 = [
+    "s = 'a-b'\ns.replace('-', '_')",
+    "df.rename(columns={'a': 'b'})",
+    "df.replace({'a': 1})",
+    "from pathlib import Path\nstem = Path(p).stem.replace('-', '_')",
+    "from pathlib import Path\nname = Path(p).name\nname.replace('.csv', '')",
+    "from pathlib import Path\nprint(Path(p).resolve().name, Path(p).parent.stem, Path(p).suffix)",
+    "from pathlib import Path\nif Path(p).resolve().exists():\n    print(Path(p).stat().st_size)",
+    "from pathlib import Path\nfor f in Path(d).iterdir():\n    print(f.name, f.suffix)",
+    "from pathlib import Path\nnames = [f.name for f in Path(d).glob('*.csv')]",
+    "from pathlib import Path\nPath('oci://bucket@ns/sandbox/x').resolve().open('w')",
+    "from pathlib import Path\nq = Path('oci://bucket@ns/sandbox/out')\nq.absolute().open('w')",
+    "from pathlib import Path\nPath('oci://bucket@ns/sandbox/a').absolute().rename('oci://bucket@ns/sandbox/b')",
+    "from pathlib import Path\nPath('rel/x.txt').resolve().open()",
+    "from pathlib import Path\nPath('rel/x.txt').expanduser().read_text()",
+    "import zipfile\nzf = zipfile.ZipFile('oci://bucket@ns/sandbox/x.zip')\nzf.open(member)",
+    "import fsspec\nfs = fsspec.filesystem('oci')\nwith fs.open(object_path, 'rb') as fh:\n    data = fh.read()",
+]
+
+
+@pytest.mark.parametrize("source", CLEAN_CELLS_9, ids=[c[:40] for c in CLEAN_CELLS_9])
+def test_pathlib_adjacent_everyday_code_passes_the_gate(source):
+    assert npol.scan_source(source, policy=REVIEW_POLICY) == []
