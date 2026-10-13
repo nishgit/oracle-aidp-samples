@@ -30,6 +30,78 @@ migrator Codex plugin, newest first. The format loosely follows
   no roles is resolved from `SHOW GRANTS TO USER`, or refused when that
   cannot be read; a write grant with no object name is judged inside the
   source rather than out of scope.
+- A grant that is not on source data is judged too, instead of being
+  skipped: `MANAGE GRANTS` on the account (the role could grant itself any
+  privilege, INSERT on every table included), `OWNERSHIP` of a role, user,
+  warehouse or integration, `CREATE ROLE` / `CREATE USER` / `CREATE
+  INTEGRATION` / `CREATE SHARE`, the `APPLY ... POLICY` and `APPLY TAG`
+  privileges, `EXECUTE TASK` / `EXECUTE MANAGED TASK` and `MANAGE WAREHOUSES`
+  each refuse the session with the escalation named. Each non-source class
+  has an allowlist of what passes (USAGE/OPERATE/MONITOR/MODIFY on a
+  warehouse; USAGE on an integration; MONITOR USAGE, MONITOR EXECUTION,
+  MONITOR SECURITY, IMPORTED PRIVILEGES, CREATE DATABASE and CREATE WAREHOUSE
+  on the account; USAGE/MONITOR on a resource monitor, network policy,
+  compute pool, connection, replication or failover group, external volume,
+  application or share); any other privilege, on any class, is refused as
+  unknown rather than assumed harmless.
+- A system role (`ACCOUNTADMIN`, `SECURITYADMIN`, `USERADMIN`, `SYSADMIN`,
+  `ORGADMIN`, `GLOBALORGADMIN`) as the session's role, as a secondary role or
+  anywhere in the walked hierarchy refuses the session before its grants are
+  listed.
+- Future grants are read with `SHOW FUTURE GRANTS TO ROLE` / `TO DATABASE
+  ROLE` for every walked role and judged by the same rules: a future INSERT
+  on a schema is a write on every table created there later. A future grants
+  listing that cannot be read, or that reaches the 10,000-row cap, refuses
+  the session like any other.
+- The role check also lists `PUBLIC`, which every role holds and no `SHOW
+  GRANTS TO ROLE` row names, and every other role granted to the session's
+  user (`SHOW GRANTS TO USER`, for every session, not only under `USE
+  SECONDARY ROLES ALL`): a write held by any of them, or a system role among
+  them, refuses the session, since a leaked credential is one `USE ROLE`
+  away from each. A user listing that cannot be read, a missing or empty
+  `current_secondary_roles()`, or a grants row that is not a mapping of
+  columns refuses the session instead of passing or crashing. The user
+  listing is believed only when it is one the session could have produced:
+  a listing that does not name the role the session runs as and each
+  secondary role in effect (an empty listing included), or whose rows name
+  no role at all (a null or blank `role`, a row without the column, a None
+  row), is refused as cut or filtered rather than read as "the user holds
+  nothing else". PUBLIC, which no user listing names, is exempt.
+- The `database:` scope excuses only a write the check can place on another
+  database: a refused privilege on a database-contained source class
+  (table, view, schema, stage, function, ...) whose name carries a database
+  other than `database:` is reported, not refused; a refused privilege on
+  any other class — the account, the organisation, a listing, a class
+  Snowflake adds later — or on a row whose class or name is blank is refused
+  whatever the scope. Nor does the scope excuse an escalation: `MANAGE
+  GRANTS`, `CREATE ROLE`, `CREATE USER`, `EXECUTE TASK`, the `APPLY ...
+  POLICY` privileges and any privilege spelled `MANAGE ...`, `APPLY ...` or
+  `EXECUTE ...` reach past the object a row reports them on, so one reported
+  on a database, schema or table of another database is refused like one on
+  the account. Class and privilege names are read with stray
+  whitespace removed, so a padded or null `granted_on` is not a loophole: a
+  blank class refuses the row, a padded `ROLE` is still walked, and a
+  role-like class the walk does not follow (`APPLICATION_ROLE`,
+  `INSTANCE_ROLE`, ...) is refused unwalked.
+- Owning, altering or applying a masking, row access, aggregation,
+  projection, join or privacy policy, a tag, an authentication, password,
+  session or packages policy or a network rule is a write on the source in
+  whatever database the object lives: a policy created elsewhere is applied
+  to the source all the same, and its owner can change what the source
+  shows. `MONITOR` on a user (its query history) is allowed.
+- When the role check fails, `preflight` no longer reads the source
+  afterwards: the schema listing and the connector session schema checks
+  are reported as skipped ("not checked: the source role is not provably
+  read-only"), and a skip is not a pass.
+- Two allowances are documented as such: `CREATE DATABASE` on the account
+  passes because a created database, even a `CLONE` of the source, is not a
+  write on the source (a clone is still a copy of the estate under the
+  role's control, so the README asks that it be withheld); `USAGE` on a
+  procedure passes because discovery reads procedure DDL (an owner's-rights
+  procedure is a write the credential could call, so the README asks that
+  none be granted that is not needed).
+- `OPERATE` on a task, pipe, alert or dynamic table and `APPLY` on a policy
+  or tag count as writes on the source (OPERATE stays a read on a warehouse).
 - `init-config` no longer says the config "will hold live credentials": it
   names the credential files, and those are what to keep out of git and chat.
 - `preflight`, every stage and `PROVISION.md` print the credential's source

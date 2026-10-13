@@ -41,8 +41,15 @@ def _run_sql(sql, params=None):
         return [{"U": "SVC", "R": "READER", "W": "WH", "D": "SALES_DB"}]
     if "current_role()" in low:
         return [{"R": "READER", "S": '{"roles":"","value":""}'}]
+    if low.startswith("show grants to user"):
+        # The service user holds the migration role alone.
+        return [{"role": "READER", "granted_to": "USER", "grantee_name": "SVC"}]
+    if low.startswith('show grants to role "public"'):
+        return []
     if low.startswith("show grants to role"):
         return list(READ_ONLY_GRANTS)
+    if low.startswith("show future grants to role"):
+        return []
     if "show schemas" in low:
         return [{"name": "A"}, {"name": "B"}]
     raise AssertionError(f"unexpected sql: {sql}")
@@ -58,14 +65,48 @@ def _writer_sql(sql, params=None):
 
 
 def _inheriting_sql(sql, params=None):
-    """The role itself holds only reads, but SYSADMIN was granted to it."""
+    """The role itself holds only reads, but DATA_OWNER was granted to it.
+    (A system role in that position is refused unlisted; a custom role is
+    walked, and its writes are judged as the session's own.)"""
     low = " ".join(sql.split()).lower()
-    if low.startswith("show grants to role") and '"sysadmin"' in low:
+    if low.startswith("show grants to role") and '"data_owner"' in low:
         return [{"privilege": "OWNERSHIP", "granted_on": "DATABASE",
                  "name": "SALES_DB"}]
     if low.startswith("show grants to role"):
         return READ_ONLY_GRANTS + [{"privilege": "USAGE", "granted_on": "ROLE",
-                                    "name": "SYSADMIN"}]
+                                    "name": "DATA_OWNER"}]
+    return _run_sql(sql, params)
+
+
+def _grants_manager_sql(sql, params=None):
+    """Nothing on a table beyond SELECT, but MANAGE GRANTS on the account:
+    the role can grant itself anything, so it is not read-only."""
+    low = " ".join(sql.split()).lower()
+    if low.startswith("show grants to role"):
+        return READ_ONLY_GRANTS + [{"privilege": "MANAGE GRANTS",
+                                    "granted_on": "ACCOUNT", "name": "ACME"}]
+    return _run_sql(sql, params)
+
+
+def _public_writer_sql(sql, params=None):
+    """READER's own listing is clean; PUBLIC, which every role holds and no
+    listing names, holds INSERT on the source."""
+    low = " ".join(sql.split()).lower()
+    if low.startswith('show grants to role "public"'):
+        return [{"privilege": "INSERT", "granted_on": "TABLE",
+                 "name": "SALES_DB.PUBLIC.ORDERS"}]
+    return _run_sql(sql, params)
+
+
+def _second_role_sql(sql, params=None):
+    """The session is READER, with no secondary roles, but the service user
+    also holds WRITER: one USE ROLE away for whoever holds the credential."""
+    low = " ".join(sql.split()).lower()
+    if low.startswith("show grants to user"):
+        return [{"role": "READER"}, {"role": "WRITER"}]
+    if low.startswith('show grants to role "writer"'):
+        return [{"privilege": "DELETE", "granted_on": "TABLE",
+                 "name": "SALES_DB.PUBLIC.ORDERS"}]
     return _run_sql(sql, params)
 
 
@@ -164,18 +205,58 @@ def test_a_role_that_can_write_the_source_fails_preflight(tmp_path):
 
 
 def test_a_write_inherited_through_a_granted_role_fails_preflight(tmp_path):
-    """`GRANT ROLE SYSADMIN TO ROLE READER` leaves READER's own listing
+    """`GRANT ROLE DATA_OWNER TO ROLE READER` leaves READER's own listing
     clean; the gate follows the grant and the evidence names the carrier."""
     result = run_preflight(_config(tmp_path), run_sql=_inheriting_sql)
     check = next(c for c in result["checks"]
                  if c["name"] == "source role is read-only")
     assert check["ok"] is False
-    assert "OWNERSHIP" in check["detail"] and "via SYSADMIN" in check["detail"]
+    assert "OWNERSHIP" in check["detail"] and "via DATA_OWNER" in check["detail"]
     assert result["ok"] is False
     report = render_preflight_report(result)
-    assert "`SYSADMIN`" in report, "the walked role is named in the evidence"
-    assert "`OWNERSHIP` on DATABASE `SALES_DB` (role `READER`, via `SYSADMIN`)" \
-        in report
+    assert "`DATA_OWNER`" in report, "the walked role is named in the evidence"
+    assert ("`OWNERSHIP` on DATABASE `SALES_DB` (role `READER`, via "
+            "`DATA_OWNER`)") in report
+
+
+def test_manage_grants_on_the_account_fails_preflight_with_the_reason(tmp_path):
+    """The reviewer's case: a role whose table grants are all reads but
+    which holds MANAGE GRANTS can grant itself INSERT on every table. The
+    report says so, with the escalation named."""
+    result = run_preflight(_config(tmp_path), run_sql=_grants_manager_sql)
+    check = next(c for c in result["checks"]
+                 if c["name"] == "source role is read-only")
+    assert check["ok"] is False
+    assert "MANAGE GRANTS on ACCOUNT ACME" in check["detail"]
+    assert result["ok"] is False
+    report = render_preflight_report(result)
+    assert "`MANAGE GRANTS` on ACCOUNT `ACME` (role `READER`)" in report
+    assert "grant itself any privilege" in report
+    assert "SHOW FUTURE GRANTS TO ROLE" in report, "future grants were read"
+
+
+def test_a_write_granted_to_public_fails_preflight(tmp_path):
+    result = run_preflight(_config(tmp_path), run_sql=_public_writer_sql)
+    check = next(c for c in result["checks"]
+                 if c["name"] == "source role is read-only")
+    assert check["ok"] is False
+    assert "INSERT" in check["detail"] and "held by role PUBLIC" in check["detail"]
+    assert result["ok"] is False
+    report = render_preflight_report(result)
+    assert "`role PUBLIC`" in report, "PUBLIC is named among the walked roles"
+    assert "`INSERT` on TABLE `SALES_DB.PUBLIC.ORDERS` (role `PUBLIC`)" in report
+
+
+def test_a_write_held_by_another_role_of_the_user_fails_preflight(tmp_path):
+    result = run_preflight(_config(tmp_path), run_sql=_second_role_sql)
+    check = next(c for c in result["checks"]
+                 if c["name"] == "source role is read-only")
+    assert check["ok"] is False
+    assert "DELETE" in check["detail"] and "held by role WRITER" in check["detail"]
+    assert result["ok"] is False
+    report = render_preflight_report(result)
+    assert "granted to user SVC: WRITER" in report
+    assert "`DELETE` on TABLE `SALES_DB.PUBLIC.ORDERS` (role `WRITER`)" in report
 
 
 def test_unreadable_grants_fail_the_role_check_closed(tmp_path):
@@ -188,6 +269,42 @@ def test_unreadable_grants_fail_the_role_check_closed(tmp_path):
     check = next(c for c in result["checks"]
                  if c["name"] == "source role is read-only")
     assert check["ok"] is False and "could not be read" in check["detail"]
+
+
+def test_a_failed_role_gate_skips_the_source_checks_that_follow(tmp_path):
+    """The gate runs BEFORE any discovery, and the checks after it read the
+    source (its schemas, its INFORMATION_SCHEMA). When the gate fails they
+    are not run: each is reported as skipped -- a skip is not a pass -- and
+    no statement touches the source database."""
+    calls = []
+
+    def counting(sql, params=None):
+        calls.append(sql)
+        return _grants_manager_sql(sql, params)
+
+    result = run_preflight(_config(tmp_path, schema="PUBLIC"),
+                           run_sql=counting)
+    gate = next(c for c in result["checks"]
+                if c["name"] == "source role is read-only")
+    assert gate["ok"] is False and "MANAGE GRANTS" in gate["detail"]
+    for name in ("source database visible", "connector session schema"):
+        check = next(c for c in result["checks"] if c["name"] == name)
+        assert check["ok"] is None, f"{name} is skipped, not run"
+        assert "not provably read-only" in check["detail"]
+        assert "not a pass" in check["detail"]
+    assert not any("show schemas" in c.lower() or
+                   "information_schema" in c.lower() for c in calls), \
+        "nothing in the source is read after the gate fails"
+    assert result["ok"] is False
+    assert result["skipped"] == 3, "the two source checks and the destination"
+    report = render_preflight_report(result)
+    assert "| source database visible | SKIPPED |" in report
+    assert "| connector session schema | SKIPPED |" in report
+    # ...and with a read-only role the same checks run and are reported.
+    ran = run_preflight(_config(tmp_path, schema="PUBLIC"), run_sql=_run_sql)
+    visible = next(c for c in ran["checks"]
+                   if c["name"] == "source database visible")
+    assert visible["ok"] is True and "2 schema(s) visible" in visible["detail"]
     assert result["ok"] is False
 
 

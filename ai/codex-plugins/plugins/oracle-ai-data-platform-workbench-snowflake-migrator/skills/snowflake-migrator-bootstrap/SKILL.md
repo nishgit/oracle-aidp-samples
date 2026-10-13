@@ -107,11 +107,20 @@ Rules that come with the credential files, and they are not optional:
   working directory nothing ignores it or the credential files until they add
   them to that repo's `.gitignore` — say so when you create it. Keep them out
   of tickets and commits too.
-- **The role must be read-only.** `preflight --test-source` reads its grants
-  back and fails if it holds CREATE, ALTER, DROP, INSERT, UPDATE, DELETE,
-  MERGE, TRUNCATE or OWNERSHIP on the source database, or if the grants cannot
-  be read. Tell the user what the report lists and have the account owner fix
-  the role; do not look for a way around it.
+- **The role must be read-only, and the service user must hold it alone.**
+  `preflight --test-source` reads the grants and future grants back, through
+  every role granted to the migration role, through PUBLIC and through every
+  other role granted to the user, and fails if any of them holds CREATE,
+  ALTER, DROP, INSERT, UPDATE, DELETE, MERGE, TRUNCATE or OWNERSHIP on the
+  source database, a privilege that leads to a write (MANAGE GRANTS on the
+  account, OWNERSHIP of a role, user, policy or tag, CREATE ROLE, EXECUTE
+  TASK, an APPLY ... POLICY privilege — wherever a row reports it), a system
+  role such as SYSADMIN or ACCOUNTADMIN anywhere in its hierarchy or granted
+  to the user, a privilege the check does not know, or if the grants cannot
+  be read or the user's listing does not name the role the session runs as.
+  When that check fails, the source checks after it are skipped, not run.
+  Tell the user what the report lists and have the account owner fix the
+  role or the user; do not look for a way around it.
 
 Key-pair setup, if the user wants one instead of a password:
 

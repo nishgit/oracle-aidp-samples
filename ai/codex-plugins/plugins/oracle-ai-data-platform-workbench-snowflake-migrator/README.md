@@ -166,16 +166,53 @@ owner decides the rest. Before the first run:
 
 - Create a **dedicated read-only role** for the migration (USAGE on the
   database, schemas and warehouse; SELECT on the tables and views; nothing
-  else) and a service user that holds only that role. `preflight` and every
-  Snowflake-reading stage read the role's grants back with `SHOW GRANTS TO
-  ROLE` and **stop if it can write the source** — or if the grants cannot be
-  read at all. The check **walks the role hierarchy**: a role or database
-  role granted to the migration role (`GRANT ROLE SYSADMIN TO ROLE ...`) is
-  listed in turn, so a write it inherits counts the same as one granted
-  directly, and the refusal names the role that carried it. Do not grant the
-  migration role any other role. With `USE SECONDARY ROLES ALL` in effect
-  every role the user holds is checked too; pass `--only-primary-role` to
-  scope a run to `role:` alone.
+  else) and a service user that holds **only that role** — the check
+  enforces both. `preflight` and every Snowflake-reading stage read the
+  grants back with `SHOW GRANTS TO ROLE` and **stop if the credential can
+  write the source** — or if the grants cannot be read at all. The check
+  **walks the role hierarchy**: a role or database role granted to the
+  migration role (`GRANT ROLE SYSADMIN TO ROLE ...`) is listed in turn, so a
+  write it inherits counts the same as one granted directly, and the refusal
+  names the role that carried it. It also lists **`PUBLIC`**, which every
+  role holds and no listing names, and **every other role granted to the
+  service user** (`SHOW GRANTS TO USER`), because a leaked credential is one
+  `USE ROLE` away from each of them: a write held by any of these refuses
+  the session too. That user listing is believed only when it names the
+  role the session runs as (and every secondary role in effect): one that
+  does not, or whose rows name no role at all, is cut or filtered and is
+  refused rather than read as "the user holds nothing else". Do not grant
+  the migration role any other role, grant
+  the service user nothing else, and nothing on the account beyond warehouse
+  usage: a grant that is not on a table is judged too, and one that **leads
+  to a write** refuses the session — `MANAGE GRANTS` (the role could grant
+  itself INSERT on every table), `OWNERSHIP` of a role, user or warehouse,
+  `CREATE ROLE` / `CREATE USER`, `EXECUTE TASK`, the `APPLY ... POLICY`
+  privileges, `CREATE SHARE` / `CREATE INTEGRATION`. Owning or applying a
+  **masking, row access, aggregation or projection policy, a tag or a
+  network rule** is refused in whatever database it lives, because a policy
+  governs what the source shows wherever it was created. A system role
+  (`ACCOUNTADMIN`, `SECURITYADMIN`, `USERADMIN`, `SYSADMIN`, `ORGADMIN`,
+  `GLOBALORGADMIN`) anywhere in the hierarchy or granted to the user is
+  refused without being listed, a privilege the check does not know is
+  refused rather than assumed harmless, and **future grants** (`SHOW FUTURE
+  GRANTS TO ROLE`) are read and judged the same way. With `database:` set,
+  a write on a table of **another** database is reported, not refused — but
+  only when the grant names that database and the privilege stays on that
+  object (INSERT, OWNERSHIP of the table); an escalation — `MANAGE GRANTS`,
+  `CREATE ROLE`, `EXECUTE TASK`, any `MANAGE` / `APPLY` / `EXECUTE ...`
+  privilege — is refused whatever class or database a row reports it on,
+  as is anything on the account or on an object the check cannot place.
+  When the gate fails, `preflight` skips the source checks after it (the
+  schema listing, the connector session schema) and reports them as
+  skipped: nothing in the source is read. Two
+  allowances to know about: `CREATE DATABASE` on the account passes (a
+  database the role creates, even a `CLONE` of the source, is not a write on
+  the source — but a clone is a copy of the estate under the role's control,
+  so withhold it), and `USAGE` on a procedure passes because discovery reads
+  procedure DDL — a procedure that runs with its owner's rights is a write
+  the credential could call, so grant the migration role no procedures it
+  does not need. Pass `--only-primary-role` to scope what a run *sees* to
+  `role:` alone; the check still judges every role the user holds.
 - Enforce **SSO/MFA** for human users and a **network policy** that limits
   where the service user may connect from.
 - Prefer a **key pair** (`auth: keypair`) and **rotate** the key or password

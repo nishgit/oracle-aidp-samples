@@ -457,7 +457,7 @@ def _run_sql_from_args(args, *, role_gate: bool = True):
         # Fail closed, before the first read: a role that can write to the
         # source, or whose grants cannot be read, does not get a session.
         evidence = assert_role_read_only(run_sql, database=coords["database"])
-        walked = (f', {len(evidence["inherited_roles"])} granted role(s) '
+        walked = (f', {len(evidence["inherited_roles"])} other role(s) '
                   f'walked' if evidence["inherited_roles"] else "")
         print(f'  role: {evidence["role"]} is read-only on '
               f'{evidence["database"] or "the account"} '

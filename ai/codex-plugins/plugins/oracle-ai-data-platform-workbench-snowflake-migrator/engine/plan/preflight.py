@@ -19,7 +19,9 @@ So this module does two things, in this order:
      destination with a list -- and, before any discovery, the ROLE: its
      grants are read back and the check fails if it can write to the source
      (`snowflake_source.role_guard`). Each check captures its own failure so
-     one denial does not hide the rest.
+     one denial does not hide the rest -- except that a failed role check
+     skips the source checks after it, which would read the source: they
+     are reported as skipped, and a skip is not a pass.
 
 Nothing here writes. `run_sql` and `call` are injected, so the whole thing is
 unit-tested with no environment.
@@ -162,7 +164,10 @@ def run_preflight(config: dict, *, run_sql: Callable[..., list] | None = None,
 
         # BEFORE any discovery: the role's own grants, read back, and a FAIL
         # when it can write to the source -- or when the grants cannot be
-        # read at all, which proves nothing and is treated the same.
+        # read at all, which proves nothing and is treated the same. The
+        # source checks after it read the source (its schemas, its
+        # INFORMATION_SCHEMA), so when the gate fails they are not run:
+        # each is reported as skipped, and a skip is not a pass.
         def role_read_only():
             nonlocal role_grants
             role_grants = read_role_grants(
@@ -173,13 +178,22 @@ def run_preflight(config: dict, *, run_sql: Callable[..., list] | None = None,
             return detail
 
         checks.append(_check("source role is read-only", role_read_only))
+        role_ok = checks[-1]["ok"] is True
+        _NOT_PROVEN = ("not checked: the source role is not provably "
+                       "read-only, so nothing in the source is read. A skip "
+                       "is not a pass")
+
+        def _source_check(name: str, fn) -> dict:
+            if role_ok:
+                return _check(name, fn)
+            return {"name": name, "ok": None, "detail": _NOT_PROVEN}
 
         def visible():
             db = lexer.config_name(config.get("database") or "")
             rows = run_sql(f"show schemas in database {lexer.qualify(db)}")
             return f"{len(rows)} schema(s) visible in {db}"
 
-        checks.append(_check("source database visible", visible))
+        checks.append(_source_check("source database visible", visible))
 
         def session_schema():
             # `schema:` is NOT a discovery filter -- discovery reads
@@ -234,7 +248,8 @@ def run_preflight(config: dict, *, run_sql: Callable[..., list] | None = None,
             return (f"{schema} is a real schema with {n} relation(s); it "
                     f"scopes the connector session only, not the discovery")
 
-        checks.append(_check("connector session schema", session_schema))
+        checks.append(_source_check("connector session schema",
+                                    session_schema))
     else:
         checks.append({"name": "source", "ok": None,
                        "detail": "not checked: no Snowflake transport was "
@@ -320,27 +335,35 @@ def render_preflight_report(result: dict) -> str:
         # confirm the role is the one they meant and holds only reads.
         roles = grants["role"] + (
             f' (+ secondary: {", ".join(grants["secondary_roles"])})'
-            if grants.get("secondary_roles") else "")
+            if grants.get("secondary_roles") else "") + (
+            f' (+ granted to user {grants.get("user")}: '
+            f'{", ".join(grants["user_roles"])})'
+            if grants.get("user_roles") else "")
         scope = grants.get("database") or "every database"
         names = "`, `".join(grants.get("inherited_roles") or [])
-        walked = (f" and every role granted to it (`{names}`)"
+        walked = (f" and every role it reaches (`{names}`)"
                   if names else "")
         lines += ["## Source role grants", "",
                   f'Role `{roles}`, {grants["grants_read"]} grant(s) read '
-                  f'with `SHOW GRANTS TO ROLE` across the role{walked}; '
-                  f'privileges on {scope}:', "",
+                  f'with `SHOW GRANTS TO ROLE` and '
+                  f'{grants.get("future_grants_read", 0)} future grant(s) '
+                  f'with `SHOW FUTURE GRANTS TO ROLE` across the role'
+                  f'{walked}; privileges on {scope}:', "",
                   "| Privilege | Grants |", "|---|---|"]
         lines += [f"| `{p}` | {n} |" for p, n in grants["by_privilege"].items()]
         if grants["write_grants"]:
-            lines += ["", "**Write privileges on the source — the migration "
-                          "role must not hold these, directly or through a "
-                          "role granted to it:**", ""]
-            lines += [f'- `{w["privilege"]}` on {w["granted_on"]} '
+            lines += ["", "**Write privileges on the source, or privileges "
+                          "that lead to one — the migration role must not "
+                          "hold these, directly or through a role granted "
+                          "to it:**", ""]
+            lines += [f'- {"future " if w.get("future") else ""}'
+                      f'`{w["privilege"]}` on {w["granted_on"]} '
                       f'`{w["name"]}` (role `{w["role"]}`'
                       + (f', via `{w["via"]}`' if w.get("via") else "") + ")"
+                      + (f' — {w["reason"]}' if w.get("reason") else "")
                       for w in grants["write_grants"]]
         if grants.get("out_of_scope_writes"):
-            lines += ["", f'{grants["out_of_scope_writes"]} write grant(s) '
+            lines += ["", f'{grants["out_of_scope_writes"]} refused grant(s) '
                           f'on other databases are outside this migration '
                           f'and were not counted.']
         lines.append("")
