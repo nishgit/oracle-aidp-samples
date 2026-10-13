@@ -51,7 +51,9 @@ No bundled credentials, no MCP server, no third-party network calls.
   the credential can write the source database (CREATE, ALTER, DROP, INSERT,
   UPDATE, DELETE, MERGE, TRUNCATE, OWNERSHIP), holds a privilege that leads
   to a write (MANAGE GRANTS, OWNERSHIP of a role, user, policy or tag, CREATE
-  ROLE, EXECUTE TASK, ... — in whatever database a row reports it), is,
+  ROLE, EXECUTE TASK, ... — in whatever database a row reports it), can run
+  an owner's-rights object in another database (OPERATE on a task, pipe,
+  alert or dynamic table, USAGE of a procedure there), is,
   inherits or is granted a system role, or if the grants cannot be read or
   the user listing does not name the role the session runs as. `preflight`
   lists the grants it found, and skips the source checks after a failed

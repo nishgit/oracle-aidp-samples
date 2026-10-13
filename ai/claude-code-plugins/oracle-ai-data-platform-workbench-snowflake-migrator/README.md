@@ -194,22 +194,36 @@ owner decides the rest. Before the first run:
   refused rather than assumed harmless, and **future grants** (`SHOW FUTURE
   GRANTS TO ROLE`) are read and judged the same way. With `database:` set,
   a write on a table of **another** database is reported, not refused — but
-  only when the grant names that database and the privilege stays on that
+  only when the grant names that database the way `SHOW GRANTS` prints a
+  name (`DB.SCHEMA.OBJECT`, no stray whitespace in an unquoted part; a
+  padded or short name is judged inside) and the privilege stays on that
   object (INSERT, OWNERSHIP of the table); an escalation — `MANAGE GRANTS`,
   `CREATE ROLE`, `EXECUTE TASK`, any `MANAGE` / `APPLY` / `EXECUTE ...`
   privilege — is refused whatever class or database a row reports it on,
   as is anything on the account or on an object the check cannot place.
+  So is the privilege that **runs an owner's-rights object**: `OPERATE` on
+  a task, pipe, alert, dynamic table or service, `USAGE` of a procedure,
+  notebook or Streamlit app in another database — each runs its body with
+  its *owner's* privileges, which the check never reads, so a task
+  elsewhere whose body writes the source
+  is a source write the credential could trigger (owning such an object
+  elsewhere stays reported: it would then run as the read-only role).
   When the gate fails, `preflight` skips the source checks after it (the
   schema listing, the connector session schema) and reports them as
   skipped: nothing in the source is read. Two
   allowances to know about: `CREATE DATABASE` on the account passes (a
   database the role creates, even a `CLONE` of the source, is not a write on
   the source — but a clone is a copy of the estate under the role's control,
-  so withhold it), and `USAGE` on a procedure passes because discovery reads
-  procedure DDL — a procedure that runs with its owner's rights is a write
-  the credential could call, so grant the migration role no procedures it
-  does not need. Pass `--only-primary-role` to scope what a run *sees* to
-  `role:` alone; the check still judges every role the user holds.
+  so withhold it), and `USAGE` on a procedure **in the migration's
+  database** passes because discovery reads procedure DDL — a procedure
+  that runs with its owner's rights is a write the credential could call,
+  so grant the migration role no procedures it does not need (one in
+  another database is refused: discovery never reads it). System-role
+  names are matched against the **stored** name as `current_role()` and
+  `SHOW GRANTS` print it: exactly `SYSADMIN` is the system role, and a
+  distinct role created as `"sysadmin"` is walked and judged by its grants
+  like any other. Pass `--only-primary-role` to scope what a run *sees*
+  to `role:` alone; the check still judges every role the user holds.
 - Enforce **SSO/MFA** for human users and a **network policy** that limits
   where the service user may connect from.
 - Prefer a **key pair** (`auth: keypair`) and **rotate** the key or password
