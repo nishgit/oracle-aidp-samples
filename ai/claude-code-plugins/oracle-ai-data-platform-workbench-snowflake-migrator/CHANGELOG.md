@@ -60,14 +60,25 @@ migrator plugin, newest first. The format loosely follows
   them, refuses the session, since a leaked credential is one `USE ROLE`
   away from each. A user listing that cannot be read, a missing or empty
   `current_secondary_roles()`, or a grants row that is not a mapping of
-  columns refuses the session instead of passing or crashing.
+  columns refuses the session instead of passing or crashing. The user
+  listing is believed only when it is one the session could have produced:
+  a listing that does not name the role the session runs as and each
+  secondary role in effect (an empty listing included), or whose rows name
+  no role at all (a null or blank `role`, a row without the column, a None
+  row), is refused as cut or filtered rather than read as "the user holds
+  nothing else". PUBLIC, which no user listing names, is exempt.
 - The `database:` scope excuses only a write the check can place on another
   database: a refused privilege on a database-contained source class
   (table, view, schema, stage, function, ...) whose name carries a database
   other than `database:` is reported, not refused; a refused privilege on
   any other class — the account, the organisation, a listing, a class
   Snowflake adds later — or on a row whose class or name is blank is refused
-  whatever the scope. Class and privilege names are read with stray
+  whatever the scope. Nor does the scope excuse an escalation: `MANAGE
+  GRANTS`, `CREATE ROLE`, `CREATE USER`, `EXECUTE TASK`, the `APPLY ...
+  POLICY` privileges and any privilege spelled `MANAGE ...`, `APPLY ...` or
+  `EXECUTE ...` reach past the object a row reports them on, so one reported
+  on a database, schema or table of another database is refused like one on
+  the account. Class and privilege names are read with stray
   whitespace removed, so a padded or null `granted_on` is not a loophole: a
   blank class refuses the row, a padded `ROLE` is still walked, and a
   role-like class the walk does not follow (`APPLICATION_ROLE`,
@@ -78,6 +89,10 @@ migrator plugin, newest first. The format loosely follows
   whatever database the object lives: a policy created elsewhere is applied
   to the source all the same, and its owner can change what the source
   shows. `MONITOR` on a user (its query history) is allowed.
+- When the role check fails, `preflight` no longer reads the source
+  afterwards: the schema listing and the connector session schema checks
+  are reported as skipped ("not checked: the source role is not provably
+  read-only"), and a skip is not a pass.
 - Two allowances are documented as such: `CREATE DATABASE` on the account
   passes because a created database, even a `CLONE` of the source, is not a
   write on the source (a clone is still a copy of the estate under the

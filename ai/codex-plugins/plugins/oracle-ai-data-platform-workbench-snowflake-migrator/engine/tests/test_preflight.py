@@ -82,11 +82,24 @@ def test_a_missing_target_is_stated_not_faked():
 
 
 def _sql_for(schema_counts):
-    """A transport that answers the three preflight reads."""
+    """A transport that answers the three preflight reads -- and the role
+    gate before them, as a read-only role whose user holds it alone, since
+    a failed gate skips the source checks these tests are about."""
     def run_sql(sql, *a, **k):
-        low = sql.lower()
-        if "current_user" in low:
+        low = " ".join(sql.split()).lower()
+        if "current_user()" in low and "current_warehouse()" in low:
             return [{"U": "U", "R": "R", "W": "W", "D": "DB"}]
+        if "current_role()" in low:
+            return [{"R": "R", "S": '{"roles":"","value":""}'}]
+        if low.startswith("select current_user()"):
+            return [{"U": "U"}]
+        if low.startswith("show grants to user"):
+            return [{"role": "R", "granted_to": "USER", "grantee_name": "U"}]
+        if low.startswith("show grants to role"):
+            return [] if '"public"' in low else [
+                {"privilege": "USAGE", "granted_on": "DATABASE", "name": "DB"}]
+        if low.startswith("show future grants"):
+            return []
         if "show schemas" in low:
             return [{"name": s} for s in schema_counts]
         if "group by table_schema" in low:

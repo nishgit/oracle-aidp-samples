@@ -269,6 +269,42 @@ def test_unreadable_grants_fail_the_role_check_closed(tmp_path):
     check = next(c for c in result["checks"]
                  if c["name"] == "source role is read-only")
     assert check["ok"] is False and "could not be read" in check["detail"]
+
+
+def test_a_failed_role_gate_skips_the_source_checks_that_follow(tmp_path):
+    """The gate runs BEFORE any discovery, and the checks after it read the
+    source (its schemas, its INFORMATION_SCHEMA). When the gate fails they
+    are not run: each is reported as skipped -- a skip is not a pass -- and
+    no statement touches the source database."""
+    calls = []
+
+    def counting(sql, params=None):
+        calls.append(sql)
+        return _grants_manager_sql(sql, params)
+
+    result = run_preflight(_config(tmp_path, schema="PUBLIC"),
+                           run_sql=counting)
+    gate = next(c for c in result["checks"]
+                if c["name"] == "source role is read-only")
+    assert gate["ok"] is False and "MANAGE GRANTS" in gate["detail"]
+    for name in ("source database visible", "connector session schema"):
+        check = next(c for c in result["checks"] if c["name"] == name)
+        assert check["ok"] is None, f"{name} is skipped, not run"
+        assert "not provably read-only" in check["detail"]
+        assert "not a pass" in check["detail"]
+    assert not any("show schemas" in c.lower() or
+                   "information_schema" in c.lower() for c in calls), \
+        "nothing in the source is read after the gate fails"
+    assert result["ok"] is False
+    assert result["skipped"] == 3, "the two source checks and the destination"
+    report = render_preflight_report(result)
+    assert "| source database visible | SKIPPED |" in report
+    assert "| connector session schema | SKIPPED |" in report
+    # ...and with a read-only role the same checks run and are reported.
+    ran = run_preflight(_config(tmp_path, schema="PUBLIC"), run_sql=_run_sql)
+    visible = next(c for c in ran["checks"]
+                   if c["name"] == "source database visible")
+    assert visible["ok"] is True and "2 schema(s) visible" in visible["detail"]
     assert result["ok"] is False
 
 

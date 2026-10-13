@@ -23,7 +23,14 @@ And every role granted to the session's USER is one `USE ROLE` away for
 whoever holds the credential, whatever role the session started with: the
 user's grants (`SHOW GRANTS TO USER`) are read and each role they name is
 walked like the session's own. A user who holds only the migration role
-passes as before; the README asks for exactly that.
+passes as before; the README asks for exactly that. The listing has to be
+one the session could have produced: the user holds the role it is
+running as and every secondary role in effect, so a listing that does not
+name them is cut or filtered and proves nothing, and a row that names no
+role at all (a null or blank `role`, a row without one, a row that is not
+a mapping) is refused the same way -- the roles the credential reaches are
+unknown. PUBLIC is the one role no user listing names, so a session that
+runs as PUBLIC is not asked to find it there.
 
 Not every grant is ON source data, and the ones that are not are judged
 too. MANAGE GRANTS on the ACCOUNT lets a role grant itself any privilege,
@@ -51,11 +58,18 @@ The `database:` of the migration scopes the check to the estate being
 read: a write on a table of ANOTHER database is reported, not refused,
 because it is not a write on the source. That carve-out applies only to a
 grant the check can PLACE -- a database-contained source class
-(`SCOPED_SOURCE_CLASSES`) whose object name carries the database part. A
-refused privilege on any other class, or on a row whose class or name is
-blank or malformed, is a refusal whatever the scope: an escalation on the
-account, the organisation, a listing or a class Snowflake adds tomorrow is
-never "another database". Class and privilege names are read with the
+(`SCOPED_SOURCE_CLASSES`) whose object name carries the database part --
+and only to a privilege whose reach is BOUNDED by that object: INSERT or
+OWNERSHIP on a table of another database is a write on that table and
+nothing more. A privilege whose reach is not bounded by what it is granted
+on -- one named in `ESCALATIONS`, or any `MANAGE ...`, `APPLY ...` or
+`EXECUTE ...` privilege -- is refused in whatever class and database a
+row reports it (`_escalates`): MANAGE GRANTS reported ON a database still
+lets the role grant itself anything. A refused privilege on any other
+class, or on a row whose class or name is blank or malformed, is a refusal
+whatever the scope too: an escalation on the account, the organisation, a
+listing or a class Snowflake adds tomorrow is never "another database".
+Class and privilege names are read with the
 whitespace SHOW GRANTS never prints removed, so a padded or null column is
 not a loophole either: a blank class refuses the row, and a role-like class
 that is not exactly ROLE or DATABASE_ROLE (an application or instance
@@ -85,10 +99,11 @@ procedures it does not need.
 The check fails CLOSED. A role whose grants or future grants cannot be
 read, a session with no current role, a secondary-roles setting that is
 missing or whose roles cannot be named, a user whose roles cannot be
-listed, a grants row that is not a mapping, or a listing cut off at
-Snowflake's 10,000-row cap is refused the same as a role that holds
-INSERT: in each case the plugin cannot prove the credential is read-only,
-and it does not guess.
+listed or whose listing names no role or omits one the session holds, a
+grants row that is not a mapping, or a listing cut off at Snowflake's
+10,000-row cap is refused the same as a role that holds INSERT: in each
+case the plugin cannot prove the credential is read-only, and it does not
+guess.
 
 Pure except for `run_sql`, which is injected; a fake cursor tests all of it.
 """
@@ -243,17 +258,23 @@ SCOPED_SOURCE_CLASSES = frozenset({
     "DBT_PROJECT",
 })
 
-# Why a privilege on a non-source class is refused, when the reason is a
-# known path from "not a write" to "a write": each of these lets the role
-# widen its own reach, change what the source shows, or move the data.
-# A privilege on a non-source class that is neither allowed above nor
-# named here (MANAGE ACCOUNT SUPPORT CASES, CREATE ACCOUNT, ...) is refused
-# as unknown: harmless or not, the check cannot say.
+# Why a privilege is refused when the reason is a known path from "not a
+# write" to "a write": each of these lets the role widen its own reach,
+# change what the source shows, or move the data. None of them acts on
+# the object it is granted on -- MANAGE GRANTS reaches every grant in the
+# account whatever row reports it -- so a privilege named here, or any
+# privilege spelled `MANAGE ...`, `APPLY ...` or `EXECUTE ...`, is refused
+# on EVERY class and in EVERY database (`_escalates`): the `database:`
+# scope never excuses one. A privilege on a non-source class that is
+# neither allowed above nor named here (MANAGE ACCOUNT SUPPORT CASES,
+# CREATE ACCOUNT, ...) is refused as unknown: harmless or not, the check
+# cannot say. OWNERSHIP is not here: owning an object reaches exactly that
+# object, so on a source class it is a write on it (and excused by the
+# scope like any write on another database), and on a role, user, account,
+# warehouse or integration it is refused with `_OWNERSHIP` as the reason.
 ESCALATIONS = {
     "MANAGE GRANTS": ("lets the role grant itself any privilege, including "
                       "writes on every table"),
-    "OWNERSHIP": ("the owner of an object can grant itself anything the "
-                  "object confers: a role's grants, a user's sign-in"),
     "CREATE ROLE": "lets the role create roles it owns and grant them on",
     "CREATE USER": "lets the role create a user it owns and sign in as it",
     "CREATE INTEGRATION": ("lets the role stand up a path for data to leave "
@@ -273,7 +294,11 @@ ESCALATIONS = {
                           "reading needs"),
 }
 
+_ESCALATION_PREFIXES = ("MANAGE ", "APPLY ", "EXECUTE ")
+
 _WRITE = "a write on the source"
+_OWNERSHIP = ("the owner of an object can grant itself anything the object "
+              "confers: a role's grants, a user's sign-in")
 _UNKNOWN = ("not a privilege this check knows to be read-only, so it is "
             "refused unproven")
 _NO_CLASS = ("a grants row with no object class cannot be placed or judged, "
@@ -418,6 +443,16 @@ def _is_write(privilege: str) -> bool:
     return p in WRITE_PRIVILEGES or p.startswith("CREATE")
 
 
+def _escalates(privilege: str) -> bool:
+    """True for a privilege whose reach is not bounded by the object it is
+    granted on: one named in `ESCALATIONS`, or any `MANAGE ...`, `APPLY ...`
+    or `EXECUTE ...` privilege. Such a grant is refused on whatever class
+    and in whatever database a row reports it; the `database:` scope
+    excuses only a write that stays on its object."""
+    return (privilege in ESCALATIONS
+            or privilege.startswith(_ESCALATION_PREFIXES))
+
+
 def _refusal(privilege: str, granted_on: str) -> str | None:
     """Why a grant of `privilege` ON a `granted_on` is refused; None when it
     cannot lead to a write on the source.
@@ -425,8 +460,10 @@ def _refusal(privilege: str, granted_on: str) -> str | None:
     A blank class is refused on sight. A non-source class is judged by its
     allowlist; a role class the walk does not follow is refused unwalked;
     a governance class (policy, tag, network rule) allows reads only; a
-    source class allows the read list. Either way a privilege the check
-    does not know is refused: the burden of proof is on the grant.
+    source class allows the read list, and names an escalation before a
+    write so the refusal says what the privilege reaches. Either way a
+    privilege the check does not know is refused: the burden of proof is
+    on the grant.
     """
     if not granted_on:
         return _NO_CLASS
@@ -434,6 +471,8 @@ def _refusal(privilege: str, granted_on: str) -> str | None:
     if allowed is not None:
         if privilege in allowed:
             return None
+        if privilege == "OWNERSHIP":
+            return _OWNERSHIP
         if privilege in ESCALATIONS:
             return ESCALATIONS[privilege]
         if "ROLE" in granted_on:
@@ -443,6 +482,8 @@ def _refusal(privilege: str, granted_on: str) -> str | None:
         # INSTANCE_ROLE, or a role class Snowflake adds later: USAGE of it
         # is a role the walk did not follow, anything else an escalation
         # or unknown.
+        if privilege == "OWNERSHIP":
+            return _OWNERSHIP
         if privilege in ESCALATIONS:
             return ESCALATIONS[privilege]
         return _ROLE_UNWALKED
@@ -455,6 +496,8 @@ def _refusal(privilege: str, granted_on: str) -> str | None:
                 f"changing one is a write on the source")
     if privilege in READ_PRIVILEGES:
         return None
+    if privilege in ESCALATIONS:
+        return ESCALATIONS[privilege]
     if _is_write(privilege):
         return _WRITE
     return _UNKNOWN
@@ -493,9 +536,10 @@ _USER_HELP = (
     "and let it read its own grants.")
 
 
-def _roles_granted_to_user(run_sql: Callable[..., list], exclude: list[str]
+def _roles_granted_to_user(run_sql: Callable[..., list], held: list[str]
                            ) -> tuple[str, list[str]]:
-    """The session's user and every role granted to it besides `exclude`.
+    """The session's user and every role granted to it besides `held`, the
+    primary and secondary roles the session already has.
 
     The credential can `USE ROLE` any of them, so each is judged like the
     session's own role. `USE SECONDARY ROLES ALL` puts all of them in
@@ -503,6 +547,15 @@ def _roles_granted_to_user(run_sql: Callable[..., list], exclude: list[str]
     does not (an empty `roles` next to `value: ALL`); the user's grants list
     is the authority either way. When it cannot be read the session is
     refused, because the roles the credential reaches are unknown.
+
+    The listing is believed only when it is one this session could have
+    produced. The user holds every role in `held` -- it is running as them
+    -- so a listing that does not name each of them is cut or filtered,
+    and a row that names no role (a null or blank `role`, a row without
+    the column, a row that is not a mapping) is a listing the check cannot
+    read: both are refused rather than read as "the user holds nothing
+    else". PUBLIC is never named by a user listing, so it is not looked
+    for; it is walked for every session regardless.
     """
     try:
         rows = run_sql("select current_user() U")
@@ -521,12 +574,27 @@ def _roles_granted_to_user(run_sql: Callable[..., list], exclude: list[str]
             f"the user holds {len(listing)} role grants, at or over SHOW "
             f"GRANTS' {SHOW_GRANTS_CAP}-row cap; the listing may be cut, "
             f"so the roles it reaches are unknown. {_USER_HELP}")
-    names: list[str] = []
+    listed: list[str] = []
     for raw in listing:
-        name = str(_lower_keys(raw).get("role") or "").strip()
-        if name and name not in exclude and name not in names:
-            names.append(name)
-    return str(user), names
+        value = _lower_keys(raw).get("role")
+        name = str(value if value is not None else "").strip()
+        if not name:
+            raise RoleNotReadOnly(
+                f"a row of the grants of user {user} names no role (the "
+                f"`role` column is missing or blank), so the roles the "
+                f"credential reaches are unknown and the session is not "
+                f"provably read-only. {_USER_HELP}")
+        if name not in listed:
+            listed.append(name)
+    unnamed = [name for name in held
+               if name not in listed and _unquote(name).upper() != PUBLIC_ROLE]
+    if unnamed:
+        raise RoleNotReadOnly(
+            f"the grants of user {user} do not name {', '.join(unnamed)}, "
+            f"which the session is running as, so the listing is cut or "
+            f"filtered and cannot say which roles the credential reaches; "
+            f"the session is not provably read-only. {_USER_HELP}")
+    return str(user), [name for name in listed if name not in held]
 
 
 def _session_roles(run_sql: Callable[..., list]) -> tuple[str, list[str]]:
@@ -627,6 +695,8 @@ def read_role_grants(run_sql: Callable[..., list], *,
     for name in secondary:
         _refuse_system_role(name, f"the session's secondary role {name}")
     user, user_roles = _roles_granted_to_user(run_sql, [role, *secondary])
+    # (the listing has already been checked to name `role` and each
+    #  secondary role; `user_roles` is what the user holds beyond them)
     for name in user_roles:
         _refuse_system_role(name, f"role {name}, granted to user {user},")
     scope = _unquote(database) if database else None
@@ -697,8 +767,12 @@ def read_role_grants(run_sql: Callable[..., list], *,
                 # Only a grant that can be PLACED on another database is
                 # outside the migration; a blank or short name, a class
                 # that is not database-contained, a policy or a tag is
-                # judged as inside it.
-                if scope and _outside_scope(granted_on, obj, scope):
+                # judged as inside it. And only a privilege whose reach
+                # stays on its object is excused there: MANAGE GRANTS
+                # reported ON another database still reaches every grant
+                # in the account, so an escalation is refused in any scope.
+                if (scope and _outside_scope(granted_on, obj, scope)
+                        and not (reason is not None and _escalates(privilege))):
                     if reason is not None:
                         out_of_scope += 1
                     continue

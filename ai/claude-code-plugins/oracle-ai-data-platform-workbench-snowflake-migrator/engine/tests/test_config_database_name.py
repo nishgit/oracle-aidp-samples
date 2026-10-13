@@ -39,7 +39,17 @@ def test_preflight_names_the_resolved_database():
     sent = []
 
     def run_sql(sql):
+        # The role gate runs first and a failed gate skips the schema
+        # listing this test is about, so it is answered as a read-only
+        # role whose user holds it alone.
         sent.append(sql)
+        low = " ".join(sql.split()).lower()
+        if "current_secondary_roles()" in low:
+            return [{"R": "r", "S": '{"roles":"","value":""}'}]
+        if low.startswith("show grants to user"):
+            return [{"role": "r", "granted_to": "USER", "grantee_name": "u"}]
+        if low.startswith("show "):
+            return []
         return [{"U": "u", "R": "r", "W": "w", "D": "d", "name": "PUBLIC"}]
 
     run_preflight({"database": "sales_db", "account": "a", "user": "u"},

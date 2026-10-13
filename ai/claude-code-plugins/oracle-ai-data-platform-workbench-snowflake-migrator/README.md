@@ -174,7 +174,11 @@ owner decides the rest. Before the first run:
   role holds and no listing names, and **every other role granted to the
   service user** (`SHOW GRANTS TO USER`), because a leaked credential is one
   `USE ROLE` away from each of them: a write held by any of these refuses
-  the session too. Do not grant the migration role any other role, grant
+  the session too. That user listing is believed only when it names the
+  role the session runs as (and every secondary role in effect): one that
+  does not, or whose rows name no role at all, is cut or filtered and is
+  refused rather than read as "the user holds nothing else". Do not grant
+  the migration role any other role, grant
   the service user nothing else, and nothing on the account beyond warehouse
   usage: a grant that is not on a table is judged too, and one that **leads
   to a write** refuses the session — `MANAGE GRANTS` (the role could grant
@@ -190,8 +194,14 @@ owner decides the rest. Before the first run:
   refused rather than assumed harmless, and **future grants** (`SHOW FUTURE
   GRANTS TO ROLE`) are read and judged the same way. With `database:` set,
   a write on a table of **another** database is reported, not refused — but
-  only when the grant names that database; an escalation on the account or
-  on any object the check cannot place is refused whatever the scope. Two
+  only when the grant names that database and the privilege stays on that
+  object (INSERT, OWNERSHIP of the table); an escalation — `MANAGE GRANTS`,
+  `CREATE ROLE`, `EXECUTE TASK`, any `MANAGE` / `APPLY` / `EXECUTE ...`
+  privilege — is refused whatever class or database a row reports it on,
+  as is anything on the account or on an object the check cannot place.
+  When the gate fails, `preflight` skips the source checks after it (the
+  schema listing, the connector session schema) and reports them as
+  skipped: nothing in the source is read. Two
   allowances to know about: `CREATE DATABASE` on the account passes (a
   database the role creates, even a `CLONE` of the source, is not a write on
   the source — but a clone is a copy of the estate under the role's control,

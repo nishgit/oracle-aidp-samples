@@ -265,6 +265,11 @@ def _session(grants):
             return [{"R": "READER", "S": '{"roles":"","value":""}'}]
         if low.startswith("select current_user()"):
             return [{"U": "SVC"}]
+        if low.startswith("show grants to user"):
+            # The service user holds the migration role alone; a listing
+            # that did not name READER would be refused as cut.
+            return [{"role": "READER", "granted_to": "USER",
+                     "grantee_name": "SVC"}]
         if low.startswith("show grants to role"):
             return grants
         return []
