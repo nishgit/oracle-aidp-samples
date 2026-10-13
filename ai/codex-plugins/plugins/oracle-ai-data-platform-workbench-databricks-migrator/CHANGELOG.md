@@ -113,9 +113,10 @@ All notable changes to this plugin are documented here. Format loosely follows [
   the gate cannot resolve is allowed (reading source data through variables is the normal
   migration case; the cluster's IAM scope is the control) and recorded in the policy log as
   `unverified_read_path`, and object-storage / catalog reads are never path-checked. Scope
-  decision for dynamic SQL: a `spark.sql` statement whose literal head (after whitespace and
-  comments) is `SELECT` / `WITH` / `SHOW` / `DESCRIBE` / `DESC` / `EXPLAIN` (or a TEMP VIEW)
-  cannot become a write because Spark runs one statement per call, so it is allowed and
+  decision for dynamic SQL (superseded in review round 3, see **the SQL gate is an allowlist**
+  below: a `WITH` head is NOT a read, and a dynamic read head is admitted only under the runtime
+  SQL guard): a `spark.sql` statement whose literal head (after whitespace and comments) was
+  `SELECT` / `WITH` / `SHOW` / `DESCRIBE` / `DESC` / `EXPLAIN` (or a TEMP VIEW) was allowed and
   recorded as `unverified_sql_read`; every other dynamic head (DDL/DML, `USE`, empty, a
   variable) is `NBP-SQL-DYNAMIC`, which also closes `spark.sql(f"{verb} TABLE prod.t")`.
   Constants bound once inside `for` / `if` / `with` / `try` bodies are resolved (the loop-bound
@@ -286,6 +287,44 @@ All notable changes to this plugin are documented here. Format loosely follows [
   against the coverage-round-3 fix scanner, and the probe files (now 253 refused / 62 allowed cells) are green.
 - Python 3.9 floor: `cluster_lifecycle.py` and `fuse_package_analyzer.py` used PEP 604
   `X | None` annotations evaluated at import time; `from __future__ import annotations` added.
+- **Sandbox gate: the SQL gate is an allowlist** (review round 3 of SEC-AIDP-SAMPLES-005). The
+  reviewer's point: the `spark.sql` handling was a blocklist of write verbs that assumed a
+  statement starting with `WITH` is a read, so `SELECT reflect('java.lang.Runtime', ..)` and
+  `java_method(..)` (the SQL route to the JVM the gate blocks in Python), `SELECT * FROM
+  text.\`/etc/passwd\`` (path tables read any local file), `ADD JAR` and `WITH x AS (..) INSERT
+  INTO prod.table ..` all passed. One classifier, `notebook_policy.classify_sql`, now serves the
+  static gate and a new runtime guard: the statement is masked (comments, string literals and
+  backtick identifiers neutralised), a text with more than one statement is refused, the
+  TOP-LEVEL verb is resolved behind the `WITH` CTE list (parenthesis depth) and `EXPLAIN`, and
+  only known read forms (`SELECT` / `VALUES` / `TABLE` / `WITH .. SELECT` / `SHOW` / `DESCRIBE` /
+  `EXPLAIN` / `CACHE` / `UNCACHE` / `CLEAR CACHE` / `REFRESH TABLE` / `CREATE TEMP VIEW` without
+  `LOCATION` / `USE` of the sandbox / `SET TIME ZONE` / `SET` of a short conf allowlist) or known
+  write forms with a target inside `catalog.schema` (`CREATE` / `REPLACE` / `INSERT` / `MERGE` /
+  `UPDATE` / `DELETE` / `DROP` / `ALTER` / `TRUNCATE` / `OPTIMIZE` / `VACUUM` / `RESTORE` / `MSCK
+  REPAIR` / `ANALYZE` / `COPY INTO` / `CLONE`; `LOCATION` / `OPTIONS (path)` under the prefix) are
+  accepted. Everything else is the new `NBP-SQL-REFUSED` with a precise detail: `reflect(` /
+  `java_method(` and `TRANSFORM .. USING '<cmd>'` anywhere in a statement (CTEs, subqueries,
+  expressions, case-insensitive), `ADD` / `LIST` `JAR` / `FILE` / `ARCHIVE`, `CREATE` / `DROP
+  FUNCTION`, `GRANT` / `REVOKE`, `CALL`, `DECLARE` / `EXECUTE IMMEDIATE` / `BEGIN .. END`,
+  `INSERT OVERWRITE DIRECTORY`, `LOAD DATA INPATH`, `SET` / `RESET` outside the allowlist (and any
+  conf matching `credential` / `secret` / `key` / `token` / `password` / `hadoop` / `fs.` /
+  `spark.databricks` / `spark.driver` / `spark.executor` / `extraJavaOptions` / `extraClassPath`
+  / `spark.sql.extensions`), `FROM .. INSERT` and every unknown verb; `USE` outside the sandbox and
+  write targets outside it stay `NBP-SQL-TARGET`. Path tables (`<format>.\`<path>\``), `COPY INTO
+  .. FROM '<path>'` and `OPTIONS (path)` on a read naming a local path outside the prefix are
+  `NBP-OPEN-PATH` (object-storage URIs stay allowed for reads; writes must sit under the prefix).
+  Dynamic statements fail closed (`NBP-SQL-DYNAMIC`) unless the runtime SQL guard is active for
+  the run: `dbutils.notebook.run` now wraps, for the duration of the run only, `spark.sql` /
+  `sqlContext.sql` on every session object in the executing namespace, the `pyspark`
+  `SparkSession` / `SQLContext` classes, `DataFrame.selectExpr` / `filter` / `where` and
+  `functions.expr`, re-classifies the FINAL string before Spark executes it and records a
+  `runtime_refused` entry; with the guard active, a dynamic statement whose literal head verb is
+  a read verb and whose literal fragments carry no refused token is allowed and recorded as
+  `unverified_sql_read`. `spark.newSession()`, `SparkSession.builder..getOrCreate()` and
+  `getActiveSession()` are refused statically (`NBP-POLICY-TAMPER`) because a fresh session would
+  not carry the guard. `%sql` cells reach the same classifier through `sql_magic`. The old "a
+  `WITH` head is a read" assumption is gone from code, tests and docs; every refused case fails
+  against the round-2 tree.
 - **Secrets shim is Vault-only by default** (`engine/aidp_compat/secrets.py`,
   SEC-AIDP-SAMPLES-006). `AIDP_SECRET_*` environment scanning and the JSON file fallback
   (now only via an explicit `AIDP_SECRETS_FILE`) happen only with

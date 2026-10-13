@@ -12,6 +12,7 @@ Covers the Jira acceptance criteria:
 """
 import json
 import os
+import sys
 
 import nbformat
 import pytest
@@ -332,8 +333,7 @@ CLEAN_CELLS = [
     "CLEAN_SQL = spark.sql('SELECT * FROM prod.t')",
     "spark.sql('CREATE OR REPLACE TEMP VIEW v AS SELECT 1')",
     "spark.sql('CREATE GLOBAL TEMPORARY VIEW gv AS SELECT 1')",
-    "v = 'v'\nspark.sql(f'CREATE OR REPLACE TEMP VIEW {v} AS SELECT 1')",
-    "t = 'prod.t'\nspark.sql(f'SELECT count(*) FROM {t}')",
+    # (dynamic read statements need the runtime SQL guard: see SQL_DYNAMIC_READ_CELLS)
     "spark.sql('CREATE TABLE IF NOT EXISTS default.sbx.t (a INT)')",
     "spark.sql('INSERT INTO `sbx`.`t` VALUES (1)')",
     "spark.sql('CREATE SCHEMA IF NOT EXISTS sbx')",
@@ -1386,17 +1386,8 @@ CLEAN_CELLS_3 = [
     "v = getattr(spark, 'version')",
     "n = getattr(sc, 'defaultParallelism')",
     "getattr(spark.conf, 'get')('spark.app.name')",
-    # (c) dynamic read-only SQL with a literal read-keyword head
-    "q = 'SELECT * FROM sbx.t WHERE id=' + str(cid)\nspark.sql(q)",
-    "for cid in ids:\n    q = 'SELECT * FROM sbx.t WHERE id=' + str(cid)\n    spark.sql(q)",
-    "if flag:\n    q = f'SELECT count(*) FROM sbx.t WHERE d={d}'\n    spark.sql(q)",
-    "spark.sql('SELECT * FROM sbx.t WHERE id=' + str(cid))",
-    "spark.sql(f'WITH c AS (SELECT 1) SELECT * FROM c WHERE x={v}')",
-    "spark.sql('SHOW TABLES IN {}'.format(s))",
-    "spark.sql('-- filter\\nSELECT 1 FROM {}'.format(s))",
-    "spark.sql('/* cols */ DESCRIBE {}'.format(s))",
-    "spark.sql('DESC ' + t)",
-    "spark.sql('EXPLAIN ' + q)",
+    # (c) dynamic read-only SQL with a literal read-keyword head: moved to
+    #     SQL_DYNAMIC_READ_CELLS, allowed only with the runtime SQL guard active
     # (4) dynamic, object-storage, catalog and relative reads stay allowed
     "import pandas as pd\npdf = pd.read_csv(src_path)",
     "spark.read.csv(path, header=True)",
@@ -1431,8 +1422,11 @@ def test_unverified_reads_are_allowed_and_recorded(sandbox_env):
     src = ("import pandas as pd\n"
            "pdf = pd.read_csv(src_path)\n"
            "rows = spark.sql('SELECT * FROM sbx.t WHERE id=' + str(cid))")
-    assert npol.scan_source(src) == []
-    assert npol.enforce_cell_policy(src, notebook_path="nb", cell_index=3) == []
+    # the dynamic SELECT is admitted only while the runtime SQL guard is active for the run
+    ctx = npol.ScanContext(runtime_sql_guard=True)
+    assert npol.scan_source(src, context=ctx) == []
+    assert npol.enforce_cell_policy(src, notebook_path="nb", cell_index=3,
+                                    context=npol.ScanContext(runtime_sql_guard=True)) == []
     notes = [e for e in npol.get_policy_log() if e["event"] in npol.POLICY_NOTES]
     assert [(e["event"], e["target"], e["cell_index"], e["notebook_path"]) for e in notes] == [
         ("unverified_read_path", "pandas.read_csv(<dynamic>)", 3, "nb"),
@@ -1877,7 +1871,7 @@ CLEAN_CELLS_4 = [
     "import operator\nrows.sort(key=operator.itemgetter(1))\nnames = list(map(operator.attrgetter('name'), rows))",
     'import functools\ntotal = functools.reduce(lambda a, b: a + b, values, 0)',
     'import inspect\nsig = inspect.signature(transform)',
-    'q = "SELECT id, amount FROM sbx.mig.orders WHERE region = \'" + region + "\'"\nspark.sql(q).show()',
+    # (the dynamic SELECT of the review's legit list is in SQL_DYNAMIC_READ_CELLS: guard required)
     "df.write.mode('overwrite').saveAsTable('sbx.mig.orders_clean')",
     "spark.read.table('sbx.mig.orders').filter('amount > 0').write.format('delta')"
     ".save('oci://bucket@ns/sandbox/orders_pos')",
@@ -2421,3 +2415,721 @@ CLEAN_CELLS_9 = [
 @pytest.mark.parametrize("source", CLEAN_CELLS_9, ids=[c[:40] for c in CLEAN_CELLS_9])
 def test_pathlib_adjacent_everyday_code_passes_the_gate(source):
     assert npol.scan_source(source, policy=REVIEW_POLICY) == []
+
+
+# ══════════════════════════════════════════════════════════════════════
+# SEC-AIDP-SAMPLES-005 round 3 (B1): the SQL gate is an ALLOWLIST
+# ══════════════════════════════════════════════════════════════════════
+# Review finding: the SQL handling was a blocklist of write verbs and assumed
+# that a statement starting with WITH is a read, so SELECT reflect(..),
+# SELECT * FROM text.`/etc/passwd`, ADD JAR and WITH .. INSERT INTO prod.t all
+# passed. Now one classifier (classify_sql) resolves the TOP-LEVEL verb behind
+# the CTE list on a masked copy of the statement (comments, string literals and
+# backtick identifiers neutralised), accepts only known read forms and known
+# write forms whose target is inside the sandbox, and refuses everything else.
+# The same classifier runs again at run time: dbutils.notebook.run installs a
+# guard on the session's SQL entry points for the duration of the run, so a
+# statement with run-time fragments is judged on its final text before Spark
+# executes it, and the static gate admits such a statement only while that
+# guard is active (ScanContext.runtime_sql_guard) and its literal head verb is
+# a read verb. Every cell below fails against the round-2 tree (1356a56).
+
+# The four statements named in the review, verbatim.
+SQL_REVIEWER_CELLS = [
+    ("spark.sql(\"SELECT reflect('java.lang.Runtime', 'getRuntime')\")", "NBP-SQL-REFUSED", "reflect("),
+    ("spark.sql('SELECT * FROM text.`/etc/passwd`')", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("spark.sql(\"ADD JAR 'oci://b@ns/prod/evil.jar'\")", "NBP-SQL-REFUSED", "ADD JAR"),
+    ("spark.sql('WITH x AS (SELECT 1) INSERT INTO prod.table SELECT * FROM x')", "NBP-SQL-TARGET", "prod.table"),
+]
+SQL_REFUSED_CELLS = SQL_REVIEWER_CELLS + [
+    # -- the Java-call functions anywhere, case-insensitively: CTEs, subqueries, expressions, other verbs
+    ("spark.sql(\"SELECT java_method('java.lang.System', 'getenv', 'PATH')\")", "NBP-SQL-REFUSED", "java_method("),
+    ("spark.sql(\"WITH c AS (SELECT REFLECT('a', 'b') r) SELECT * FROM c\")", "NBP-SQL-REFUSED", "reflect("),
+    ("spark.sql(\"SELECT * FROM sbx.t WHERE x = (SELECT Java_Method('a', 'b'))\")", "NBP-SQL-REFUSED",
+     "java_method("),
+    ("spark.sql(\"SELECT 'x' FROM sbx.t WHERE reflect ('a', 'b') = 1\")", "NBP-SQL-REFUSED", "reflect("),
+    ("spark.sql(\"CACHE TABLE c AS SELECT reflect('a', 'b')\")", "NBP-SQL-REFUSED", "reflect("),
+    ("spark.sql(\"DESCRIBE QUERY SELECT reflect('a', 'b')\")", "NBP-SQL-REFUSED", "reflect("),
+    ("spark.sql(\"EXPLAIN SELECT java_method('a', 'b')\")", "NBP-SQL-REFUSED", "java_method("),
+    ("spark.sql(\"INSERT INTO sbx.t SELECT reflect('a', 'b')\")", "NBP-SQL-REFUSED", "reflect("),
+    ("spark.sql(\"CREATE OR REPLACE TEMP VIEW v AS SELECT reflect('a', 'b')\")", "NBP-SQL-REFUSED", "reflect("),
+    # -- the Hive script transform runs a shell command
+    ("spark.sql(\"SELECT TRANSFORM(a) USING 'cat' AS (b) FROM sbx.t\")", "NBP-SQL-REFUSED", "TRANSFORM ... USING"),
+    ("spark.sql(\"SELECT TRANSFORM(a, b) ROW FORMAT DELIMITED USING '/bin/sh -c id' FROM sbx.t\")",
+     "NBP-SQL-REFUSED", "TRANSFORM ... USING"),
+    ("spark.sql(\"WITH c AS (SELECT TRANSFORM(a) USING 'id' AS (b) FROM sbx.t) SELECT * FROM c\")",
+     "NBP-SQL-REFUSED", "TRANSFORM ... USING"),
+    # -- path tables / path sources on the cluster's local filesystem outside the prefix
+    ("spark.sql('SELECT * FROM parquet.`/dbfs/mnt/prod/x`')", "NBP-OPEN-PATH", "/dbfs/mnt/prod/x"),
+    ("spark.sql('SELECT * FROM delta.`/Workspace/Repos/x/t`')", "NBP-OPEN-PATH", "/Workspace/Repos/x/t"),
+    ("spark.sql('SELECT * FROM csv.`/tmp/other/x.csv`')", "NBP-OPEN-PATH", "/tmp/other/x.csv"),
+    ("spark.sql('SELECT * FROM json.`/Volumes/prod/x`')", "NBP-OPEN-PATH", "/Volumes/prod/x"),
+    ("spark.sql('SELECT * FROM text.`file:///etc/shadow`')", "NBP-OPEN-PATH", "file:///etc/shadow"),
+    ("spark.sql('SELECT * FROM json.`~/.ssh/id_rsa`')", "NBP-OPEN-PATH", "~/.ssh/id_rsa"),
+    ("spark.sql('SELECT * FROM csv.`C:/Users/x/s.csv`')", "NBP-OPEN-PATH", "C:/Users/x/s.csv"),
+    ("spark.sql('SELECT * FROM binaryFile.`/etc`')", "NBP-OPEN-PATH", "/etc"),
+    ("spark.sql('SELECT * FROM sbx.t JOIN text.`/etc/passwd` p ON 1 = 1')", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("spark.sql('WITH p AS (SELECT * FROM text.`/etc/passwd`) SELECT * FROM p')", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("spark.sql('INSERT INTO sbx.t SELECT * FROM text.`/etc/passwd`')", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("spark.sql('EXPLAIN SELECT * FROM text.`/etc/passwd`')", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("spark.sql(\"COPY INTO sbx.t FROM '/etc/passwd' FILEFORMAT = CSV\")", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("spark.sql(\"CREATE TEMP VIEW v USING csv OPTIONS (path '/etc/passwd')\")", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("spark.sql(\"CREATE TEMPORARY VIEW v USING parquet OPTIONS ('path' = '/dbfs/mnt/prod/x')\")",
+     "NBP-OPEN-PATH", "/dbfs/mnt/prod/x"),
+    ("spark.sql(\"CREATE TEMP VIEW v USING parquet LOCATION '/etc/x'\")", "NBP-SQL-TARGET", "/etc/x"),
+    ("spark.sql('INSERT INTO delta.`/tmp/other/x` SELECT 1')", "NBP-SQL-TARGET", "/tmp/other/x"),
+    ("spark.sql('INSERT INTO delta.`oci://b@ns/prod/x` SELECT 1')", "NBP-SQL-TARGET", "oci://b@ns/prod/x"),
+    ("spark.sql('OPTIMIZE delta.`/dbfs/mnt/prod/x`')", "NBP-SQL-TARGET", "/dbfs/mnt/prod/x"),
+    ("spark.sql(\"LOAD DATA LOCAL INPATH '/etc/passwd' INTO TABLE sbx.t\")", "NBP-SQL-REFUSED", "LOAD DATA"),
+    ("spark.sql(\"LOAD DATA INPATH 'oci://b@ns/sbx/in' INTO TABLE sbx.t\")", "NBP-SQL-REFUSED", "LOAD DATA"),
+    ("spark.sql(\"INSERT OVERWRITE DIRECTORY '/tmp/out' SELECT 1\")", "NBP-SQL-REFUSED",
+     "INSERT OVERWRITE DIRECTORY"),
+    ("spark.sql(\"INSERT OVERWRITE LOCAL DIRECTORY 'oci://b@ns/sbx/out' USING parquet SELECT 1\")",
+     "NBP-SQL-REFUSED", "INSERT OVERWRITE DIRECTORY"),
+    # -- session resources, functions, privileges, procedures, scripting, multiple statements
+    ("spark.sql(\"ADD FILE '/etc/passwd'\")", "NBP-SQL-REFUSED", "ADD FILE"),
+    ("spark.sql(\"ADD ARCHIVE 'oci://b@ns/sbx/x.zip'\")", "NBP-SQL-REFUSED", "ADD ARCHIVE"),
+    ("spark.sql(\"ADD JARS 'oci://b@ns/sbx/a.jar' 'oci://b@ns/sbx/b.jar'\")", "NBP-SQL-REFUSED", "ADD JARS"),
+    ("spark.sql('LIST JAR')", "NBP-SQL-REFUSED", "LIST JAR"),
+    ("spark.sql('LIST FILES')", "NBP-SQL-REFUSED", "LIST FILES"),
+    ("spark.sql(\"CREATE FUNCTION sbx.f AS 'com.evil.Udf'\")", "NBP-SQL-REFUSED", "CREATE FUNCTION"),
+    ("spark.sql(\"CREATE OR REPLACE TEMPORARY FUNCTION f AS 'com.evil.Udf' USING JAR 'oci://b@ns/x.jar'\")",
+     "NBP-SQL-REFUSED", "CREATE FUNCTION"),
+    ("spark.sql('CREATE FUNCTION sbx.f(x INT) RETURNS INT RETURN x + 1')", "NBP-SQL-REFUSED", "CREATE FUNCTION"),
+    ("spark.sql('DROP FUNCTION IF EXISTS sbx.f')", "NBP-SQL-REFUSED", "DROP FUNCTION"),
+    ("spark.sql('DROP TEMPORARY FUNCTION f')", "NBP-SQL-REFUSED", "DROP FUNCTION"),
+    ("spark.sql('GRANT SELECT ON TABLE sbx.t TO `u`')", "NBP-SQL-REFUSED", "GRANT"),
+    ("spark.sql('REVOKE ALL PRIVILEGES ON SCHEMA sbx FROM `u`')", "NBP-SQL-REFUSED", "REVOKE"),
+    ("spark.sql('CALL sbx.proc()')", "NBP-SQL-REFUSED", "CALL"),
+    ("spark.sql('DECLARE v STRING')", "NBP-SQL-REFUSED", "DECLARE"),
+    ("spark.sql(\"EXECUTE IMMEDIATE 'DROP TABLE prod.t'\")", "NBP-SQL-REFUSED", "EXECUTE"),
+    ("spark.sql('BEGIN END')", "NBP-SQL-REFUSED", "BEGIN"),
+    ("spark.sql('BEGIN SELECT 1; END')", "NBP-SQL-REFUSED", "<multiple statements>"),
+    ("spark.sql('SELECT 1; DROP TABLE prod.t')", "NBP-SQL-REFUSED", "<multiple statements>"),
+    ("spark.sql('SELECT 1;\\nADD JAR x.jar;')", "NBP-SQL-REFUSED", "<multiple statements>"),
+    # -- SET / RESET outside the conf allowlist, USE outside the sandbox
+    ("spark.sql('SET spark.sql.extensions = com.evil.Ext')", "NBP-SQL-REFUSED", "SET spark.sql.extensions"),
+    ("spark.sql('SET spark.hadoop.fs.oci.client.auth.secret = x')", "NBP-SQL-REFUSED",
+     "SET spark.hadoop.fs.oci.client.auth.secret"),
+    ("spark.sql('SET spark.driver.extraJavaOptions = -javaagent:x.jar')", "NBP-SQL-REFUSED",
+     "SET spark.driver.extraJavaOptions"),
+    ("spark.sql('SET spark.executor.extraClassPath = /tmp/x')", "NBP-SQL-REFUSED",
+     "SET spark.executor.extraClassPath"),
+    ("spark.sql('SET spark.databricks.io.cache.enabled = true')", "NBP-SQL-REFUSED",
+     "SET spark.databricks.io.cache.enabled"),
+    ("spark.sql('SET spark.sql.adaptive.token = x')", "NBP-SQL-REFUSED", "SET spark.sql.adaptive.token"),
+    ("spark.sql('SET spark.sql.warehouse.dir = /tmp/x')", "NBP-SQL-REFUSED", "SET spark.sql.warehouse.dir"),
+    ("spark.sql('SET')", "NBP-SQL-REFUSED", "SET"),
+    ("spark.sql('SET -v')", "NBP-SQL-REFUSED", "SET -v"),
+    ("spark.sql('RESET')", "NBP-SQL-REFUSED", "RESET"),
+    ("spark.sql('RESET spark.sql.extensions')", "NBP-SQL-REFUSED", "RESET spark.sql.extensions"),
+    ("spark.sql('SET VAR x = 1')", "NBP-SQL-REFUSED", "SET"),
+    ("spark.sql('USE prod')", "NBP-SQL-TARGET", "prod"),
+    ("spark.sql('USE CATALOG prod')", "NBP-SQL-TARGET", "prod"),
+    ("spark.sql('USE prod.sbx')", "NBP-SQL-TARGET", "prod.sbx"),
+    ("spark.sql('USE SCHEMA other')", "NBP-SQL-TARGET", "other"),
+    # -- writes outside the sandbox through the verbs the old blocklist did not know
+    ("spark.sql('OPTIMIZE prod.t ZORDER BY (a)')", "NBP-SQL-TARGET", "prod.t"),
+    ("spark.sql('VACUUM prod.t RETAIN 0 HOURS')", "NBP-SQL-TARGET", "prod.t"),
+    ("spark.sql(\"VACUUM '/dbfs/mnt/prod/t'\")", "NBP-SQL-TARGET", "/dbfs/mnt/prod/t"),
+    ("spark.sql('RESTORE TABLE prod.t TO VERSION AS OF 1')", "NBP-SQL-TARGET", "prod.t"),
+    ("spark.sql('MSCK REPAIR TABLE prod.t')", "NBP-SQL-TARGET", "prod.t"),
+    ("spark.sql('ANALYZE TABLE prod.t COMPUTE STATISTICS')", "NBP-SQL-TARGET", "prod.t"),
+    ("spark.sql('ANALYZE TABLES IN prod COMPUTE STATISTICS')", "NBP-SQL-TARGET", "prod"),
+    ("spark.sql('ANALYZE TABLES COMPUTE STATISTICS')", "NBP-SQL-TARGET", "ANALYZE TABLES COMPUTE STATISTICS"),
+    ("spark.sql(\"COPY INTO prod.t FROM 'oci://b@ns/sbx/x' FILEFORMAT = CSV\")", "NBP-SQL-TARGET", "prod.t"),
+    ("spark.sql('CREATE TABLE prod.t SHALLOW CLONE sbx.t')", "NBP-SQL-TARGET", "prod.t"),
+    ("spark.sql('REPLACE TABLE prod.t AS SELECT 1')", "NBP-SQL-TARGET", "prod.t"),
+    ("spark.sql('MERGE WITH SCHEMA EVOLUTION INTO prod.t USING sbx.s ON 1 = 1 WHEN MATCHED THEN DELETE')",
+     "NBP-SQL-TARGET", "prod.t"),
+    ("spark.sql('CREATE MATERIALIZED VIEW prod.mv AS SELECT 1')", "NBP-SQL-TARGET", "prod.mv"),
+    ("spark.sql('CREATE NAMESPACE prod')", "NBP-SQL-TARGET", "prod"),
+    ("spark.sql(\"ALTER TABLE sbx.t SET LOCATION 'oci://b@ns/prod/x'\")", "NBP-SQL-TARGET", "oci://b@ns/prod/x"),
+    ("spark.sql('EXPLAIN INSERT INTO prod.t SELECT 1')", "NBP-SQL-TARGET", "prod.t"),
+    ("spark.sql('DROP VIEW tmp_v')", "NBP-SQL-TARGET", "tmp_v"),
+    ("spark.sql('CREATE CATALOG evil')", "NBP-SQL-REFUSED", "CREATE CATALOG"),
+    ("spark.sql('CREATE VOLUME sbx.v')", "NBP-SQL-REFUSED", "CREATE VOLUME"),
+    ("spark.sql('DROP CATALOG prod')", "NBP-SQL-REFUSED", "DROP CATALOG"),
+    # -- the WITH head is NOT a read: the verb behind the CTE list is the one judged
+    ("spark.sql('WITH x (a) AS (SELECT 1), y AS NOT MATERIALIZED (SELECT 2) "
+     "DELETE FROM prod.t WHERE a IN (SELECT a FROM x)')", "NBP-SQL-TARGET", "prod.t"),
+    ("spark.sql('WITH RECURSIVE x AS (SELECT 1) MERGE INTO prod.t USING x ON 1 = 1 WHEN MATCHED THEN DELETE')",
+     "NBP-SQL-TARGET", "prod.t"),
+    ("spark.sql('WITH x AS (SELECT 1) UPDATE prod.t SET a = 1')", "NBP-SQL-TARGET", "prod.t"),
+    ("spark.sql('WITH x AS (SELECT 1) INSERT OVERWRITE TABLE prod.t SELECT * FROM x')", "NBP-SQL-TARGET", "prod.t"),
+    ("spark.sql('WITH x AS (SELECT 1) ADD JAR x.jar')", "NBP-SQL-REFUSED", "ADD JAR"),
+    ("spark.sql('WITH x AS (SELECT 1)')", "NBP-SQL-REFUSED", "WITH x AS (SELECT 1)"),
+    # -- comments and quoted text cannot steer the verdict either way
+    ("spark.sql('/* SELECT */ DROP TABLE prod.t')", "NBP-SQL-TARGET", "prod.t"),
+    ("spark.sql('-- SELECT\\nDROP TABLE prod.t')", "NBP-SQL-TARGET", "prod.t"),
+    ("spark.sql(\"SELECT '--' AS c FROM text.`/etc/passwd`\")", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("spark.sql(\"SELECT '/*' AS c, reflect('a', 'b')\")", "NBP-SQL-REFUSED", "reflect("),
+    # -- Hive multi-insert and unknown verbs: not on the allowlist
+    ("spark.sql('FROM sbx.src INSERT OVERWRITE TABLE prod.t SELECT *')", "NBP-SQL-REFUSED", "FROM"),
+    ("spark.sql('FROM sbx.t SELECT *')", "NBP-SQL-REFUSED", "FROM"),
+    ("spark.sql('IMPORT TABLE x FROM y')", "NBP-SQL-REFUSED", "IMPORT"),
+    ("spark.sql(\"REFRESH '/dbfs/mnt/prod/x'\")", "NBP-SQL-REFUSED", "REFRESH"),
+    # -- the bare sql() helper and sqlContext go through the same classifier
+    ("sql(\"SELECT reflect('a', 'b')\")", "NBP-SQL-REFUSED", "reflect("),
+    ("sqlContext.sql(\"ADD JAR 'x.jar'\")", "NBP-SQL-REFUSED", "ADD JAR"),
+    ("Q = \"SELECT java_method('a', 'b')\"\nspark.sql(Q)", "NBP-SQL-REFUSED", "java_method("),
+    # -- dynamic statements whose literal fragments already carry a refused token
+    ("spark.sql(\"SELECT reflect('java.lang.Runtime', 'getRuntime') FROM \" + t)", "NBP-SQL-REFUSED", "reflect("),
+    ("spark.sql(f'SELECT * FROM text.`/etc/passwd` WHERE a = {v}')", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("spark.sql('SELECT * FROM sbx.t; ' + q)", "NBP-SQL-REFUSED", "<multiple statements>"),
+    ("spark.sql(f'VALUES ({x}); DROP TABLE prod.t')", "NBP-SQL-REFUSED", "<multiple statements>"),
+    ("spark.sql(f\"SELECT TRANSFORM(a) USING 'cat' FROM {t}\")", "NBP-SQL-REFUSED", "TRANSFORM ... USING"),
+    # -- dynamic statements whose literal head is not a read verb (with or without the guard)
+    ("spark.sql(f'WITH x AS ({sub}) SELECT * FROM x')", "NBP-SQL-DYNAMIC", "<dynamic>"),
+    ("spark.sql('ADD JAR ' + jar)", "NBP-SQL-DYNAMIC", "<dynamic>"),
+    ("spark.sql('SET ' + conf)", "NBP-SQL-DYNAMIC", "<dynamic>"),
+    ("spark.sql(f'OPTIMIZE {t}')", "NBP-SQL-DYNAMIC", "<dynamic>"),
+    ("spark.sql(f'COPY INTO sbx.t FROM {src} FILEFORMAT = CSV')", "NBP-SQL-DYNAMIC", "<dynamic>"),
+    ("spark.sql(f'CREATE FUNCTION {f} AS {cls}')", "NBP-SQL-DYNAMIC", "<dynamic>"),
+    # -- a fresh / fetched session object would not carry the runtime SQL guard
+    ("spark.newSession().sql('SELECT 1')", "NBP-POLICY-TAMPER", "spark.newSession"),
+    ("s2 = spark.newSession()", "NBP-POLICY-TAMPER", "spark.newSession"),
+    ("spark.builder.getOrCreate()", "NBP-POLICY-TAMPER", "spark.builder.getOrCreate"),
+    ("from pyspark.sql import SparkSession\nSparkSession.builder.appName('x').getOrCreate()", "NBP-POLICY-TAMPER",
+     "pyspark.sql.SparkSession.builder.appName.getOrCreate"),
+    ("from pyspark.sql import SparkSession\ns = SparkSession.getActiveSession()", "NBP-POLICY-TAMPER",
+     "pyspark.sql.SparkSession.getActiveSession"),
+    ("import pyspark\npyspark.sql.SparkSession.builder.getOrCreate()", "NBP-POLICY-TAMPER",
+     "pyspark.sql.SparkSession.builder.getOrCreate"),
+]
+
+
+@pytest.mark.parametrize("source,rule,target", SQL_REFUSED_CELLS,
+                         ids=[c[1] + ":" + c[0][:40] for c in SQL_REFUSED_CELLS])
+def test_sql_allowlist_refuses_the_cell_before_it_runs(tmp_path, sandbox_env, source, rule, target):
+    # Through dbutils.notebook.run, i.e. with the runtime SQL guard active: the
+    # static verdict alone must refuse these, the guard is the second line.
+    path = write_notebook(tmp_path, "child", ["SQL_SETUP_OK = 1", source + "\nSQL_REFUSED_MARK = 1"])
+    globals().pop("SQL_SETUP_OK", None)
+    globals().pop("SQL_REFUSED_MARK", None)
+    try:
+        with pytest.raises(PolicyViolation) as ei:
+            runner(tmp_path).run(path)
+    finally:
+        globals().pop("Q", None)
+        globals().pop("s2", None)
+        globals().pop("s", None)
+    err = ei.value
+    assert err.rule_id == rule
+    assert err.target == target
+    assert err.cell_index == 1
+    assert err.remediation
+    assert globals().pop("SQL_SETUP_OK") == 1
+    assert "SQL_REFUSED_MARK" not in globals()
+    refused = [e for e in npol.get_policy_log() if e["event"] == "refused"]
+    assert refused and refused[0]["rule"] == rule and refused[0]["target"] == target
+    assert refused[0]["notebook_path"] == path and refused[0]["cell_index"] == 1
+
+
+# Legitimate reads and in-sandbox writes (sandbox: default.sbx, prefix oci://b@ns/sbx/).
+SQL_ALLOWED_CELLS = [
+    # reads
+    "spark.sql('SELECT * FROM prod.t')",
+    "spark.sql('VALUES (1, 2), (3, 4)')",
+    "spark.sql('TABLE prod.t')",
+    "spark.sql('WITH x AS (SELECT 1) SELECT * FROM x')",
+    "spark.sql('WITH RECURSIVE x AS (SELECT 1), y (a) AS NOT MATERIALIZED (SELECT 2) SELECT * FROM x JOIN y')",
+    "spark.sql('SHOW TABLES IN prod')",
+    "spark.sql('SHOW CREATE TABLE prod.t')",
+    "spark.sql('SHOW TBLPROPERTIES prod.t')",
+    "spark.sql('DESCRIBE prod.t')",
+    "spark.sql('DESC EXTENDED prod.t')",
+    "spark.sql('DESCRIBE FORMATTED prod.t')",
+    "spark.sql('DESCRIBE FUNCTION EXTENDED upper')",
+    "spark.sql('DESCRIBE DATABASE prod')",
+    "spark.sql('DESCRIBE QUERY SELECT 1')",
+    "spark.sql('EXPLAIN SELECT * FROM prod.t')",
+    "spark.sql('EXPLAIN EXTENDED WITH x AS (SELECT 1) SELECT * FROM x')",
+    "spark.sql('EXPLAIN FORMATTED INSERT INTO sbx.t SELECT 1')",
+    "spark.sql('CACHE TABLE c AS SELECT * FROM prod.t')",
+    "spark.sql('CACHE LAZY TABLE prod.t')",
+    "spark.sql('UNCACHE TABLE IF EXISTS c')",
+    "spark.sql('CLEAR CACHE')",
+    "spark.sql('REFRESH TABLE prod.t')",
+    "spark.sql('REFRESH FUNCTION upper')",
+    "spark.sql('CREATE OR REPLACE TEMP VIEW v AS SELECT * FROM prod.t')",
+    "spark.sql('CREATE GLOBAL TEMPORARY VIEW gv AS SELECT 1')",
+    "spark.sql('CREATE TEMPORARY VIEW IF NOT EXISTS v (a, b) AS SELECT 1, 2')",
+    "spark.sql(\"CREATE TEMPORARY VIEW v USING parquet OPTIONS (path 'oci://b@ns/prod/in')\")",
+    "spark.sql(\"CREATE TEMPORARY VIEW v USING csv OPTIONS (header 'true', path 'oci://b@ns/prod/in.csv')\")",
+    # path sources: object storage anywhere, local paths under a prefix, an alias that looks like a format
+    "spark.sql('SELECT * FROM parquet.`oci://b@ns/prod/in`')",
+    "spark.sql('SELECT * FROM delta.`abfss://c@a.dfs.core.windows.net/prod/in`')",
+    "spark.sql('SELECT * FROM csv.`s3://bucket/prod/in.csv`')",
+    "spark.sql('SELECT * FROM json.`oci://b@ns/sbx/in`')",
+    "spark.sql('SELECT text.a FROM prod.t text')",
+    "spark.sql(\"COPY INTO sbx.t FROM 'oci://b@ns/prod/in' FILEFORMAT = PARQUET\")",
+    # in-sandbox writes through every write verb
+    "spark.sql('CREATE TABLE IF NOT EXISTS default.sbx.t (a INT)')",
+    "spark.sql('CREATE OR REPLACE TABLE `default`.`sbx`.`t` AS SELECT 1')",
+    "spark.sql(\"CREATE EXTERNAL TABLE sbx.t2 USING parquet LOCATION 'oci://b@ns/sbx/t2'\")",
+    "spark.sql(\"CREATE TABLE sbx.t3 USING csv OPTIONS (header 'true', 'path' = 'oci://b@ns/sbx/t3')\")",
+    "spark.sql('CREATE SCHEMA IF NOT EXISTS default.sbx')",
+    "spark.sql('CREATE DATABASE IF NOT EXISTS sbx')",
+    "spark.sql('REPLACE TABLE sbx.t AS SELECT 1')",
+    "spark.sql('INSERT INTO sbx.t VALUES (1)')",
+    "spark.sql('INSERT INTO TABLE sbx.t PARTITION (d = 1) SELECT 1')",
+    "spark.sql('INSERT OVERWRITE sbx.t SELECT * FROM prod.src')",
+    "spark.sql('INSERT INTO sbx.t SELECT * FROM parquet.`oci://b@ns/prod/in`')",
+    "spark.sql('WITH x AS (SELECT 1 AS a) INSERT INTO sbx.t SELECT a FROM x')",
+    "spark.sql('WITH x AS (SELECT 1) MERGE INTO sbx.t USING x ON 1 = 1 WHEN MATCHED THEN DELETE')",
+    "spark.sql('MERGE INTO default.sbx.t t USING prod.s s ON t.id = s.id WHEN NOT MATCHED THEN INSERT *')",
+    "spark.sql('UPDATE sbx.t SET a = 1 WHERE a = 0')",
+    "spark.sql('DELETE FROM sbx.t WHERE a = 0')",
+    "spark.sql('DROP TABLE IF EXISTS sbx.t')",
+    "spark.sql('DROP VIEW IF EXISTS sbx.v')",
+    "spark.sql('DROP SCHEMA IF EXISTS sbx CASCADE')",
+    "spark.sql('ALTER TABLE sbx.t ADD COLUMNS (b STRING)')",
+    "spark.sql(\"ALTER TABLE sbx.t SET LOCATION 'oci://b@ns/sbx/t_moved'\")",
+    "spark.sql(\"ALTER SCHEMA default.sbx SET DBPROPERTIES (owner = 'mig')\")",
+    "spark.sql('TRUNCATE TABLE sbx.t')",
+    "spark.sql('OPTIMIZE sbx.t ZORDER BY (a)')",
+    "spark.sql('VACUUM default.sbx.t RETAIN 168 HOURS')",
+    "spark.sql(\"VACUUM 'oci://b@ns/sbx/t'\")",
+    "spark.sql('RESTORE TABLE sbx.t TO VERSION AS OF 1')",
+    "spark.sql('MSCK REPAIR TABLE sbx.t')",
+    "spark.sql('ANALYZE TABLE sbx.t COMPUTE STATISTICS FOR ALL COLUMNS')",
+    "spark.sql('ANALYZE TABLES IN default.sbx COMPUTE STATISTICS')",
+    "spark.sql('CREATE TABLE sbx.t2 SHALLOW CLONE prod.t')",
+    "spark.sql('CREATE TABLE sbx.t2 DEEP CLONE delta.`oci://b@ns/prod/t`')",
+    "spark.sql('INSERT INTO delta.`oci://b@ns/sbx/x` SELECT 1')",
+    "spark.sql('OPTIMIZE delta.`oci://b@ns/sbx/x`')",
+    # session confs on the allowlist, USE of the sandbox
+    "spark.sql('SET spark.sql.shuffle.partitions = 8')",
+    "spark.sql('SET spark.sql.adaptive.enabled = true')",
+    "spark.sql('SET spark.sql.adaptive.coalescePartitions.enabled = false')",
+    "spark.sql('SET spark.sql.autoBroadcastJoinThreshold = -1')",
+    "spark.sql('SET spark.sql.session.timeZone = UTC')",
+    "spark.sql('SET spark.sql.shuffle.partitions')",
+    "spark.sql(\"SET TIME ZONE 'Europe/London'\")",
+    "spark.sql('RESET spark.sql.shuffle.partitions')",
+    "spark.sql('USE default')",
+    "spark.sql('USE CATALOG default')",
+    "spark.sql('USE default.sbx')",
+    "spark.sql('USE SCHEMA sbx')",
+    "spark.sql('USE sbx')",
+    # quoted text, comments and identifiers cannot trigger a refusal
+    "spark.sql('SELECT 1;')",
+    "spark.sql(\"SELECT ';' AS semi FROM prod.t\")",
+    "spark.sql(\"SELECT 'reflect(' AS s, 'ADD JAR' AS j FROM prod.t\")",
+    "spark.sql('SELECT `reflect(` FROM prod.t')",
+    "spark.sql('SELECT transform(arr, x -> x + 1) FROM prod.t')",
+    "spark.sql('SELECT * FROM prod.t -- reflect(1)')",
+    "spark.sql('SELECT * FROM prod.t /* ADD JAR */')",
+    "spark.sql('SELECT * FROM prod.`text.`')",
+    # parameterised SQL keeps a literal statement; the other spellings of the call
+    "spark.sql('SELECT * FROM prod.t WHERE id = :id', args={'id': 1})",
+    "spark.sql(sqlQuery='SELECT 1')",
+    "sql('SELECT 1')",
+    "sqlContext.sql('SHOW TABLES')",
+    "Q = 'WITH x AS (SELECT 1) SELECT * FROM x'\nspark.sql(Q)",
+]
+
+
+@pytest.mark.parametrize("source", SQL_ALLOWED_CELLS, ids=[c[:48] for c in SQL_ALLOWED_CELLS])
+def test_sql_allowlist_passes_legitimate_reads_and_in_sandbox_writes(sandbox_env, source):
+    assert npol.scan_source(source) == []
+    assert [e for e in npol.get_policy_log() if e["event"] in npol.POLICY_NOTES] == []
+
+
+# Dynamic statements with a literal read head: admitted ONLY while the runtime
+# SQL guard is active (recorded as unverified_sql_read); a bare scan fails closed.
+SQL_DYNAMIC_READ_CELLS = [
+    "t = 'prod.t'\nspark.sql(f'SELECT count(*) FROM {t}')",
+    "v = 'v'\nspark.sql(f'CREATE OR REPLACE TEMP VIEW {v} AS SELECT 1')",
+    "q = 'SELECT * FROM sbx.t WHERE id=' + str(cid)\nspark.sql(q)",
+    "for cid in ids:\n    q = 'SELECT * FROM sbx.t WHERE id=' + str(cid)\n    spark.sql(q)",
+    "if flag:\n    q = f'SELECT count(*) FROM sbx.t WHERE d={d}'\n    spark.sql(q)",
+    "spark.sql('SELECT * FROM sbx.t WHERE id=' + str(cid))",
+    "spark.sql(f'WITH c AS (SELECT 1) SELECT * FROM c WHERE x={v}')",
+    "spark.sql('SHOW TABLES IN {}'.format(s))",
+    "spark.sql('-- filter\\nSELECT 1 FROM {}'.format(s))",
+    "spark.sql('/* cols */ DESCRIBE {}'.format(s))",
+    "spark.sql('DESC ' + t)",
+    "spark.sql('EXPLAIN ' + q)",
+    "spark.sql(f'VALUES ({x})')",
+    "spark.sql(f'TABLE {t}')",
+    "spark.sql(f'CACHE TABLE c AS SELECT * FROM {t}')",
+    "spark.sql(f'REFRESH TABLE {t}')",
+    "spark.sql('SELECT * FROM %s' % t)",
+    'q = "SELECT id, amount FROM sbx.mig.orders WHERE region = \'" + region + "\'"\nspark.sql(q).show()',
+]
+
+
+@pytest.mark.parametrize("source", SQL_DYNAMIC_READ_CELLS, ids=[c[:48] for c in SQL_DYNAMIC_READ_CELLS])
+def test_dynamic_read_is_admitted_only_with_the_runtime_sql_guard(sandbox_env, source):
+    assert npol.scan_source(source, context=npol.ScanContext(runtime_sql_guard=True)) == []
+    assert [v.rule for v in npol.scan_source(source)] == ["NBP-SQL-DYNAMIC"]
+    assert [v.rule for v in npol.scan_source(source, context=npol.ScanContext())] == ["NBP-SQL-DYNAMIC"]
+
+
+def test_dynamic_read_with_the_guard_is_recorded_as_unverified(sandbox_env):
+    npol.enforce_cell_policy("spark.sql('SELECT * FROM sbx.t WHERE id = ' + str(cid))", notebook_path="nb",
+                             cell_index=4, context=npol.ScanContext(runtime_sql_guard=True))
+    notes = [e for e in npol.get_policy_log() if e["event"] == "unverified_sql_read"]
+    assert len(notes) == 1
+    assert notes[0]["target"] == "SELECT * FROM sbx.t WHERE id ="
+    assert "runtime SQL guard" in notes[0]["detail"]["detail"]
+    assert notes[0]["cell_index"] == 4
+
+
+def test_classify_sql_reviewer_statements_and_verbs():
+    pol = SandboxPolicy(catalog="default", schema="sbx", prefix="oci://b@ns/sbx/")
+    v = npol.classify_sql("SELECT reflect('java.lang.Runtime', 'getRuntime')", pol)
+    assert (v.allowed, v.kind, v.rule, v.target) == (False, "refused", "NBP-SQL-REFUSED", "reflect(")
+    v = npol.classify_sql("SELECT * FROM text.`/etc/passwd`", pol)
+    assert (v.allowed, v.rule, v.target, v.verb) == (False, "NBP-OPEN-PATH", "/etc/passwd", "SELECT")
+    v = npol.classify_sql("ADD JAR 'oci://b@ns/x.jar'", pol)
+    assert (v.allowed, v.rule, v.verb) == (False, "NBP-SQL-REFUSED", "ADD JAR")
+    v = npol.classify_sql("WITH x AS (SELECT 1) INSERT INTO prod.table SELECT * FROM x", pol)
+    assert (v.allowed, v.kind, v.rule, v.verb, v.target) == (False, "refused", "NBP-SQL-TARGET", "INSERT INTO",
+                                                             "prod.table")
+    # the CTE walk: the statement verb, not WITH, is the verb
+    v = npol.classify_sql("WITH x (a) AS (SELECT 1), y AS (SELECT 2) INSERT INTO sbx.t SELECT * FROM x", pol)
+    assert (v.allowed, v.kind, v.verb, v.target) == (True, "write", "INSERT INTO", "sbx.t")
+    v = npol.classify_sql("WITH x AS (SELECT (1)) SELECT * FROM x", pol)
+    assert (v.allowed, v.kind, v.verb) == (True, "read", "SELECT")
+    v = npol.classify_sql("EXPLAIN COST WITH x AS (SELECT 1) SELECT * FROM x", pol)
+    assert (v.allowed, v.kind, v.verb) == (True, "read", "SELECT")
+    v = npol.classify_sql("  -- note\n  /* c */ CREATE OR REPLACE TEMP VIEW v AS SELECT 1", pol)
+    assert (v.allowed, v.kind, v.verb) == (True, "read", "CREATE TEMP VIEW")
+    assert npol.classify_sql("SELECT 1; SELECT 2", pol).target == "<multiple statements>"
+    assert npol.classify_sql("", pol).rule == "NBP-SQL-REFUSED"
+    assert npol.classify_sql(None, pol).rule == "NBP-SQL-REFUSED"
+    # expressions: only the Java calls and the script transform matter
+    assert npol.classify_sql_expression("a + 1", pol).allowed
+    assert npol.classify_sql_expression("transform(arr, x -> x + 1)", pol).allowed
+    assert npol.classify_sql_expression("Reflect('java.lang.Runtime', 'getRuntime')", pol).target == "reflect("
+    assert npol.classify_sql_expression("java_method ('a', 'b')", pol).target == "java_method("
+
+
+def test_assert_sql_allowed_records_and_raises_before_spark(sandbox_env):
+    for stmt, rule in [("SELECT reflect('java.lang.Runtime', 'getRuntime')", "NBP-SQL-REFUSED"),
+                       ("SELECT * FROM text.`/etc/passwd`", "NBP-OPEN-PATH"),
+                       ("ADD JAR 'oci://b@ns/x.jar'", "NBP-SQL-REFUSED"),
+                       ("WITH x AS (SELECT 1) INSERT INTO prod.table SELECT * FROM x", "NBP-SQL-TARGET")]:
+        with pytest.raises(PolicyViolation) as ei:
+            npol.assert_sql_allowed(stmt, operation="spark.sql", notebook_path="nb", cell_index=2)
+        assert ei.value.rule_id == rule and ei.value.cell_index == 2 and ei.value.notebook_path == "nb"
+        assert isinstance(ei.value, PermissionError)
+    assert npol.assert_sql_allowed("SELECT 1", operation="spark.sql").kind == "read"
+    assert npol.assert_sql_allowed("INSERT INTO sbx.t SELECT 1", operation="spark.sql").kind == "write"
+    with pytest.raises(PolicyViolation) as ei:
+        npol.assert_sql_expression_allowed("java_method('a', 'b')", operation="DataFrame.selectExpr")
+    assert ei.value.rule_id == "NBP-SQL-REFUSED"
+    log = [e for e in npol.get_policy_log() if e["event"] == "runtime_refused"]
+    assert [e["rule"] for e in log] == ["NBP-SQL-REFUSED", "NBP-OPEN-PATH", "NBP-SQL-REFUSED", "NBP-SQL-TARGET",
+                                        "NBP-SQL-REFUSED"]
+    assert log[0]["detail"]["operation"] == "spark.sql" and log[0]["cell_index"] == 2
+    assert log[-1]["detail"]["operation"] == "DataFrame.selectExpr"
+
+
+# -- runtime SQL guard through dbutils.notebook.run, driven with fakes --------
+class _FakeSpark:
+    """Stand-in for a SparkSession: records the statements that reached it."""
+
+    def __init__(self):
+        self.executed = []
+
+    def sql(self, sqlQuery, *args, **kwargs):
+        self.executed.append(sqlQuery)
+        return _FakeDF()
+
+    def newSession(self):
+        return _FakeSpark()
+
+
+class _FakeSqlContext:
+    def __init__(self):
+        self.executed = []
+
+    def sql(self, sqlQuery):
+        self.executed.append(sqlQuery)
+        return _FakeDF()
+
+
+RUNTIME_GUARD_CELLS = [
+    # (cells, rule, target): the static gate admits the dynamic read head, the guard refuses the final text
+    (["T = 'text.`/etc/passwd`'", "spark.sql('SELECT * FROM ' + T)"], "NBP-OPEN-PATH", "/etc/passwd"),
+    (["FN = 'reflect'", "spark.sql(f\"SELECT {FN}('java.lang.Runtime', 'getRuntime')\")"], "NBP-SQL-REFUSED",
+     "reflect("),
+    (["FN = 'java_method'", "spark.sql(f\"SELECT {FN}('java.lang.System', 'getenv', 'PATH')\")"],
+     "NBP-SQL-REFUSED", "java_method("),
+    (["TAIL = \"; ADD JAR 'oci://b@ns/x.jar'\"", "spark.sql('SELECT 1' + TAIL)"], "NBP-SQL-REFUSED",
+     "<multiple statements>"),
+    (["TAIL = \"; WITH x AS (SELECT 1) INSERT INTO prod.table SELECT * FROM x\"", "spark.sql('SELECT 1' + TAIL)"],
+     "NBP-SQL-REFUSED", "<multiple statements>"),
+    (["CMD = \"TRANSFORM(a) USING 'cat'\"", "spark.sql(f'SELECT {CMD} FROM sbx.t')"], "NBP-SQL-REFUSED",
+     "TRANSFORM ... USING"),
+    (["SRC = \"'/etc/passwd'\"", "spark.sql(f'SELECT * FROM csv.`/etc/passwd`'.replace('x', 'y'))"],
+     "NBP-SQL-DYNAMIC", "<dynamic>"),      # a call the gate cannot fold: refused statically, fail closed
+]
+
+
+@pytest.mark.parametrize("cells,rule,target", RUNTIME_GUARD_CELLS, ids=[c[1] + ":" + c[0][-1][:40]
+                                                                        for c in RUNTIME_GUARD_CELLS])
+def test_runtime_sql_guard_refuses_the_final_statement_before_spark(tmp_path, sandbox_env, cells, rule, target):
+    fake = _FakeSpark()
+    original = _FakeSpark.sql
+    g = globals()
+    g["spark"] = fake
+    path = write_notebook(tmp_path, "child", cells + ["GUARD_MARK = 1"])
+    try:
+        with pytest.raises(PolicyViolation) as ei:
+            runner(tmp_path).run(path)
+    finally:
+        for name in ("spark", "T", "FN", "TAIL", "CMD", "SRC", "GUARD_MARK"):
+            g.pop(name, None)
+    err = ei.value
+    assert err.rule_id == rule and err.target == target
+    assert err.notebook_path == path and err.cell_index == 1
+    assert fake.executed == []                      # Spark never saw the statement
+    assert "GUARD_MARK" not in globals()
+    # the guard is removed again, whatever the outcome of the run
+    assert "sql" not in vars(fake) and _FakeSpark.sql is original
+    log = npol.get_policy_log()
+    if rule == "NBP-SQL-DYNAMIC":
+        assert [e["rule"] for e in log if e["event"] == "refused"] == [rule]
+    else:
+        assert [e["event"] for e in log if e["event"] in ("unverified_sql_read", "runtime_refused")] == \
+            ["unverified_sql_read", "runtime_refused"]
+        rr = [e for e in log if e["event"] == "runtime_refused"][0]
+        assert rr["rule"] == rule and rr["target"] == target
+        assert rr["notebook_path"] == path and rr["cell_index"] == 1
+        assert rr["detail"]["operation"] == "spark.sql"
+
+
+def test_runtime_sql_guard_lets_legitimate_dynamic_reads_through_and_restores_the_session(tmp_path, sandbox_env):
+    fake, ctx = _FakeSpark(), _FakeSqlContext()
+    original = _FakeSpark.sql
+    g = globals()
+    g["spark"], g["sqlContext"] = fake, ctx
+    path = write_notebook(tmp_path, "child", [
+        "TBL = 'prod.orders'",
+        "rows = spark.sql(f'WITH x AS (SELECT 1) SELECT * FROM x UNION ALL SELECT 1 FROM {TBL}')",
+        "spark.sql('INSERT INTO sbx.t SELECT 1')",
+        "sqlContext.sql(f'SHOW TABLES IN {TBL}')",
+        "spark.sql(sqlQuery=f'DESCRIBE {TBL}')",
+        "dbutils.notebook.exit('done')",
+    ])
+    g["dbutils"] = type("D", (), {"notebook": runner(tmp_path)})()
+    try:
+        assert runner(tmp_path).run(path) == "done"
+    finally:
+        for name in ("spark", "sqlContext", "dbutils", "TBL", "rows"):
+            g.pop(name, None)
+    assert fake.executed == ["WITH x AS (SELECT 1) SELECT * FROM x UNION ALL SELECT 1 FROM prod.orders",
+                             "INSERT INTO sbx.t SELECT 1", "DESCRIBE prod.orders"]
+    assert ctx.executed == ["SHOW TABLES IN prod.orders"]
+    log = npol.get_policy_log()
+    assert [e["event"] for e in log if e["event"] != "sandbox_declared"] == ["unverified_sql_read"] * 3
+    assert [e for e in log if e["event"] in ("refused", "runtime_refused")] == []
+    # restored: the migrator's own code is unaffected after the run
+    assert "sql" not in vars(fake) and "sql" not in vars(ctx) and _FakeSpark.sql is original
+    fake.sql("ADD JAR 'x.jar'")
+    assert fake.executed[-1] == "ADD JAR 'x.jar'"
+
+
+def test_sql_runtime_guard_wraps_session_objects_and_classes(sandbox_env):
+    from aidp_compat.notebook import SqlRuntimeGuard
+    fake, ctx = _FakeSpark(), _FakeSqlContext()
+    original = _FakeSpark.sql
+    ns = {"spark": fake, "sqlContext": ctx, "sc": object(), "pyspark": npol, "SparkSession": _FakeSpark,
+          "unrelated": _FakeSpark()}
+    policy = npol.require_policy()
+    with SqlRuntimeGuard(policy, ns, notebook_path="nb") as guard:
+        # the class bound as `SparkSession` is wrapped under that name, once, and covers every instance
+        assert {"spark.sql", "sqlContext.sql", "SparkSession.sql", "_FakeSqlContext.sql"} <= set(guard.patched)
+        assert len([p for p in guard.patched if p in ("SparkSession.sql", "_FakeSpark.sql")]) == 1
+        with pytest.raises(PolicyViolation) as ei:
+            fake.sql("ADD JAR 'x.jar'")
+        assert ei.value.rule_id == "NBP-SQL-REFUSED" and ei.value.notebook_path == "nb"
+        with pytest.raises(PolicyViolation):
+            _FakeSpark.sql(fake, "SELECT reflect('a', 'b')")          # class-level call
+        with pytest.raises(PolicyViolation):
+            ns["unrelated"].sql("SELECT java_method('a', 'b')")          # another instance of the class
+        with pytest.raises(PolicyViolation):
+            fake.newSession().sql("SELECT reflect('a', 'b')")          # a new session of the same class
+        with pytest.raises(PolicyViolation) as ei:
+            ctx.sql("SELECT * FROM text.`/etc/passwd`")
+        assert ei.value.rule_id == "NBP-OPEN-PATH"
+        with pytest.raises(PolicyViolation):
+            fake.sql(sqlQuery="WITH x AS (SELECT 1) INSERT INTO prod.table SELECT * FROM x")
+        fake.sql("SELECT 1")
+        fake.sql("INSERT INTO sbx.t SELECT 1", args={"a": 1})
+        assert fake.executed == ["SELECT 1", "INSERT INTO sbx.t SELECT 1"]
+    assert "sql" not in vars(fake) and "sql" not in vars(ctx) and _FakeSpark.sql is original
+    assert _FakeSqlContext.sql.__name__ == "sql"
+    fake.sql("ADD JAR 'x.jar'")                                         # untouched after the block
+    assert fake.executed[-1] == "ADD JAR 'x.jar'"
+    assert [e["rule"] for e in npol.get_policy_log() if e["event"] == "runtime_refused"] == \
+        ["NBP-SQL-REFUSED"] * 4 + ["NBP-OPEN-PATH", "NBP-SQL-TARGET"]
+
+
+def test_sql_runtime_guard_is_a_no_op_for_dataframes_without_pyspark(sandbox_env, monkeypatch):
+    from aidp_compat.notebook import SqlRuntimeGuard
+    monkeypatch.setitem(sys.modules, "pyspark", None)                   # import pyspark -> ImportError
+    for name in [m for m in sys.modules if m.startswith("pyspark.")]:
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    guard = SqlRuntimeGuard(npol.require_policy(), {}).install()
+    try:
+        assert guard.patched == []
+    finally:
+        guard.restore()
+
+
+def _stub_pyspark(monkeypatch):
+    """A minimal pyspark stand-in: the classes / functions the guard patches."""
+    import types
+    pyspark = types.ModuleType("pyspark")
+    sql = types.ModuleType("pyspark.sql")
+    functions = types.ModuleType("pyspark.sql.functions")
+
+    class DataFrame:
+        def __init__(self):
+            self.calls = []
+
+        def selectExpr(self, *exprs):
+            self.calls.append(("selectExpr", exprs))
+            return self
+
+        def filter(self, condition):
+            self.calls.append(("filter", condition))
+            return self
+
+        def where(self, condition):
+            self.calls.append(("where", condition))
+            return self
+
+    class SparkSession:
+        def __init__(self):
+            self.executed = []
+
+        def sql(self, sqlQuery, **kwargs):
+            self.executed.append(sqlQuery)
+            return DataFrame()
+
+    def expr(str):
+        return ("expr", str)
+
+    sql.DataFrame, sql.SparkSession, sql.functions, functions.expr = DataFrame, SparkSession, functions, expr
+    pyspark.sql = sql
+    for name, mod in (("pyspark", pyspark), ("pyspark.sql", sql), ("pyspark.sql.functions", functions)):
+        monkeypatch.setitem(sys.modules, name, mod)
+    for name in [m for m in sys.modules if m.startswith("pyspark.sql.c")]:
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    return pyspark
+
+
+FRAME_EXPRESSION_CELLS = [
+    "df.selectExpr('a', \"reflect('java.lang.Runtime', 'getRuntime')\")",
+    "df.selectExpr([\"java_method('java.lang.System', 'getenv', 'PATH') AS p\"])",
+    "df.filter(\"java_method('a', 'b') = 1\")",
+    "df.where(\"REFLECT('a', 'b') IS NOT NULL\")",
+    "from pyspark.sql import functions as F\nC = F.expr(\"reflect('a', 'b')\")",
+    "from pyspark.sql.functions import expr\nC = expr(\"java_method('a', 'b')\")",
+    "import pyspark.sql.functions as F\ndf.select(F.expr(\"reflect('a', 'b')\"))",
+    "C = expr(\"reflect('a', 'b')\")",            # expr imported into the namespace before the run
+]
+
+
+@pytest.mark.parametrize("source", FRAME_EXPRESSION_CELLS, ids=[c[:48] for c in FRAME_EXPRESSION_CELLS])
+def test_runtime_guard_refuses_java_calls_in_dataframe_expressions(tmp_path, sandbox_env, monkeypatch, source):
+    stub = _stub_pyspark(monkeypatch)
+    DataFrame, functions = stub.sql.DataFrame, stub.sql.functions
+    originals = (DataFrame.selectExpr, DataFrame.filter, DataFrame.where, functions.expr)
+    df = DataFrame()
+    df.select = lambda *cols: df
+    g = globals()
+    g["df"], g["expr"] = df, functions.expr
+    path = write_notebook(tmp_path, "child", [source, "FRAME_MARK = 1"])
+    try:
+        with pytest.raises(PolicyViolation) as ei:
+            runner(tmp_path).run(path)
+        assert g["expr"] is functions.expr                        # the namespace binding is restored
+    finally:
+        for name in ("df", "expr", "F", "C", "FRAME_MARK"):
+            g.pop(name, None)
+    assert ei.value.rule_id == "NBP-SQL-REFUSED"
+    assert ei.value.target in ("reflect(", "java_method(")
+    assert ei.value.cell_index == 0 and ei.value.notebook_path == path
+    assert df.calls == []
+    assert (DataFrame.selectExpr, DataFrame.filter, DataFrame.where, functions.expr) == originals
+    rr = [e for e in npol.get_policy_log() if e["event"] == "runtime_refused"]
+    assert len(rr) == 1 and rr[0]["detail"]["operation"] in ("DataFrame.selectExpr", "DataFrame.filter",
+                                                             "DataFrame.where", "functions.expr", "expr()")
+
+
+def test_runtime_guard_lets_legitimate_dataframe_expressions_through(tmp_path, sandbox_env, monkeypatch):
+    stub = _stub_pyspark(monkeypatch)
+    DataFrame, functions = stub.sql.DataFrame, stub.sql.functions
+    session = stub.sql.SparkSession()
+    df = DataFrame()
+    g = globals()
+    g["df"], g["spark"] = df, session
+    path = write_notebook(tmp_path, "child", [
+        "df.selectExpr('a + 1 AS b').filter('b > 0').where('b < 10')",
+        "from pyspark.sql import functions as F\nC = F.expr('transform(arr, x -> x + 1)')",
+        "df.filter(C)",                                              # a Column, not a string: not classified
+        "spark.sql('SELECT 1')",
+        "TBL = 'prod.t'",
+        "spark.sql(f'SELECT * FROM {TBL}')",
+    ])
+    try:
+        assert runner(tmp_path).run(path) == "ok"
+        # the pyspark SparkSession class was patched for the run: every instance was guarded
+        assert session.executed == ["SELECT 1", "SELECT * FROM prod.t"]
+    finally:
+        for name in ("df", "spark", "F", "C", "TBL"):
+            g.pop(name, None)
+    assert [c[0] for c in df.calls] == ["selectExpr", "filter", "where", "filter"]
+    assert [e for e in npol.get_policy_log() if e["event"] in ("refused", "runtime_refused")] == []
+    assert stub.sql.SparkSession.sql.__name__ == "sql" and "sql" not in vars(session)
+    assert DataFrame.selectExpr.__name__ == "selectExpr" and functions.expr.__name__ == "expr"
+
+
+def test_runtime_guard_patches_the_pyspark_session_class_for_sessions_made_elsewhere(sandbox_env, monkeypatch):
+    from aidp_compat.notebook import SqlRuntimeGuard
+    stub = _stub_pyspark(monkeypatch)
+    original = stub.sql.SparkSession.sql
+    other = stub.sql.SparkSession()        # e.g. the session sql_magic.sql() fetches with getOrCreate()
+    with SqlRuntimeGuard(npol.require_policy(), {}) as guard:
+        assert "pyspark.sql.SparkSession.sql" in guard.patched
+        assert {"pyspark.sql.DataFrame.selectExpr", "pyspark.sql.DataFrame.filter", "pyspark.sql.DataFrame.where",
+                "pyspark.sql.functions.expr"} <= set(guard.patched)
+        with pytest.raises(PolicyViolation):
+            other.sql("ADD JAR 'x.jar'")
+        other.sql("SELECT 1")
+    assert stub.sql.SparkSession.sql is original
+    assert other.executed == ["SELECT 1"]
+
+
+# -- %sql cells: sql_magic turns them into spark.sql(\"\"\"..\"\"\") literals, so the static classifier applies
+SQL_MAGIC_CELLS = [
+    ("%sql SELECT reflect('java.lang.Runtime', 'getRuntime')", "NBP-SQL-REFUSED", "reflect("),
+    ("%sql\nADD JAR 'oci://b@ns/prod/evil.jar'", "NBP-SQL-REFUSED", "ADD JAR"),
+    ("%sql SELECT * FROM text.`/etc/passwd`", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("%sql\nWITH x AS (SELECT 1)\nINSERT INTO prod.table\nSELECT * FROM x", "NBP-SQL-TARGET", "prod.table"),
+]
+
+
+@pytest.mark.parametrize("magic,rule,target", SQL_MAGIC_CELLS, ids=[c[1] + ":" + c[0][:30] for c in SQL_MAGIC_CELLS])
+def test_sql_magic_cells_are_classified_after_transformation(sandbox_env, magic, rule, target):
+    from aidp_compat.sql_magic import transform_sql_cells
+    nb = {"cells": [{"cell_type": "code", "source": [magic]}]}
+    src = "".join(transform_sql_cells(nb)["cells"][0]["source"])
+    assert src.startswith('spark.sql("""')
+    assert [(v.rule, v.target) for v in npol.scan_source(src)] == [(rule, target)]
+
+
+def test_sql_magic_read_and_in_sandbox_write_cells_pass(sandbox_env):
+    from aidp_compat.sql_magic import transform_sql_cells
+    nb = {"cells": [{"cell_type": "code", "source": ["%sql SELECT * FROM prod.t WHERE a = 1"]},
+                    {"cell_type": "code", "source": ["%sql\nWITH x AS (SELECT 1)\nINSERT INTO sbx.t SELECT * FROM x"]}]}
+    for cell in transform_sql_cells(nb)["cells"]:
+        assert npol.scan_source("".join(cell["source"])) == []

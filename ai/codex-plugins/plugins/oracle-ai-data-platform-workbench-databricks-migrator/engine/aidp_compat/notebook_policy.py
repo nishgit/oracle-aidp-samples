@@ -63,8 +63,10 @@ Two pieces:
    same way when the receiver is a name the notebook bound, while
    ``open(path_var)`` itself stays refused in every mode and so does
    ``thing.open(p)`` on a receiver the run never bound), a ``spark.sql``
-   statement whose literal head is a read keyword (``unverified_sql_read``;
-   Spark runs one statement per call, so it cannot become a write) and
+   statement with run-time fragments whose literal head verb is a read verb,
+   only while the runtime SQL guard of ``dbutils.notebook.run`` is active
+   (``unverified_sql_read``; the guard re-classifies the final text before
+   Spark executes it, so a bare static scan fails closed instead) and
    ``DataFrame.pipe(name)`` with a bare name the gate cannot type on a bound,
    non-Spark receiver (``unverified_pipe_callable``; ``RDD.pipe(cmd)``, a
    string-typed argument and a receiver the run never bound are refused).
@@ -153,6 +155,7 @@ RULE_TABLE_TARGET = "NBP-TABLE-TARGET"          # saveAsTable / insertInto / wri
 RULE_TABLE_DYNAMIC = "NBP-TABLE-DYNAMIC"
 RULE_SQL_TARGET = "NBP-SQL-TARGET"              # spark.sql DDL/DML literal outside catalog.schema / prefix
 RULE_SQL_DYNAMIC = "NBP-SQL-DYNAMIC"            # spark.sql with an unresolvable statement
+RULE_SQL_REFUSED = "NBP-SQL-REFUSED"            # spark.sql statement outside the SQL read / in-sandbox write allowlist
 RULE_PATH_WRITE = "NBP-PATH-WRITE"              # df.write.parquet/csv/json/orc/text/save/option("path") literal outside prefix
 RULE_PATH_WRITE_DYNAMIC = "NBP-PATH-WRITE-DYNAMIC"
 RULE_RUNTIME_PATH = "NBP-RUNTIME-PATH"          # compat helper asked to write outside the prefix
@@ -167,7 +170,7 @@ ALL_RULES = (
     RULE_SHUTIL_RMTREE, RULE_BUILTIN_EXEC, RULE_INDIRECT, RULE_POLICY_TAMPER,
     RULE_OPEN_PATH, RULE_OPEN_DYNAMIC, RULE_FS_PATH, RULE_FS_DYNAMIC,
     RULE_DBFS_PATH, RULE_DBFS_DYNAMIC, RULE_TABLE_TARGET, RULE_TABLE_DYNAMIC,
-    RULE_SQL_TARGET, RULE_SQL_DYNAMIC, RULE_PATH_WRITE, RULE_PATH_WRITE_DYNAMIC,
+    RULE_SQL_TARGET, RULE_SQL_DYNAMIC, RULE_SQL_REFUSED, RULE_PATH_WRITE, RULE_PATH_WRITE_DYNAMIC,
     RULE_RUNTIME_PATH, RULE_RUNTIME_TABLE, RULE_RUNTIME_SECRET,
     RULE_DUNDER_ESCAPE, RULE_IPYTHON_ESCAPE, RULE_DESERIALIZE,
 )
@@ -362,6 +365,12 @@ _JVM_BRIDGE_ATTRS = frozenset({
 })
 _SPARK_CODE_LOAD_ATTRS = frozenset({"addPyFile", "addJar", "addArchive"})
 _SPARK_JVM_UDF_ATTRS = frozenset({"registerJavaFunction", "registerJavaUDAF"})
+# A fresh / fetched session object would not carry the instance-level runtime SQL
+# guard that dbutils.notebook.run installs on the session it finds.
+_SPARK_SESSION_FACTORY_ATTRS = frozenset({"newSession", "getOrCreate", "getActiveSession"})
+# Public alias for the runtime SQL guard: the names under which a session object
+# is looked up in the executing namespace.
+SPARK_ROOT_NAMES = _SPARK_ROOTS
 _PY4J_NAMES = frozenset({"JavaGateway", "GatewayClient", "GatewayParameters", "java_import", "JavaObject"})
 _IPYTHON_NAMES = frozenset({"get_ipython", "InteractiveShell", "TerminalInteractiveShell", "ZMQInteractiveShell"})
 # get_ipython().<attr>: shell / magic execution is reported as process execution,
@@ -542,51 +551,77 @@ _COMPAT_PROTECTED_NAMES = frozenset({
     "AIDPNotebookUtils", "AIDPFileSystemUtils", "AIDPSecretsUtils",
 }) | _COMPAT_INTERNAL_MODULES
 
-# SQL statements that create, replace, mutate or drop a table/schema. The
-# first capture group is the object name (optionally backtick-quoted parts).
+# ── SQL allowlist (see classify_sql) ───────────────────────────────────
+# ``spark.sql`` / ``sql`` statements are judged by an ALLOWLIST, not by a list
+# of write verbs: a statement is accepted only when its top-level verb is a
+# known read form, or a known write form whose target is inside the sandbox.
+# Keyword analysis runs on a MASKED copy of the statement (comments removed,
+# every string literal and backtick identifier replaced by a numbered
+# placeholder) so quoted text cannot steer it; the placeholders are looked up
+# where a quoted value matters (paths, table names).
 _SQL_IDENT = r"((?:`[^`]+`|[A-Za-z_][\w$]*)(?:\s*\.\s*(?:`[^`]+`|[A-Za-z_][\w$]*)){0,2})"
-_SQL_WRITE_RE = re.compile(
-    r"^\s*(?:"
-    r"CREATE\s+(?:OR\s+REPLACE\s+)?(?:EXTERNAL\s+)?(?:TABLE|VIEW|SCHEMA|DATABASE)(?:\s+IF\s+NOT\s+EXISTS)?"
-    r"|INSERT\s+(?:INTO|OVERWRITE)(?:\s+TABLE)?"
-    r"|DROP\s+(?:TABLE|VIEW|SCHEMA|DATABASE)(?:\s+IF\s+EXISTS)?"
-    r"|ALTER\s+(?:TABLE|VIEW|SCHEMA|DATABASE)"
-    r"|TRUNCATE\s+TABLE"
-    r"|MERGE\s+INTO"
-    r"|DELETE\s+FROM"
-    r"|UPDATE"
-    r")\s+" + _SQL_IDENT,
-    re.IGNORECASE | re.DOTALL,
-)
-_SQL_WRITE_VERB_RE = re.compile(
-    r"^\s*(?:CREATE|INSERT|DROP|ALTER|TRUNCATE|MERGE|DELETE|UPDATE)\b",
-    re.IGNORECASE,
-)
-# Session-scoped objects are not catalog writes: CREATE [OR REPLACE] [GLOBAL] TEMP[ORARY] VIEW.
-_SQL_TEMP_VIEW_RE = re.compile(
+_SQL_IDENT_RE = re.compile(r"\s*" + _SQL_IDENT)
+_SQL_WORD_RE = re.compile(r"[A-Za-z_][\w$]*")
+_SQL_STR_MARK = "\x00"
+_SQL_IDENT_MARK = "\x01"
+_SQL_STR_PLACEHOLDER_RE = re.compile("'\x00(\\d+)\x00'")
+_SQL_IDENT_PLACEHOLDER_RE = re.compile("`\x01(\\d+)\x01`")
+# Verbs that read: allowed without a target check.
+_SQL_READ_VERBS = frozenset({"SELECT", "VALUES", "TABLE", "SHOW", "DESCRIBE", "DESC", "CACHE", "UNCACHE"})
+# A dynamic statement (run-time fragments) is allowed only when its literal
+# head verb is one of these AND the runtime SQL guard is active for the run.
+_SQL_DYNAMIC_READ_VERBS = _SQL_READ_VERBS | frozenset({"REFRESH", "CLEAR", "EXPLAIN"})
+_SQL_EXPLAIN_MODES = frozenset({"EXTENDED", "CODEGEN", "COST", "FORMATTED", "ANALYZE", "LOGICAL"})
+_SQL_CREATE_FLAGS = frozenset({"GLOBAL", "TEMP", "TEMPORARY", "EXTERNAL", "MATERIALIZED", "STREAMING", "LIVE"})
+_SQL_TEMP_FLAGS = frozenset({"TEMP", "TEMPORARY"})
+_SQL_TABLE_OBJECTS = frozenset({"TABLE", "VIEW"})
+_SQL_SCHEMA_OBJECTS = frozenset({"SCHEMA", "DATABASE", "NAMESPACE"})
+_SQL_CATALOG_OBJECTS = _SQL_TABLE_OBJECTS | _SQL_SCHEMA_OBJECTS
+# CREATE [OR REPLACE] [GLOBAL] TEMP[ORARY] VIEW: the literal head of a dynamic statement.
+_SQL_TEMP_VIEW_HEAD_RE = re.compile(
     r"^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(?:GLOBAL\s+)?TEMP(?:ORARY)?\s+VIEW\b", re.IGNORECASE
 )
-# Spark executes one statement per spark.sql() call, so a statement whose
-# literal head is a read keyword cannot become a write whatever the run-time
-# tail contains. Dynamic statements with any other head are refused.
-_SQL_READ_HEAD_RE = re.compile(r"^\s*(?:SELECT|WITH|SHOW|DESCRIBE|DESC|EXPLAIN)\b", re.IGNORECASE)
-
-
-def _is_sql_write_verb(text: str) -> bool:
-    if _SQL_TEMP_VIEW_RE.match(text):
-        return False
-    return bool(_SQL_WRITE_VERB_RE.match(text))
-
-
-# LOCATION 'x' / LOCATION "x" and OPTIONS (path 'x') / OPTIONS ('path' = "x")
-_SQL_LOCATION_RE = re.compile(r"\bLOCATION\s+(['\"])(.+?)\1", re.IGNORECASE | re.DOTALL)
-_SQL_OPTIONS_PATH_RE = re.compile(
-    r"\bOPTIONS\s*\((?:[^()]*?[\s,(])?['\"`]?path['\"`]?\s*=?\s*(['\"])(.+?)\1", re.IGNORECASE | re.DOTALL
+# Refused ANYWHERE in a statement (CTEs, subqueries, expressions), case-insensitively:
+# the Java-call functions and the Hive script transform (TRANSFORM (..) [ROW FORMAT ..]
+# USING 'cmd' runs a shell command; in Spark SQL a string literal after USING occurs
+# nowhere else).
+_SQL_JVM_CALL_RE = re.compile(r"\b(reflect|java_method)\s*\(", re.IGNORECASE)
+_SQL_SCRIPT_TRANSFORM_RE = re.compile(r"\bUSING\s+'\x00\d+\x00'", re.IGNORECASE)
+_SQL_SCRIPT_TRANSFORM_RAW_RE = re.compile(r"\bUSING\s+['\"]", re.IGNORECASE)
+# <format>.`<path>` path tables (text.`/etc/passwd`, delta.`/tmp/x`, parquet.`oci://..`).
+_SQL_PATH_TABLE_FORMATS = ("text", "csv", "json", "parquet", "orc", "avro", "delta", "binaryFile", "libsvm",
+                           "xml", "image")
+_SQL_PATH_TABLE_RE = re.compile(
+    r"\b(" + "|".join(_SQL_PATH_TABLE_FORMATS) + r")\s*\.\s*`\x01(\d+)\x01`", re.IGNORECASE
 )
-_SQL_SCHEMA_STMT_RE = re.compile(
-    r"^\s*(?:CREATE|DROP|ALTER)\s+(?:OR\s+REPLACE\s+)?(?:SCHEMA|DATABASE)\b", re.IGNORECASE
+_SQL_PATH_TABLE_RAW_RE = re.compile(
+    r"\b(" + "|".join(_SQL_PATH_TABLE_FORMATS) + r")\s*\.\s*`([^`]+)`", re.IGNORECASE
 )
-_SQL_COMMENT_RE = re.compile(r"--[^\n]*|/\*.*?\*/", re.DOTALL)
+_SQL_PATH_TABLE_NAME_RE = re.compile(
+    r"^(" + "|".join(_SQL_PATH_TABLE_FORMATS) + r")\s*\.\s*`(.+)`$", re.IGNORECASE | re.DOTALL
+)
+# LOCATION '<path>' (a write location), [COPY INTO ..] FROM '<path>' and LOAD DATA
+# [LOCAL] INPATH '<path>' (read sources), on the masked text.
+_SQL_LOCATION_RE = re.compile(r"\bLOCATION\s+'\x00(\d+)\x00'", re.IGNORECASE)
+_SQL_FROM_PATH_RE = re.compile(r"\b(?:FROM|INPATH)\s+'\x00(\d+)\x00'", re.IGNORECASE)
+_SQL_OPTIONS_RE = re.compile(r"\bOPTIONS\s*\(([^()]*)\)", re.IGNORECASE)
+_SQL_OPTION_ITEM_RE = re.compile(r"\s*(`\x01\d+\x01`|'\x00\d+\x00'|[\w.]+)\s*=?\s*('\x00(\d+)\x00')")
+# SET / RESET: a short allowlist of harmless performance / session confs; anything
+# that smells of credentials, the filesystem, the JVM or the Databricks runtime is
+# refused whatever the allowlist says.
+_SQL_SET_ALLOWED_CONFS = frozenset({
+    "spark.sql.shuffle.partitions", "spark.sql.autobroadcastjointhreshold", "spark.sql.session.timezone",
+    "spark.sql.ansi.enabled", "spark.sql.casesensitive", "spark.sql.legacy.timeparserpolicy",
+    "spark.sql.sources.partitionoverwritemode", "spark.sql.broadcasttimeout",
+    "spark.sql.files.maxpartitionbytes", "spark.sql.parquet.compression.codec",
+})
+_SQL_SET_ALLOWED_CONF_PREFIXES = ("spark.sql.adaptive.",)
+_SQL_SET_DENY_RE = re.compile(
+    r"credential|secret|key|token|password|hadoop|fs\.|spark\.databricks|spark\.driver|spark\.executor|"
+    r"extraJavaOptions|extraClassPath|spark\.sql\.extensions", re.IGNORECASE
+)
+_SQL_SET_TIME_ZONE_RE = re.compile(r"^SET\s+TIME\s+ZONE\b", re.IGNORECASE)
+_SQL_SET_KEY_RE = re.compile(r"^(SET|RESET)\s+(?!VAR\b|VARIABLE\b)([\w.\-]+)\s*(?:=|$)", re.IGNORECASE | re.DOTALL)
 _URI_RE = re.compile(r"^([A-Za-z][A-Za-z0-9+.\-]*)://([^/\\]*)([/\\].*)?$", re.DOTALL)
 _SEGMENT_SPLIT_RE = re.compile(r"[\\/]+")
 # Host-absolute forms regardless of the host this module runs on: a Windows
@@ -1039,6 +1074,12 @@ class ScanContext:
     # ``None`` when the gate cannot resolve the path (rebound, loop / parameter).
     # ``.open`` / ``.rename`` / ``.replace`` on such a name are Path operations.
     paths: Dict[str, Optional[ast.AST]] = field(default_factory=dict)
+    # True while ``dbutils.notebook.run`` has its runtime SQL guard installed on
+    # the session's SQL entry points: a ``spark.sql`` statement with run-time
+    # fragments whose literal head is a read verb is then allowed (and recorded
+    # as ``unverified_sql_read``) because the guard re-classifies the final text
+    # before Spark executes it. Off by default: a bare static scan fails closed.
+    runtime_sql_guard: bool = False
 
     def forget(self, name: str) -> None:
         """``name`` is (re)bound in the current cell: drop what it stood for."""
@@ -1284,27 +1325,646 @@ def _first_arg(call: ast.Call, kw: Sequence[str]) -> Optional[ast.AST]:
     return None
 
 
-def _sql_write_target(sql: str) -> Tuple[Optional[str], bool, List[str]]:
-    """Return (object name or None, is_schema_statement, storage paths).
+# ── SQL classifier ─────────────────────────────────────────────────────
+@dataclass(frozen=True)
+class SqlVerdict:
+    """Result of :func:`classify_sql` / :func:`classify_sql_expression`.
 
-    ``object name`` is None when the statement is not a write/DDL statement.
-    ``storage paths`` are every ``LOCATION`` and ``OPTIONS (path ...)`` value.
+    ``kind`` is ``"read"`` (allowed, no target check), ``"write"`` (allowed,
+    target inside the sandbox) or ``"refused"``. A refused verdict carries the
+    rule id (``NBP-SQL-REFUSED``, ``NBP-SQL-TARGET`` or ``NBP-OPEN-PATH``),
+    the target, a detail and a remediation; ``verb`` is the top-level verb
+    phrase the classifier resolved (``"WITH"`` is never a verb: the CTE list
+    is walked to the statement behind it).
     """
-    text = _SQL_COMMENT_RE.sub(" ", sql).strip()
-    if not text or not _is_sql_write_verb(text):
-        return None, False, []
-    m = _SQL_WRITE_RE.match(text)
-    locations = [mm.group(2) for mm in _SQL_LOCATION_RE.finditer(text)]
-    locations += [mm.group(2) for mm in _SQL_OPTIONS_PATH_RE.finditer(text)]
+
+    allowed: bool
+    kind: str
+    verb: str = ""
+    rule: str = ""
+    target: str = ""
+    detail: str = ""
+    remediation: str = ""
+
+
+_REM_SQL_REFUSED = ("The SQL gate is an allowlist: read statements (SELECT / VALUES / TABLE / WITH .. SELECT / "
+                    "SHOW / DESCRIBE / EXPLAIN / CACHE / UNCACHE / REFRESH TABLE / CREATE TEMP VIEW) and writes "
+                    "to tables in the sandbox schema are accepted; everything else is refused. Express the step in "
+                    "PySpark, or ask for the sandbox to be widened after review.")
+_REM_SQL_JVM = ("reflect() / java_method() call arbitrary Java from SQL and are refused anywhere in a statement; "
+                "use a built-in Spark SQL function or a Python UDF.")
+_REM_SQL_SCRIPT = ("TRANSFORM (..) USING '<cmd>' runs a shell command on the executors and is refused; "
+                   "express the step as a Python UDF or a DataFrame operation.")
+_REM_SQL_DYNAMIC = ("Pass a literal statement (or a name bound once to one). A statement with run-time fragments "
+                    "is accepted only inside dbutils.notebook.run, where the runtime SQL guard re-classifies the "
+                    "final text, and only when its literal head is a read verb (SELECT / VALUES / TABLE / "
+                    "WITH .. SELECT / SHOW / DESCRIBE / EXPLAIN / CACHE / UNCACHE / REFRESH TABLE / CREATE TEMP "
+                    "VIEW); otherwise list NBP-SQL-DYNAMIC in AIDP_NOTEBOOK_POLICY_ALLOW after review.")
+_REM_SQL_PATH_READ = ("SQL path sources (<format>.`<path>`, COPY INTO .. FROM '<path>', OPTIONS (path ..)) may name "
+                      "object storage (oci://, abfss://, s3://, ..) or a path under the sandbox prefix; a "
+                      "local-filesystem path outside it is refused.")
+_REM_SQL_SET = ("SET / RESET is limited to a short allowlist of performance / session confs "
+                "(spark.sql.shuffle.partitions, spark.sql.adaptive.*, spark.sql.autoBroadcastJoinThreshold, "
+                "spark.sql.session.timeZone, SET TIME ZONE, ..); everything else, and a bare SET / RESET, is "
+                "refused. Configure the cluster instead.")
+
+
+class _MaskedSql:
+    """``statement`` with comments removed and every string literal / backtick
+    identifier replaced by a numbered placeholder.
+
+    Keyword analysis runs on :attr:`text`; :meth:`string` / :meth:`ident`
+    return the quoted value behind a placeholder and :meth:`unmask` restores
+    a fragment (a table name) to its original spelling. ``''`` / ``""`` /
+    ``\\'`` escapes inside literals and doubled backticks are honoured.
+    """
+
+    __slots__ = ("text", "strings", "idents")
+
+    def __init__(self, sql: str):
+        out: List[str] = []
+        strings: List[str] = []
+        idents: List[str] = []
+        i, n = 0, len(sql)
+        while i < n:
+            ch = sql[i]
+            nxt = sql[i + 1] if i + 1 < n else ""
+            if ch == "-" and nxt == "-":
+                j = sql.find("\n", i)
+                i = n if j < 0 else j
+                out.append(" ")
+                continue
+            if ch == "/" and nxt == "*":
+                j = sql.find("*/", i + 2)
+                i = n if j < 0 else j + 2
+                out.append(" ")
+                continue
+            if ch in "'\"":
+                j = i + 1
+                buf: List[str] = []
+                while j < n:
+                    c = sql[j]
+                    if c == "\\" and j + 1 < n:
+                        buf.append(sql[j + 1])
+                        j += 2
+                        continue
+                    if c == ch:
+                        if j + 1 < n and sql[j + 1] == ch:
+                            buf.append(ch)
+                            j += 2
+                            continue
+                        break
+                    buf.append(c)
+                    j += 1
+                strings.append("".join(buf))
+                out.append("'" + _SQL_STR_MARK + str(len(strings) - 1) + _SQL_STR_MARK + "'")
+                i = j + 1
+                continue
+            if ch == "`":
+                j = i + 1
+                buf = []
+                while j < n:
+                    c = sql[j]
+                    if c == "`":
+                        if j + 1 < n and sql[j + 1] == "`":
+                            buf.append("`")
+                            j += 2
+                            continue
+                        break
+                    buf.append(c)
+                    j += 1
+                idents.append("".join(buf))
+                out.append("`" + _SQL_IDENT_MARK + str(len(idents) - 1) + _SQL_IDENT_MARK + "`")
+                i = j + 1
+                continue
+            out.append(ch)
+            i += 1
+        self.text = "".join(out).strip()
+        self.strings = strings
+        self.idents = idents
+
+    def string(self, index: str) -> str:
+        return self.strings[int(index)]
+
+    def ident(self, index: str) -> str:
+        return self.idents[int(index)]
+
+    def unmask(self, fragment: str) -> str:
+        fragment = _SQL_STR_PLACEHOLDER_RE.sub(lambda m: "'" + self.string(m.group(1)) + "'", fragment)
+        return _SQL_IDENT_PLACEHOLDER_RE.sub(lambda m: "`" + self.ident(m.group(1)) + "`", fragment)
+
+
+def _sql_words(text: str, count: int) -> List[str]:
+    """Up to ``count`` leading words of ``text``, upper-cased."""
+    words: List[str] = []
+    pos = 0
+    while len(words) < count:
+        m = _SQL_WORD_RE.match(text, pos)
+        if not m:
+            break
+        words.append(m.group(0).upper())
+        pos = m.end()
+        while pos < len(text) and text[pos].isspace():
+            pos += 1
+    return words
+
+
+def _sql_after_words(text: str, count: int) -> str:
+    """``text`` with its first ``count`` words (and the following whitespace) removed."""
+    pos = 0
+    for _ in range(count):
+        m = _SQL_WORD_RE.match(text, pos)
+        if not m:
+            return ""
+        pos = m.end()
+        while pos < len(text) and text[pos].isspace():
+            pos += 1
+    return text[pos:]
+
+
+def _sql_skip_ctes(text: str) -> Optional[str]:
+    """``text`` follows a ``WITH``: return the statement behind the CTE list.
+
+    Walks ``name [(cols)] AS [NOT MATERIALIZED] ( .. ) [, ..]`` tracking the
+    parenthesis depth (strings are masked, so quoted parentheses do not
+    count). ``None`` when the list is unbalanced or never ends.
+    """
+    pos = 0
+    n = len(text)
+    while True:
+        open_ = text.find("(", pos)
+        if open_ < 0:
+            return None
+        depth = 0
+        j = open_
+        while j < n:
+            if text[j] == "(":
+                depth += 1
+            elif text[j] == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        if j >= n:
+            return None
+        rest = text[j + 1:].lstrip()
+        if not rest:
+            return None
+        if rest.startswith(","):
+            pos = j + 1
+            continue
+        if _sql_words(rest, 1) in (["AS"], ["NOT"], ["MATERIALIZED"]):
+            pos = j + 1          # that was the CTE's column list; its body follows
+            continue
+        return rest
+
+
+def _sql_resolve_verb(text: str) -> Tuple[str, str]:
+    """``(top-level verb, statement text from that verb on)`` for masked ``text``.
+
+    ``WITH`` is walked past its CTE list, ``EXPLAIN [mode]`` past its modes,
+    so the verb is the one Spark executes (``WITH x AS (..) INSERT ..`` is an
+    ``INSERT``). ``verb`` is ``""`` when it cannot be determined.
+    """
+    t = text.lstrip()
+    for _ in range(8):
+        m = _SQL_WORD_RE.match(t)
+        if not m:
+            return "", t
+        verb = m.group(0).upper()
+        if verb == "WITH":
+            rest = _sql_skip_ctes(t[m.end():])
+            if rest is None:
+                return "", t
+            t = rest
+            continue
+        if verb == "EXPLAIN":
+            rest = t[m.end():].lstrip()
+            words = _sql_words(rest, 1)
+            while words and words[0] in _SQL_EXPLAIN_MODES:
+                rest = _sql_after_words(rest, 1)
+                words = _sql_words(rest, 1)
+            t = rest
+            continue
+        return verb, t
+    return "", t
+
+
+def _sql_ident_at(masked: _MaskedSql, text: str) -> Optional[str]:
+    """The (unmasked) 1- to 3-part object name at the start of masked ``text``."""
+    m = _SQL_IDENT_RE.match(text)
     if not m:
-        if _SQL_WRITE_VERB_RE.match(text):
-            # A write verb we recognise but could not parse a target for.
-            return "", False, locations
-        return None, False, locations
-    return m.group(1), bool(_SQL_SCHEMA_STMT_RE.match(text)), locations
+        return None
+    return masked.unmask(m.group(1)).strip()
 
 
-_REM_ENV = "Pass values through dbutils.widgets / job parameters instead of reading the process environment."
+def _sql_refused(rule: str, verb: str, target: str, detail: str, remediation: str) -> SqlVerdict:
+    return SqlVerdict(allowed=False, kind="refused", verb=verb, rule=rule, target=target,
+                      detail=detail, remediation=remediation)
+
+
+def _sql_refused_token(masked_text: str) -> Optional[Tuple[str, str, str]]:
+    """``(target, detail, remediation)`` for a token refused anywhere in a statement."""
+    m = _SQL_JVM_CALL_RE.search(masked_text)
+    if m:
+        name = m.group(1).lower() + "("
+        return name, f"{name}) calls arbitrary Java from SQL", _REM_SQL_JVM
+    if _SQL_SCRIPT_TRANSFORM_RE.search(masked_text):
+        return "TRANSFORM ... USING", "Hive script transform (TRANSFORM .. USING '<cmd>') runs a shell command", \
+            _REM_SQL_SCRIPT
+    return None
+
+
+def _sql_option_paths(masked: _MaskedSql) -> List[str]:
+    """Every ``OPTIONS (.. path '<p>' ..)`` / ``OPTIONS ('path' = '<p>')`` value."""
+    paths: List[str] = []
+    for om in _SQL_OPTIONS_RE.finditer(masked.text):
+        for item in om.group(1).split(","):
+            im = _SQL_OPTION_ITEM_RE.match(item)
+            if not im:
+                continue
+            key = masked.unmask(im.group(1)).strip().strip("`'\"").lower()
+            if key == "path":
+                paths.append(masked.string(im.group(3)))
+    return paths
+
+
+def _sql_judge_paths(policy: SandboxPolicy, verb: str, write_paths: Sequence[str],
+                     read_paths: Sequence[str]) -> Optional[SqlVerdict]:
+    """A write location must sit under the prefix; a read source may be object
+    storage or a path under the prefix but not a local path outside it."""
+    for p in write_paths:
+        if not policy.path_in_sandbox(p):
+            return _sql_refused(RULE_SQL_TARGET, verb, p, "LOCATION / OPTIONS path outside the sandbox prefix",
+                                f"Use a LOCATION under {policy.prefix}.")
+    for p in read_paths:
+        if _is_local_path(p) and not policy.path_in_sandbox(_local_path_for_check(p)):
+            return _sql_refused(RULE_OPEN_PATH, verb, p,
+                                "SQL path source on the cluster's local filesystem outside the sandbox prefix",
+                                _REM_SQL_PATH_READ)
+    return None
+
+
+def _sql_conf_allowed(key: str) -> bool:
+    k = key.strip().strip("`").lower()
+    if _SQL_SET_DENY_RE.search(k):
+        return False
+    return k in _SQL_SET_ALLOWED_CONFS or k.startswith(_SQL_SET_ALLOWED_CONF_PREFIXES)
+
+
+def _sql_judge_target(policy: SandboxPolicy, verb: str, name: Optional[str], schema_object: bool,
+                      shown: str) -> Optional[SqlVerdict]:
+    """Refuse a write whose object name is missing or outside the sandbox."""
+    if not name:
+        return _sql_refused(RULE_SQL_TARGET, verb, shown, "write statement whose target could not be resolved",
+                            f"Qualify the target as {policy.catalog}.{policy.schema}.<table> inside the sandbox.")
+    pm = _SQL_PATH_TABLE_NAME_RE.match(name)
+    if pm:
+        # INSERT INTO delta.`/path` / OPTIMIZE delta.`oci://..`: a write to a path.
+        path = pm.group(2)
+        if not policy.path_in_sandbox(path):
+            return _sql_refused(RULE_SQL_TARGET, verb, path, "path-table write target outside the sandbox prefix",
+                                f"Write under {policy.prefix}.")
+        return None
+    inside = policy.schema_in_sandbox(name) if schema_object else policy.table_in_sandbox(name)
+    if not inside:
+        return _sql_refused(RULE_SQL_TARGET, verb, name,
+                            f"DDL/DML target outside {policy.catalog}.{policy.schema}",
+                            f"Target {policy.catalog}.{policy.schema}.<table> "
+                            "(1-part names are treated as outside the sandbox).")
+    return None
+
+
+def _sql_create_object(text: str) -> Tuple[Set[str], str, str]:
+    """``CREATE [OR REPLACE] <flags> <object> ..`` -> (flags, object word, text after the object)."""
+    rest = _sql_after_words(text, 1)                   # past CREATE
+    if _sql_words(rest, 2) == ["OR", "REPLACE"]:
+        rest = _sql_after_words(rest, 2)
+    flags: Set[str] = set()
+    words = _sql_words(rest, 1)
+    while words and words[0] in _SQL_CREATE_FLAGS:
+        flags.add(words[0])
+        rest = _sql_after_words(rest, 1)
+        words = _sql_words(rest, 1)
+    obj = words[0] if words else ""
+    return flags, obj, _sql_after_words(rest, 1)
+
+
+def classify_sql(statement: str, policy: SandboxPolicy) -> SqlVerdict:
+    """Allowlist verdict for one ``spark.sql`` / ``sql`` statement.
+
+    Allowed as a read (no target check): ``SELECT``, ``VALUES``, ``TABLE``,
+    ``WITH .. SELECT``, ``SHOW *``, ``DESCRIBE`` / ``DESC``, ``EXPLAIN
+    <allowed statement>``, ``CACHE`` / ``UNCACHE TABLE``, ``CLEAR CACHE``,
+    ``REFRESH TABLE`` / ``REFRESH FUNCTION``, ``CREATE [OR REPLACE] [GLOBAL]
+    TEMP[ORARY] VIEW`` without ``LOCATION``, ``USE`` of the sandbox catalog /
+    schema, ``SET`` / ``RESET`` of an allowlisted conf, ``SET TIME ZONE``.
+    Allowed as a write when the target is inside ``catalog.schema`` (a path
+    target under the prefix): ``CREATE`` / ``REPLACE`` ``TABLE`` / ``VIEW`` /
+    ``SCHEMA``, ``INSERT INTO`` / ``OVERWRITE [TABLE]``, ``MERGE``, ``UPDATE``,
+    ``DELETE``, ``DROP``, ``ALTER``, ``TRUNCATE``, ``OPTIMIZE``, ``VACUUM``,
+    ``RESTORE``, ``MSCK REPAIR TABLE``, ``ANALYZE TABLE(S)``, ``COPY INTO``,
+    ``CREATE TABLE .. CLONE``; ``LOCATION`` / ``OPTIONS (path ..)`` must sit
+    under the prefix. The verb behind a ``WITH`` CTE list is the statement's
+    verb, so ``WITH x AS (..) INSERT INTO ..`` is judged as the write it is.
+
+    Refused: a text with more than one statement; ``reflect(`` /
+    ``java_method(`` / ``TRANSFORM .. USING '<cmd>'`` anywhere; path sources
+    (``<format>.`<path>```, ``COPY INTO .. FROM '<path>'``, ``OPTIONS (path
+    ..)`` on a read) naming a local-filesystem path outside the prefix
+    (``NBP-OPEN-PATH``; object-storage URIs stay allowed for reads); ``ADD`` /
+    ``LIST`` ``JAR`` / ``FILE`` / ``ARCHIVE``, ``CREATE`` / ``DROP FUNCTION``,
+    ``GRANT`` / ``REVOKE``, ``CALL``, ``DECLARE`` / ``EXECUTE IMMEDIATE`` /
+    ``BEGIN .. END``, ``INSERT OVERWRITE [LOCAL] DIRECTORY``, ``LOAD DATA
+    [LOCAL] INPATH``, ``SET`` / ``RESET`` outside the conf allowlist, ``USE``
+    of anything but the sandbox, ``FROM .. INSERT`` multi-insert and every
+    other verb (``NBP-SQL-REFUSED``); a write target outside the sandbox
+    (``NBP-SQL-TARGET``).
+    """
+    if not isinstance(statement, str):
+        return _sql_refused(RULE_SQL_REFUSED, "", "<non-string>", "statement is not a string", _REM_SQL_REFUSED)
+    masked = _MaskedSql(statement)
+    text = masked.text
+    shown = statement.strip().split("\n", 1)[0][:80]
+    if not text:
+        return _sql_refused(RULE_SQL_REFUSED, "", "<empty>", "empty statement", _REM_SQL_REFUSED)
+    body = text.rstrip()
+    if body.endswith(";"):
+        body = body[:-1].rstrip()
+    if ";" in body:
+        return _sql_refused(RULE_SQL_REFUSED, "", "<multiple statements>",
+                            "more than one statement in one spark.sql() call", _REM_SQL_REFUSED)
+    token = _sql_refused_token(body)
+    if token is not None:
+        target, detail, remediation = token
+        return _sql_refused(RULE_SQL_REFUSED, "", target, detail, remediation)
+    verb, stmt = _sql_resolve_verb(body)
+    if not verb:
+        return _sql_refused(RULE_SQL_REFUSED, "", shown, "statement whose leading keyword could not be determined",
+                            _REM_SQL_REFUSED)
+    words = _sql_words(stmt, 4)
+    phrase = " ".join(words[:2])
+
+    # Path sources shared by reads and writes.
+    path_tables = [masked.ident(m.group(2)) for m in _SQL_PATH_TABLE_RE.finditer(body)]
+    locations = [masked.string(m.group(1)) for m in _SQL_LOCATION_RE.finditer(body)]
+    from_paths = [masked.string(m.group(1)) for m in _SQL_FROM_PATH_RE.finditer(body)]
+    option_paths = _sql_option_paths(masked)
+
+    def read(kind_verb: str) -> SqlVerdict:
+        bad = _sql_judge_paths(policy, kind_verb, locations, path_tables + from_paths + option_paths)
+        return bad or SqlVerdict(allowed=True, kind="read", verb=kind_verb)
+
+    def write(kind_verb: str, name: Optional[str], schema_object: bool = False) -> SqlVerdict:
+        target_path = None
+        if name:
+            pm = _SQL_PATH_TABLE_NAME_RE.match(name)
+            if pm:
+                target_path = pm.group(2)
+        sources = [p for p in path_tables if p != target_path] + from_paths
+        bad = _sql_judge_paths(policy, kind_verb, list(locations) + list(option_paths), sources)
+        if bad is not None:
+            return bad
+        bad = _sql_judge_target(policy, kind_verb, name, schema_object, shown)
+        return bad or SqlVerdict(allowed=True, kind="write", verb=kind_verb, target=name or "")
+
+    def refused(kind_verb: str, detail: str, remediation: str = _REM_SQL_REFUSED,
+                rule: str = RULE_SQL_REFUSED, target: str = "") -> SqlVerdict:
+        return _sql_refused(rule, kind_verb, target or kind_verb, detail, remediation)
+
+    if verb in _SQL_READ_VERBS:
+        return read(verb)
+    if verb == "CLEAR" and words[1:2] == ["CACHE"]:
+        return read("CLEAR CACHE")
+    if verb == "REFRESH":
+        if words[1:2] in (["TABLE"], ["FUNCTION"]):
+            return read(phrase)
+        return refused(phrase or verb, "REFRESH of a path is not in the SQL read allowlist")
+    if verb == "USE":
+        rest = stmt
+        kind = "USE"
+        if words[1:2] in (["CATALOG"], ["SCHEMA"], ["DATABASE"], ["NAMESPACE"]):
+            kind = phrase
+            rest = _sql_after_words(stmt, 2)
+        else:
+            rest = _sql_after_words(stmt, 1)
+        name = _sql_ident_at(masked, rest)
+        if not name:
+            return refused(kind, "USE without a resolvable name")
+        parts = [p.lower() for p in _split_table_name(name)]
+        if parts == [policy.catalog] or policy.schema_in_sandbox(name):
+            return SqlVerdict(allowed=True, kind="read", verb=kind, target=name)
+        return refused(kind, f"USE outside the sandbox {policy.catalog}.{policy.schema}", rule=RULE_SQL_TARGET,
+                       target=name, remediation=f"USE {policy.catalog} or USE {policy.catalog}.{policy.schema}.")
+    if verb in ("SET", "RESET"):
+        if _SQL_SET_TIME_ZONE_RE.match(stmt):
+            return SqlVerdict(allowed=True, kind="read", verb="SET TIME ZONE")
+        km = _SQL_SET_KEY_RE.match(stmt)
+        if km and _sql_conf_allowed(km.group(2)):
+            return SqlVerdict(allowed=True, kind="read", verb=verb, target=km.group(2))
+        key = km.group(2) if km else ""
+        return refused(verb, f"{verb} of a conf outside the allowlist" if key else f"bare {verb}", _REM_SQL_SET,
+                       target=f"{verb} {key}".strip())
+    if verb == "CREATE":
+        flags, obj, rest = _sql_create_object(stmt)
+        if obj == "FUNCTION":
+            return refused("CREATE FUNCTION", "CREATE FUNCTION registers a JVM class or a Python/SQL body as a "
+                                              "function", _REM_SQL_REFUSED)
+        if flags & _SQL_TEMP_FLAGS and obj in _SQL_TABLE_OBJECTS:
+            # Session-scoped; a LOCATION on it is judged as a write location, OPTIONS (path) as a read source.
+            kind = "CREATE TEMP VIEW"
+            bad = _sql_judge_paths(policy, kind, locations, path_tables + from_paths + option_paths)
+            return bad or SqlVerdict(allowed=True, kind="read", verb=kind)
+        if obj in _SQL_CATALOG_OBJECTS:
+            if _sql_words(rest, 3) == ["IF", "NOT", "EXISTS"]:
+                rest = _sql_after_words(rest, 3)
+            return write(f"CREATE {obj}", _sql_ident_at(masked, rest), obj in _SQL_SCHEMA_OBJECTS)
+        return refused(f"CREATE {obj}".strip(), f"CREATE {obj or '<?>'} is not in the SQL allowlist")
+    if verb == "REPLACE" and words[1:2] == ["TABLE"]:
+        return write("REPLACE TABLE", _sql_ident_at(masked, _sql_after_words(stmt, 2)))
+    if verb == "INSERT":
+        if words[1:2] in (["INTO"], ["OVERWRITE"]):
+            rest = _sql_after_words(stmt, 2)
+            if words[1] == "OVERWRITE" and words[2:3] in (["DIRECTORY"], ["LOCAL"]):
+                return refused("INSERT OVERWRITE DIRECTORY", "INSERT OVERWRITE [LOCAL] DIRECTORY writes files to a "
+                                                             "path", _REM_SQL_REFUSED)
+            if words[2:3] == ["TABLE"]:
+                rest = _sql_after_words(rest, 1)
+            return write(phrase, _sql_ident_at(masked, rest))
+        return refused(phrase or verb, "INSERT form not in the SQL allowlist")
+    if verb == "MERGE":
+        rest = _sql_after_words(stmt, 1)
+        if _sql_words(rest, 3) == ["WITH", "SCHEMA", "EVOLUTION"]:
+            rest = _sql_after_words(rest, 3)
+        if _sql_words(rest, 1) != ["INTO"]:
+            return refused("MERGE", "MERGE form not in the SQL allowlist")
+        return write("MERGE INTO", _sql_ident_at(masked, _sql_after_words(rest, 1)))
+    if verb == "UPDATE":
+        return write("UPDATE", _sql_ident_at(masked, _sql_after_words(stmt, 1)))
+    if verb == "DELETE":
+        if words[1:2] != ["FROM"]:
+            return refused("DELETE", "DELETE form not in the SQL allowlist")
+        return write("DELETE FROM", _sql_ident_at(masked, _sql_after_words(stmt, 2)))
+    if verb in ("DROP", "ALTER"):
+        rest = _sql_after_words(stmt, 1)
+        obj_words = _sql_words(rest, 1)
+        if obj_words == ["TEMPORARY"]:
+            rest = _sql_after_words(rest, 1)
+            obj_words = _sql_words(rest, 1)
+        obj = obj_words[0] if obj_words else ""
+        if obj == "FUNCTION":
+            return refused(f"{verb} FUNCTION", f"{verb} FUNCTION changes the session's function registry")
+        if obj not in _SQL_CATALOG_OBJECTS:
+            return refused(f"{verb} {obj}".strip(), f"{verb} {obj or '<?>'} is not in the SQL allowlist")
+        rest = _sql_after_words(rest, 1)
+        if verb == "DROP" and _sql_words(rest, 2) == ["IF", "EXISTS"]:
+            rest = _sql_after_words(rest, 2)
+        return write(f"{verb} {obj}", _sql_ident_at(masked, rest), obj in _SQL_SCHEMA_OBJECTS)
+    if verb == "TRUNCATE":
+        if words[1:2] != ["TABLE"]:
+            return refused("TRUNCATE", "TRUNCATE form not in the SQL allowlist")
+        return write("TRUNCATE TABLE", _sql_ident_at(masked, _sql_after_words(stmt, 2)))
+    if verb in ("OPTIMIZE", "VACUUM"):
+        rest = _sql_after_words(stmt, 1)
+        sm = _SQL_STR_PLACEHOLDER_RE.match(rest)
+        if sm:
+            # VACUUM '/path' / OPTIMIZE '/path': a write to a path.
+            path = masked.string(sm.group(1))
+            bad = _sql_judge_paths(policy, verb, [path], [])
+            return bad or SqlVerdict(allowed=True, kind="write", verb=verb, target=path)
+        return write(verb, _sql_ident_at(masked, rest))
+    if verb == "RESTORE":
+        rest = _sql_after_words(stmt, 2 if words[1:2] == ["TABLE"] else 1)
+        return write("RESTORE TABLE", _sql_ident_at(masked, rest))
+    if verb == "MSCK":
+        if words[1:3] != ["REPAIR", "TABLE"]:
+            return refused("MSCK", "MSCK form not in the SQL allowlist")
+        return write("MSCK REPAIR TABLE", _sql_ident_at(masked, _sql_after_words(stmt, 3)))
+    if verb == "ANALYZE":
+        if words[1:2] == ["TABLE"]:
+            return write("ANALYZE TABLE", _sql_ident_at(masked, _sql_after_words(stmt, 2)))
+        if words[1:3] == ["TABLES", "IN"]:
+            return write("ANALYZE TABLES", _sql_ident_at(masked, _sql_after_words(stmt, 3)), True)
+        return refused("ANALYZE", "ANALYZE TABLES without a schema works on the session's current database",
+                       rule=RULE_SQL_TARGET, target=shown,
+                       remediation=f"ANALYZE TABLES IN {policy.catalog}.{policy.schema} ..")
+    if verb == "COPY":
+        if words[1:2] != ["INTO"]:
+            return refused("COPY", "COPY form not in the SQL allowlist")
+        return write("COPY INTO", _sql_ident_at(masked, _sql_after_words(stmt, 2)))
+    if verb == "ADD":
+        return refused(phrase or verb, "ADD JAR / FILE / ARCHIVE loads outside code or files into the session")
+    if verb == "LIST":
+        return refused(phrase or verb, "LIST JAR / FILE enumerates the session's resources")
+    if verb in ("GRANT", "REVOKE", "DENY"):
+        return refused(verb, f"{verb} changes privileges")
+    if verb == "CALL":
+        return refused(verb, "CALL runs a stored procedure")
+    if verb in ("DECLARE", "EXECUTE", "BEGIN", "FOR", "IF", "WHILE", "REPEAT", "LOOP", "CASE", "LEAVE",
+                "ITERATE", "SIGNAL"):
+        return refused(verb, f"SQL scripting ({verb} ..) builds and runs statements at run time")
+    if verb == "LOAD":
+        return refused("LOAD DATA", "LOAD DATA [LOCAL] INPATH reads a path into a table")
+    if verb == "FROM":
+        return refused("FROM", "FROM .. INSERT / FROM .. SELECT multi-insert syntax is not in the SQL allowlist")
+    return refused(verb, f"statement verb {verb} is not in the SQL read allowlist")
+
+
+def classify_sql_expression(expression: str, policy: SandboxPolicy) -> SqlVerdict:
+    """Verdict for a SQL *expression* string (``selectExpr`` / ``filter`` /
+    ``where`` / ``functions.expr``): refuses ``reflect(`` / ``java_method(``
+    and the script transform; path tables cannot occur in an expression."""
+    if not isinstance(expression, str):
+        return SqlVerdict(allowed=True, kind="read", verb="<expr>")
+    masked = _MaskedSql(expression)
+    token = _sql_refused_token(masked.text)
+    if token is not None:
+        target, detail, remediation = token
+        return _sql_refused(RULE_SQL_REFUSED, "<expr>", target, detail, remediation)
+    return SqlVerdict(allowed=True, kind="read", verb="<expr>")
+
+
+def _sql_head_verb(head: str) -> str:
+    """Top-level verb of the literal head of a dynamic statement (``""`` if undeterminable).
+
+    A head that is just ``EXPLAIN`` (``'EXPLAIN ' + q``) is an ``EXPLAIN``:
+    whatever follows is planned, never executed. A head whose CTE list is not
+    complete (``f"WITH x AS ({sub}) .."``) has no determinable verb.
+    """
+    text = _MaskedSql(head).text
+    if _SQL_TEMP_VIEW_HEAD_RE.match(text):
+        return "CREATE TEMP VIEW"
+    verb, _rest = _sql_resolve_verb(text)
+    if not verb and _sql_words(text, 1) == ["EXPLAIN"]:
+        return "EXPLAIN"
+    return verb
+
+
+def _sql_fragment_refused(fragment: str, policy: SandboxPolicy, last: bool = True) -> Optional[SqlVerdict]:
+    """A literal fragment of a dynamic statement that already carries a refused
+    token (Java call, script transform, a local path table outside the prefix,
+    a statement separator). Fragments are partial, so they are judged raw; a
+    trailing ``;`` is tolerated only on the ``last`` fragment."""
+    m = _SQL_JVM_CALL_RE.search(fragment)
+    if m:
+        name = m.group(1).lower() + "("
+        return _sql_refused(RULE_SQL_REFUSED, "", name, f"{name}) calls arbitrary Java from SQL", _REM_SQL_JVM)
+    if _SQL_SCRIPT_TRANSFORM_RAW_RE.search(fragment):
+        return _sql_refused(RULE_SQL_REFUSED, "", "TRANSFORM ... USING",
+                            "Hive script transform (TRANSFORM .. USING '<cmd>') runs a shell command", _REM_SQL_SCRIPT)
+    for pm in _SQL_PATH_TABLE_RAW_RE.finditer(fragment):
+        path = pm.group(2)
+        if _is_local_path(path) and not policy.path_in_sandbox(_local_path_for_check(path)):
+            return _sql_refused(RULE_OPEN_PATH, "", path,
+                                "SQL path source on the cluster's local filesystem outside the sandbox prefix",
+                                _REM_SQL_PATH_READ)
+    body = _MaskedSql(fragment).text.rstrip()
+    if last and body.endswith(";"):
+        body = body[:-1]
+    if ";" in body:
+        return _sql_refused(RULE_SQL_REFUSED, "", "<multiple statements>",
+                            "more than one statement in one spark.sql() call", _REM_SQL_REFUSED)
+    return None
+
+
+def _ends_with_literal(node: ast.AST) -> bool:
+    """Does the statement's text END with a literal fragment? (``'.. ;' + q`` does not:
+    the ``;`` is a separator before run-time text, not a trailing terminator.)"""
+    if isinstance(node, ast.JoinedStr):
+        return bool(node.values) and isinstance(node.values[-1], ast.Constant)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        return _ends_with_literal(node.right)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
+        return _ends_with_literal(node.left)
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "format":
+        return _ends_with_literal(node.func.value)
+    return isinstance(node, ast.Constant) and isinstance(node.value, str)
+
+
+def _literal_fragments(node: ast.AST, include_format_args: bool = True) -> List[str]:
+    """Every string constant of an f-string / concatenation / ``%`` / ``.format(..)``
+    statement, in statement order (``.format`` arguments last, when included)."""
+    out: List[str] = []
+    if isinstance(node, ast.JoinedStr):
+        for part in node.values:
+            if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                out.append(part.value)
+            elif isinstance(part, ast.FormattedValue):
+                out.extend(_literal_fragments(part.value, include_format_args))
+    elif isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Mod)):
+        out.extend(_literal_fragments(node.left, include_format_args))
+        out.extend(_literal_fragments(node.right, include_format_args))
+    elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "format":
+        out.extend(_literal_fragments(node.func.value, include_format_args))
+        if include_format_args:
+            for a in node.args:
+                out.extend(_literal_fragments(a, include_format_args))
+    elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+        out.append(node.value)
+    return out
+
+
+_REM_ENV ="Pass values through dbutils.widgets / job parameters instead of reading the process environment."
 _REM_PROC = "Shell/process execution is not available inside the sandbox."
 _REM_TAMPER = ("The policy, the compat shims and the interpreter modules are read-only for notebook code; "
                "change the sandbox through AIDP_SANDBOX_* / AIDP_NOTEBOOK_POLICY_ALLOW after review.")
@@ -1322,6 +1982,8 @@ _REM_IPYTHON = ("The IPython shell API (get_ipython, InteractiveShell, %magics, 
                 "the sandbox; express the step in plain Python or dbutils.")
 _REM_JVM = ("The Spark JVM / py4j bridge (spark._jvm, sc._jsc, df._jdf, py4j) and private Spark attributes are "
             "not available inside the sandbox; use the public PySpark API or dbutils.fs.")
+_REM_SESSION = ("spark.newSession(), SparkSession.builder..getOrCreate() and SparkSession.getActiveSession() hand "
+                "out a session object without the runtime SQL guard; use the `spark` session the run provides.")
 _REM_DESERIALIZE = ("Deserialising bytes with pickle / marshal / shelve / dill / joblib / jsonpickle, yaml.load without "
                     "SafeLoader or torch.load without weights_only=True executes code; use a data format "
                     "(parquet, json, yaml.safe_load, weights_only=True) or list NBP-DESERIALIZE in "
@@ -1877,6 +2539,11 @@ class _PolicyScanner(ast.NodeVisitor):
         if root in _SPARK_ROOTS and chain[-1] in _SPARK_JVM_UDF_ATTRS:
             target = ".".join(chain)
             return RULE_POLICY_TAMPER, target, f"{target}() registers a JVM class", _REM_JVM
+        if root in _SPARK_ROOTS and chain[-1] in _SPARK_SESSION_FACTORY_ATTRS:
+            target = ".".join(chain)
+            return RULE_POLICY_TAMPER, target, \
+                f"{target}() creates or fetches a session object that would not carry the runtime SQL guard", \
+                _REM_SESSION
         if root == "get_ipython":
             target = ".".join(chain)
             if chain[-1] in _IPYTHON_SHELL_ATTRS:
@@ -3078,50 +3745,45 @@ class _PolicyScanner(ast.NodeVisitor):
             head = _joined_literal_head(resolved) if resolved is not None else None
             if head is None:
                 self._add(RULE_SQL_DYNAMIC, node, f"{call_name}() statement that cannot be resolved statically",
-                          target="<dynamic>",
-                          remediation="Pass a literal statement (or a name bound once to one), or list "
-                                      "NBP-SQL-DYNAMIC in AIDP_NOTEBOOK_POLICY_ALLOW after review.")
+                          target="<dynamic>", remediation=_REM_SQL_DYNAMIC)
                 return
-            # Spark runs one statement per call: a statement whose literal head
-            # (after whitespace / comments) is a read keyword, or a session-scoped
-            # TEMP VIEW, cannot become a write whatever the run-time tail is.
-            head_text = _SQL_COMMENT_RE.sub(" ", head).strip()
-            if _SQL_READ_HEAD_RE.match(head_text) or _SQL_TEMP_VIEW_RE.match(head_text):
+            # A statement with run-time fragments cannot be classified here. It
+            # is allowed only when the runtime SQL guard is active for the run
+            # (dbutils.notebook.run re-classifies the final text before Spark
+            # executes it) AND its literal head verb is a read verb AND no
+            # literal fragment already carries a refused token.
+            head_text = _MaskedSql(head).text
+            verb = _sql_head_verb(head)
+            fragment_hit = None
+            template = _literal_fragments(resolved, include_format_args=False)
+            args = _literal_fragments(resolved)[len(template):]
+            ends_literal = _ends_with_literal(resolved)
+            for i, fragment in enumerate(template + args):
+                fragment_hit = _sql_fragment_refused(fragment, self.policy,
+                                                     last=(ends_literal and i == len(template) - 1))
+                if fragment_hit is not None:
+                    break
+            if not self.ctx.runtime_sql_guard:
+                self._add(RULE_SQL_DYNAMIC, node,
+                          f"{call_name}() statement with run-time fragments; the runtime SQL guard is not active "
+                          "for this scan, so it cannot be classified", target="<dynamic>",
+                          remediation=_REM_SQL_DYNAMIC)
+            elif fragment_hit is not None:
+                self._add(fragment_hit.rule, node, f"{call_name}() {fragment_hit.detail}",
+                          target=fragment_hit.target, remediation=fragment_hit.remediation)
+            elif verb in _SQL_DYNAMIC_READ_VERBS or verb == "CREATE TEMP VIEW":
                 self._note(NOTE_UNVERIFIED_SQL_READ, node,
-                           f"{call_name}() read statement with run-time fragments; allowed, the literal head "
-                           "fixes the statement type", target=head_text[:80])
-            elif head_text and _is_sql_write_verb(head_text):
-                self._add(RULE_SQL_DYNAMIC, node, f"{call_name}() DDL/DML with a non-literal target",
-                          target="<dynamic>",
-                          remediation="Use a literal sandbox table, or list NBP-SQL-DYNAMIC in "
-                                      "AIDP_NOTEBOOK_POLICY_ALLOW after review.")
+                           f"{call_name}() read statement with run-time fragments; allowed, the runtime SQL guard "
+                           "re-classifies the final statement before Spark executes it", target=head_text[:80])
             else:
                 self._add(RULE_SQL_DYNAMIC, node,
-                          f"{call_name}() statement whose leading keyword is not a literal read keyword",
-                          target="<dynamic>",
-                          remediation="Start the statement with a literal SELECT / WITH / SHOW / DESCRIBE / "
-                                      "EXPLAIN (or CREATE TEMP VIEW), pass a fully literal statement, or list "
-                                      "NBP-SQL-DYNAMIC in AIDP_NOTEBOOK_POLICY_ALLOW after review.")
+                          f"{call_name}() statement whose literal head is not a read verb", target="<dynamic>",
+                          remediation=_REM_SQL_DYNAMIC)
             return
-        name, is_schema_stmt, locations = _sql_write_target(lit)
-        for location in locations:
-            if not self.policy.path_in_sandbox(location):
-                self._add(RULE_SQL_TARGET, node, f"{call_name}() LOCATION / OPTIONS path outside the sandbox prefix",
-                          target=location, remediation=f"Use a LOCATION under {self.policy.prefix}.")
-        if name is None:
-            return
-        if name == "":
-            self._add(RULE_SQL_TARGET, node, f"{call_name}() write statement whose target could not be resolved",
-                      target=lit.strip().split("\n", 1)[0][:80],
-                      remediation="Qualify the target as <catalog>.<schema>.<table> inside the sandbox.")
-            return
-        inside = self.policy.schema_in_sandbox(name) if is_schema_stmt else self.policy.table_in_sandbox(name)
-        if not inside:
-            self._add(RULE_SQL_TARGET, node,
-                      f"{call_name}() DDL/DML target outside {self.policy.catalog}.{self.policy.schema}",
-                      target=name,
-                      remediation=f"Target {self.policy.catalog}.{self.policy.schema}.<table> "
-                                  "(1-part names are treated as outside the sandbox).")
+        verdict = classify_sql(lit, self.policy)
+        if not verdict.allowed:
+            self._add(verdict.rule, node, f"{call_name}() {verdict.detail}", target=verdict.target,
+                      remediation=verdict.remediation)
 
 
 def scan_source(source: str, *, filename: str = "<cell>", policy: Optional[SandboxPolicy] = None,
@@ -3163,8 +3825,9 @@ def enforce_cell_policy(source: str, *, notebook_path: str, cell_index: int,
     """Gate one code cell. Returns the allowed exceptions; raises on refusal.
 
     Allowed-but-unverified operations (a library reader with a dynamic path,
-    a ``spark.sql`` read statement with run-time fragments) are recorded in
-    the policy log under the :data:`POLICY_NOTES` events before the verdict.
+    a ``spark.sql`` read statement with run-time fragments while
+    ``context.runtime_sql_guard`` is set) are recorded in the policy log under
+    the :data:`POLICY_NOTES` events before the verdict.
 
     Raises:
         SandboxUndeclaredError: no policy declared.
@@ -3235,6 +3898,52 @@ def assert_table_in_sandbox(table_name: str, *, operation: str, policy: Optional
     return table_name
 
 
+def assert_sql_allowed(statement: str, *, operation: str, policy: Optional[SandboxPolicy] = None,
+                       notebook_path: str = "", cell_index: Optional[int] = None) -> SqlVerdict:
+    """Runtime SQL guard: classify the FINAL statement text on its way to Spark.
+
+    Installed by ``dbutils.notebook.run`` on the session's ``sql`` entry
+    points for the duration of the run. A refused verdict is appended to the
+    policy log (``runtime_refused``) and raised as :class:`PolicyViolation`
+    before Spark sees the statement; an allowed verdict is returned.
+    """
+    pol = policy or require_policy()
+    verdict = classify_sql(statement, pol)
+    if not verdict.allowed:
+        shown = statement.strip().split("\n", 1)[0][:80] if isinstance(statement, str) else "<non-string>"
+        _record("runtime_refused", rule=verdict.rule, target=verdict.target, notebook_path=notebook_path,
+                cell_index=cell_index, remediation=verdict.remediation,
+                detail={"operation": operation, "detail": verdict.detail, "statement": shown})
+        raise PolicyViolation(
+            f"{operation}: [{verdict.rule}] {verdict.detail} (target: {verdict.target or '-'}). "
+            f"Remediation: {verdict.remediation}",
+            notebook_path=notebook_path, cell_index=cell_index, rule_id=verdict.rule, target=verdict.target,
+            remediation=verdict.remediation,
+        )
+    return verdict
+
+
+def assert_sql_expression_allowed(expression: str, *, operation: str, policy: Optional[SandboxPolicy] = None,
+                                  notebook_path: str = "", cell_index: Optional[int] = None) -> SqlVerdict:
+    """Runtime guard for SQL expression strings (``DataFrame.selectExpr`` /
+    ``filter`` / ``where``, ``functions.expr``): refuses ``reflect(`` /
+    ``java_method(`` / the script transform, see :func:`classify_sql_expression`."""
+    pol = policy or require_policy()
+    verdict = classify_sql_expression(expression, pol)
+    if not verdict.allowed:
+        shown = expression.strip()[:80]
+        _record("runtime_refused", rule=verdict.rule, target=verdict.target, notebook_path=notebook_path,
+                cell_index=cell_index, remediation=verdict.remediation,
+                detail={"operation": operation, "detail": verdict.detail, "expression": shown})
+        raise PolicyViolation(
+            f"{operation}: [{verdict.rule}] {verdict.detail} (target: {verdict.target or '-'}). "
+            f"Remediation: {verdict.remediation}",
+            notebook_path=notebook_path, cell_index=cell_index, rule_id=verdict.rule, target=verdict.target,
+            remediation=verdict.remediation,
+        )
+    return verdict
+
+
 def record_secret_refusal(target: str, *, operation: str, remediation: str) -> None:
     """Log a ``dbutils.secrets`` allowlist refusal (raised by ``aidp_compat.secrets``)."""
     _record("runtime_refused", rule=RULE_RUNTIME_SECRET, target=target, remediation=remediation,
@@ -3259,6 +3968,8 @@ __all__ = [
     "ScanContext",
     "set_sandbox_policy", "current_policy", "require_policy",
     "scan_source", "enforce_cell_policy",
+    "SqlVerdict", "classify_sql", "classify_sql_expression", "assert_sql_allowed", "assert_sql_expression_allowed",
+    "SPARK_ROOT_NAMES",
     "assert_path_in_sandbox", "assert_table_in_sandbox", "record_secret_refusal", "record_skipped_cell",
     "get_policy_log", "clear_policy_log", "policy_log_json", "policy_log_markdown",
     "ALL_RULES", "POLICY_NOTES",

@@ -247,14 +247,27 @@ The same rule table serves every spelling: `posix` / `nt` are judged as `os`, `g
 are walked field by field (`{0.__class__.__mro__}` refused, `{0.__class__.__name__}` fine).
 Library readers (`pd.read_csv`, `spark.read.csv`, `np.load`, `sc.textFile`, ...) with a literal
 local path (`/etc/passwd`, `/dbfs/...`, `~`, `C:\`, `file://`) outside the prefix are refused.
+`spark.sql` is an allowlist, not a blocklist: only read statements (`SELECT` / `VALUES` / `TABLE`
+/ `WITH .. SELECT` / `SHOW` / `DESCRIBE` / `EXPLAIN` / `CACHE` / `UNCACHE` / `REFRESH TABLE` /
+`CREATE TEMP VIEW`) and writes to tables inside the sandbox schema are accepted; the top-level
+verb is resolved behind a `WITH` CTE list (so `WITH x AS (..) INSERT INTO prod.t` is the write it
+is), `reflect(` / `java_method(` / `TRANSFORM .. USING` are refused anywhere in a statement, path
+tables (``text.`/etc/passwd` ``) and `COPY INTO .. FROM` sources on the local filesystem outside
+the prefix are refused, and `ADD JAR`, `CREATE FUNCTION`, `GRANT`, `SET` outside a short conf
+allowlist, SQL scripting, multi-statement texts and every other verb are `NBP-SQL-REFUSED`. While
+`dbutils.notebook.run` executes, a runtime SQL guard re-classifies the final text of every
+`spark.sql` / `selectExpr` / `filter` / `where` / `functions.expr` string before Spark sees it, and
+`spark.newSession()` / `getOrCreate()` / `getActiveSession()` are refused because a fresh session
+would not carry it.
 A target that is a name bound once to a string literal earlier in the run is checked as that
 literal; any other non-literal target is refused unless its rule id is allowlisted, with two
 scope decisions that are allowed and recorded in the policy log instead: a reader path the gate
 cannot resolve (`spark.read.parquet(src)`, `unverified_read_path`; reading source data through
 parameters is the normal migration case and object-storage / catalog reads are never
-path-checked) and a `spark.sql` statement whose literal head is `SELECT` / `WITH` / `SHOW` /
-`DESCRIBE` / `EXPLAIN` (`unverified_sql_read`; Spark runs one statement per call, so it cannot
-become a write), plus a `DataFrame.pipe(fn)` whose callable the gate cannot type, on a receiver
+path-checked) and a `spark.sql` statement with run-time fragments whose literal head verb is a
+read verb (`unverified_sql_read`; admitted only inside `dbutils.notebook.run`, where the runtime
+SQL guard re-classifies the final text before Spark executes it; a bare static scan refuses it as
+`NBP-SQL-DYNAMIC`), plus a `DataFrame.pipe(fn)` whose callable the gate cannot type, on a receiver
 the notebook bound (`unverified_pipe_callable`; `RDD.pipe(cmd)`, any string-typed `.pipe()`
 argument and a receiver the notebook never bound are refused). `open(path_var)` is not such a
 decision: a non-literal `open()` path is refused in read mode as well, and so is
