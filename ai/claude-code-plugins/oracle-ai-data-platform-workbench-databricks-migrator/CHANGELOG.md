@@ -45,7 +45,7 @@ All notable changes to this plugin are documented here. Format loosely follows [
   The reviewer's probes `__builtins__['__import__']('os').system('id')`,
   `__builtins__['open']('/etc/passwd')`, `globals()['__builtins__'][...]`,
   `get_ipython().system('id')`, `spark._jvm...` and `sc._jvm...` all passed the AST gate at
-  d877d90. The scanner now resolves the builtins namespace through every door (`__builtins__`,
+  the first revision of PR #146. The scanner now resolves the builtins namespace through every door (`__builtins__`,
   `builtins`, `globals()` / `locals()` / `vars()`, `__dict__`, `getattr`) and checks the resolved
   builtin exactly like the direct form (`NBP-BUILTIN-EXEC` / `NBP-OPEN-PATH`), refusing any
   non-literal key and any other use of the frame namespace (`NBP-INDIRECT`); refuses `getattr` /
@@ -71,12 +71,12 @@ All notable changes to this plugin are documented here. Format loosely follows [
   and `os.chdir` away from it; and follows aliases of all of these across cells (`sp = spark`,
   `f = getattr`, `b = __builtins__`), refusing a name that was rebound to something it cannot
   resolve (fail closed). The test suite adds the reviewer's six probes verbatim plus per-class
-  refused and clean cells; every new test fails against the d877d90 scanner. The gate remains a
+  refused and clean cells; every new test fails against the first revision of PR #146 scanner. The gate remains a
   static mitigation layer over a full Python runtime; the platform-level control is the IAM
   scope of the cluster (documented in `SUPPORTED_OPERATIONS.md` section 8 together with the
   known false refusals).
 - **Sandbox gate: round-2 gaps closed by generalising the rules** (static review of the
-  SEC-AIDP-SAMPLES-005 gate at edcb186). `posix` / `nt`, the platform modules `os` re-exports,
+  SEC-AIDP-SAMPLES-005 gate at the round-2 baseline gate). `posix` / `nt`, the platform modules `os` re-exports,
   are tracked as aliases of `os`, so `import posix; posix.system(..)`, `from posix import
   environ`, `import nt as n; n.environ` meet every os rule. The os / shutil / sys.modules /
   importlib / asyncio / aidp_compat attribute rules moved into the one rule table that already
@@ -107,9 +107,9 @@ All notable changes to this plugin are documented here. Format loosely follows [
   other literal public names on Spark objects are allowed (dynamic, private and dunder names,
   and the interpreter / compat roots, stay refused); `~`, Windows drive / UNC and `file://`
   paths count as absolute on every host. Every new refused / allowed cell is in the test suite
-  and fails against the edcb186 scanner.
+  and fails against the round-2 baseline gate scanner.
 - **Sandbox gate: review-derived gap classes closed as classes** (automated review of the
-  round-2 commits plus a probe run against edcb186: 49 of the original 80 probe cells passed
+  round-2 commits plus a probe run against the round-2 baseline gate: 49 of the original 80 probe cells passed
   the gate there). (A) A gated module, interpreter root or Spark object may only be the root of
   an attribute chain, the whole right-hand side of a plain name assignment, the callee of a
   call or an argument of `getattr` / `setattr` / `vars` / `isinstance` / `print`; handed around
@@ -145,9 +145,9 @@ All notable changes to this plugin are documented here. Format loosely follows [
   `os.path.join(..)`) and the literal head of an f-string are path-checked. (I) `pydoc` joins
   the process modules. Every probe cell is in the test suite verbatim (first refusal as the
   runner reports it) and the legitimate cells of the same review stay allowed; the new tests
-  fail against the edcb186 scanner.
-- **Sandbox gate: coverage round 1 on d44b776 closed as classes** (an analyzer coverage test
-  found ten gaps and no false refusals; 11 of 119 probe cells passed the gate at d44b776). (J)
+  fail against the round-2 baseline gate scanner.
+- **Sandbox gate: coverage round 1 on the review-probe fix closed as classes** (an analyzer coverage test
+  found ten gaps and no false refusals; 11 of 119 probe cells passed the gate at the review-probe fix). (J)
   A list literal bound to a name is folded into a path (`"/".join(parts)`) only while the name
   is used for nothing but the join: an in-place mutation (`p[0] = '/etc'`, `.insert` /
   `.append` / `.extend` / `.pop`, `del p[0]`, an alias `q = p`, a helper call `mutate(p)`,
@@ -184,9 +184,9 @@ All notable changes to this plugin are documented here. Format loosely follows [
   (`NBP-OPEN-DYNAMIC` / `NBP-OS-PROCESS`): the gate cannot tell it from the builtin or an RDD.
   `open()` and its stdlib / pathlib twins with a dynamic path stay refused in every mode (no
   read allowance). The ten gap cells are in the test suite verbatim with per-class refused and
-  allowed cells; the new tests fail against the d44b776 scanner, and the 146-cell / 31-cell
+  allowed cells; the new tests fail against the review-probe fix scanner, and the 146-cell / 31-cell
   probe files are green.
-- **Sandbox gate: coverage round 2 on cfe1b79 closed as classes** (an analyzer coverage test
+- **Sandbox gate: coverage round 2 on the coverage-round-1 fix closed as classes** (an analyzer coverage test
   found ten gaps and no false refusals). (Q) Local-filesystem writes through library writers,
   the mirror of the reader table: `np.save` / `savez` / `savetxt`, `torch.save` /
   `torch.jit.save`, `joblib.dump`, `scipy.io.savemat`, `cv2.imwrite`, `plt.savefig`,
@@ -214,9 +214,9 @@ All notable changes to this plugin are documented here. Format loosely follows [
   `traceback.walk_stack` / `walk_tb`, `capture_locals=<not the literal False>` on any
   receiver and `.get_stack()` on a receiver the gate cannot resolve; `traceback.print_exc` /
   `format_exc` / `extract_stack` stay allowed. The ten gap cells are in the test suite
-  verbatim with per-class refused and allowed cells; the new tests fail against the cfe1b79
+  verbatim with per-class refused and allowed cells; the new tests fail against the coverage-round-1 fix
   scanner, and the probe files (now 183 refused / 40 allowed cells) are green.
-- **Sandbox gate: coverage round 3 on 26a717b closed as classes** (an analyzer coverage test
+- **Sandbox gate: coverage round 3 on the coverage-round-2 fix closed as classes** (an analyzer coverage test
   found three gaps and no false refusals). (V) A re-export back to the chain's own root:
   `os.path.os.system` / `os.path.genericpath.os.environ`, also through `import os.path as op`
   (`op.os.system`, `op.os.environ`, `op.os.popen`), `from os import path` (`path.os.system`) and
@@ -243,10 +243,10 @@ All notable changes to this plugin are documented here. Format loosely follows [
   `http.server.HTTPServer(..)`, `import wsgiref; wsgiref.simple_server.make_server(..)`);
   `import http` / `http.HTTPStatus` / `wsgiref.util` stay allowed and
   `AIDP_SANDBOX_ALLOW_NETWORK=1` lifts all of it. The three gap cells are in the test suite
-  verbatim with per-class refused and allowed cells; the new tests fail against the 26a717b
+  verbatim with per-class refused and allowed cells; the new tests fail against the coverage-round-2 fix
   scanner, and the probe files (now 225 refused / 62 allowed cells) are green.
 - **Sandbox gate: `Path.open()` / `.rename()` / `.replace()` on a derived Path receiver was
-  fail-open** (regression review on a069dd6; present since d877d90). `_check_pathlib` only
+  fail-open** (regression review on the coverage-round-3 fix; present since the first revision of PR #146). `_check_pathlib` only
   recognised a Path receiver on the bare constructor (`Path(x).open()`) or a name bound once to
   one, so `Path(p).resolve().open('r')`, `q = Path(p).resolve(); q.open('r')`,
   `Path(p).parent.open('r')`, `Path('/etc/passwd').resolve() / .absolute() / .expanduser()
@@ -267,7 +267,7 @@ All notable changes to this plugin are documented here. Format loosely follows [
   `df.rename`, `zf.open(member)`, `fs.open(p)`) reaches the generic rule. The thirteen review
   cells are in the test suite verbatim with the rest of the class (REVIEW_GAP_CELLS_6, a
   cross-cell test, CLEAN_CELLS_9 for the adjacent everyday code); 40 of the new cases fail
-  against the a069dd6 scanner, and the probe files (now 253 refused / 62 allowed cells) are green.
+  against the coverage-round-3 fix scanner, and the probe files (now 253 refused / 62 allowed cells) are green.
 - Python 3.9 floor: `cluster_lifecycle.py` and `fuse_package_analyzer.py` used PEP 604
   `X | None` annotations evaluated at import time; `from __future__ import annotations` added.
 - **Secrets shim is Vault-only by default** (`engine/aidp_compat/secrets.py`,

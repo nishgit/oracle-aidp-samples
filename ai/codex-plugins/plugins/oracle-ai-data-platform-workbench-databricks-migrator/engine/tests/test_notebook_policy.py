@@ -1255,7 +1255,7 @@ def test_clean_notebook_with_dunder_definitions_and_aliases_executes(tmp_path, s
 
 
 # ══════════════════════════════════════════════════════════════════════
-# SEC-AIDP-SAMPLES-005 round 2: gaps from the static review of edcb186
+# SEC-AIDP-SAMPLES-005 round 2: gaps from the static review of the round-2 baseline gate
 # ══════════════════════════════════════════════════════════════════════
 # (9) Each gap is closed by generalising the rule, not the spelling: posix / nt
 #     are os; the indirect (getattr) route consults the same rule table as the
@@ -1451,7 +1451,7 @@ def test_verified_reads_are_not_recorded(sandbox_env):
 
 
 # (11) Review-derived gap classes (automated review of the round-2 commits plus
-#      a probe run against edcb186), each closed as a CLASS of route:
+#      a probe run against the round-2 baseline gate), each closed as a CLASS of route:
 #      A  a gated module / Spark object handed around as a value;
 #      B  a process / introspection sink name on a receiver the gate cannot resolve;
 #      C  RDD.pipe(cmd) and string-typed .pipe() arguments;
@@ -1463,7 +1463,7 @@ def test_verified_reads_are_not_recorded(sandbox_env):
 #      G  globals()[k] with a tainted / alias / protected key or a dereferenced result;
 #      H  open() with *args / **kwargs; I  pydoc joins the process modules.
 #      The 100 probe cells below are the acceptance test, verbatim, with the first
-#      refusal the runner reports; every entry passed the gate at edcb186 or was
+#      refusal the runner reports; every entry passed the gate at the round-2 baseline gate or was
 #      refused for the wrong reason there.
 REVIEW_GAP_CELLS = [
     ("f = os\nf.system('id')", 'NBP-OS-PROCESS', 'os.system'),
@@ -1685,9 +1685,9 @@ def test_review_gap_cell_count():
     assert len(REVIEW_GAP_CELLS) == 100
 
 
-# Coverage round 1 on the d44b776 gate: the tester's ten gap cells verbatim (first
+# Coverage round 1 on the review-probe fix gate: the tester's ten gap cells verbatim (first
 # entry of each block) and the rest of the class each one belongs to. Every cell
-# passed the gate at d44b776.
+# passed the gate at the review-probe fix.
 REVIEW_GAP_CELLS_3 = [
     # J: a list literal mutated in place is no longer the literal it was bound to
     #    (subscript store, append / insert / extend / pop, aliasing, a helper call, *parts)
@@ -2022,9 +2022,9 @@ def test_imported_module_receiver_is_resolved_across_cells(sandbox_env):
     assert npol.scan_source("osname = platform.system()", context=ctx) == []
 
 
-# Coverage round 2 on the cfe1b79 gate: the tester's gap cells verbatim (first entry
+# Coverage round 2 on the coverage-round-1 fix gate: the tester's gap cells verbatim (first entry
 # of each block) and the rest of the class each one belongs to. Every cell passed
-# the gate at cfe1b79.
+# the gate at the coverage-round-1 fix.
 REVIEW_GAP_CELLS_4 = [
     # Q: local-filesystem writes through module-rooted library writers (the mirror of the reader table);
     #    a literal local path outside the prefix is NBP-PATH-WRITE, a dynamic one NBP-PATH-WRITE-DYNAMIC
@@ -2182,7 +2182,7 @@ def test_coverage_round2_adjacent_everyday_code_passes_the_gate(source):
     assert npol.scan_source(source, policy=REVIEW_POLICY) == []
 
 
-# Coverage round 3 (on 26a717b): a re-export back to the chain's own root, a DataFrameWriter /
+# Coverage round 3 (on the coverage-round-2 fix): a re-export back to the chain's own root, a DataFrameWriter /
 # DataFrameReader held in a variable (builder-call result, alias of it, streaming writer) and the
 # server modules; each gap cell verbatim plus the rest of its class.
 REVIEW_GAP_CELLS_5 = [
@@ -2312,7 +2312,7 @@ def test_coverage_round3_adjacent_everyday_code_passes_the_gate(source):
     assert npol.scan_source(source, policy=REVIEW_POLICY) == []
 
 
-# Regression review on a069dd6: Path.open() / .rename() / .replace() on a Path the gate
+# Regression review on the coverage-round-3 fix: Path.open() / .rename() / .replace() on a Path the gate
 # did not recognise as one (a Path-returning step, a derived Path, a name bound to either)
 # fell through to the generic <object>.open(path) rule, which read the MODE string as the
 # path and allowed the call. Every receiver rooted at a Path is a Path: the identity steps
