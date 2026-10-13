@@ -44,10 +44,14 @@ No bundled credentials, no MCP server, no third-party network calls.
   mode is not checked and the report says so). Secrets are never taken as
   command-line flags, and every report names a credential by its file's
   basename — never its value, never its directory.
-- Before any discovery, the session role's grants are read back with `SHOW
-  GRANTS TO ROLE` and the run stops if the role can write the source database
-  (CREATE, ALTER, DROP, INSERT, UPDATE, DELETE, MERGE, TRUNCATE, OWNERSHIP) or
-  if the grants cannot be read. `preflight` lists the grants it found.
+- Before any discovery, the session role's grants and future grants are read
+  back with `SHOW GRANTS TO ROLE` / `SHOW FUTURE GRANTS TO ROLE`, through
+  every role granted to it, and the run stops if the role can write the
+  source database (CREATE, ALTER, DROP, INSERT, UPDATE, DELETE, MERGE,
+  TRUNCATE, OWNERSHIP), holds a privilege that leads to a write (MANAGE
+  GRANTS, OWNERSHIP of a role or user, CREATE ROLE, EXECUTE TASK, ...), is or
+  inherits a system role, or if the grants cannot be read. `preflight` lists
+  the grants it found.
 - The Snowflake credential reaches your AIDP tenancy in two ways, each only
   with `--execute`:
   1. `provision --execute --source-config <file>` uploads the credential

@@ -170,9 +170,18 @@ owner decides the rest. Before the first run:
   role granted to the migration role (`GRANT ROLE SYSADMIN TO ROLE ...`) is
   listed in turn, so a write it inherits counts the same as one granted
   directly, and the refusal names the role that carried it. Do not grant the
-  migration role any other role. With `USE SECONDARY ROLES ALL` in effect
-  every role the user holds is checked too; pass `--only-primary-role` to
-  scope a run to `role:` alone.
+  migration role any other role, and nothing on the account beyond warehouse
+  usage: a grant that is not on a table is judged too, and one that **leads
+  to a write** refuses the session — `MANAGE GRANTS` (the role could grant
+  itself INSERT on every table), `OWNERSHIP` of a role, user or warehouse,
+  `CREATE ROLE` / `CREATE USER`, `EXECUTE TASK`, the `APPLY ... POLICY`
+  privileges, `CREATE SHARE` / `CREATE INTEGRATION`. A system role
+  (`ACCOUNTADMIN`, `SECURITYADMIN`, `USERADMIN`, `SYSADMIN`, `ORGADMIN`)
+  anywhere in the hierarchy is refused without being listed, a privilege the
+  check does not know is refused rather than assumed harmless, and **future
+  grants** (`SHOW FUTURE GRANTS TO ROLE`) are read and judged the same way.
+  With `USE SECONDARY ROLES ALL` in effect every role the user holds is
+  checked too; pass `--only-primary-role` to scope a run to `role:` alone.
 - Enforce **SSO/MFA** for human users and a **network policy** that limits
   where the service user may connect from.
 - Prefer a **key pair** (`auth: keypair`) and **rotate** the key or password

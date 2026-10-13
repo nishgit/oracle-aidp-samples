@@ -327,20 +327,25 @@ def render_preflight_report(result: dict) -> str:
                   if names else "")
         lines += ["## Source role grants", "",
                   f'Role `{roles}`, {grants["grants_read"]} grant(s) read '
-                  f'with `SHOW GRANTS TO ROLE` across the role{walked}; '
-                  f'privileges on {scope}:', "",
+                  f'with `SHOW GRANTS TO ROLE` and '
+                  f'{grants.get("future_grants_read", 0)} future grant(s) '
+                  f'with `SHOW FUTURE GRANTS TO ROLE` across the role'
+                  f'{walked}; privileges on {scope}:', "",
                   "| Privilege | Grants |", "|---|---|"]
         lines += [f"| `{p}` | {n} |" for p, n in grants["by_privilege"].items()]
         if grants["write_grants"]:
-            lines += ["", "**Write privileges on the source — the migration "
-                          "role must not hold these, directly or through a "
-                          "role granted to it:**", ""]
-            lines += [f'- `{w["privilege"]}` on {w["granted_on"]} '
+            lines += ["", "**Write privileges on the source, or privileges "
+                          "that lead to one — the migration role must not "
+                          "hold these, directly or through a role granted "
+                          "to it:**", ""]
+            lines += [f'- {"future " if w.get("future") else ""}'
+                      f'`{w["privilege"]}` on {w["granted_on"]} '
                       f'`{w["name"]}` (role `{w["role"]}`'
                       + (f', via `{w["via"]}`' if w.get("via") else "") + ")"
+                      + (f' — {w["reason"]}' if w.get("reason") else "")
                       for w in grants["write_grants"]]
         if grants.get("out_of_scope_writes"):
-            lines += ["", f'{grants["out_of_scope_writes"]} write grant(s) '
+            lines += ["", f'{grants["out_of_scope_writes"]} refused grant(s) '
                           f'on other databases are outside this migration '
                           f'and were not counted.']
         lines.append("")

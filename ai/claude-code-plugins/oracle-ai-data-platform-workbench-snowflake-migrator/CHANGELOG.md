@@ -30,6 +30,31 @@ migrator plugin, newest first. The format loosely follows
   no roles is resolved from `SHOW GRANTS TO USER`, or refused when that
   cannot be read; a write grant with no object name is judged inside the
   source rather than out of scope.
+- A grant that is not on source data is judged too, instead of being
+  skipped: `MANAGE GRANTS` on the account (the role could grant itself any
+  privilege, INSERT on every table included), `OWNERSHIP` of a role, user,
+  warehouse or integration, `CREATE ROLE` / `CREATE USER` / `CREATE
+  INTEGRATION` / `CREATE SHARE`, the `APPLY ... POLICY` and `APPLY TAG`
+  privileges, `EXECUTE TASK` / `EXECUTE MANAGED TASK` and `MANAGE WAREHOUSES`
+  each refuse the session with the escalation named. Each non-source class
+  has an allowlist of what passes (USAGE/OPERATE/MONITOR/MODIFY on a
+  warehouse; USAGE on an integration; MONITOR USAGE, MONITOR EXECUTION,
+  MONITOR SECURITY, IMPORTED PRIVILEGES, CREATE DATABASE and CREATE WAREHOUSE
+  on the account; USAGE/MONITOR on a resource monitor, network policy,
+  compute pool, connection, replication or failover group, external volume,
+  application or share); any other privilege, on any class, is refused as
+  unknown rather than assumed harmless.
+- A system role (`ACCOUNTADMIN`, `SECURITYADMIN`, `USERADMIN`, `SYSADMIN`,
+  `ORGADMIN`, `GLOBALORGADMIN`) as the session's role, as a secondary role or
+  anywhere in the walked hierarchy refuses the session before its grants are
+  listed.
+- Future grants are read with `SHOW FUTURE GRANTS TO ROLE` / `TO DATABASE
+  ROLE` for every walked role and judged by the same rules: a future INSERT
+  on a schema is a write on every table created there later. A future grants
+  listing that cannot be read, or that reaches the 10,000-row cap, refuses
+  the session like any other.
+- `OPERATE` on a task, pipe, alert or dynamic table and `APPLY` on a policy
+  or tag count as writes on the source (OPERATE stays a read on a warehouse).
 - `init-config` no longer says the config "will hold live credentials": it
   names the credential files, and those are what to keep out of git and chat.
 - `preflight`, every stage and `PROVISION.md` print the credential's source

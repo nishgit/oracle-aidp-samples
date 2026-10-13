@@ -259,6 +259,12 @@ The rules the design holds everywhere.
 `DESCRIBE` or `EXPLAIN` (or a CTE ending in `SELECT`), so no statement the
 plugin builds can be a write. The gate reads the verb, not the whole
 statement, so the migration's read-only role is still what prevents writes.
+`snowflake_source/role_guard.py` proves that role read-only before the first
+read: its grants and future grants are listed through every role granted to
+it; a write on the source, or a privilege that leads to one (`MANAGE GRANTS`,
+`OWNERSHIP` of a role or user, `CREATE ROLE`, `EXECUTE TASK`, ...), refuses
+the session; a system role anywhere in the hierarchy is refused unlisted; and
+an unknown privilege or an unreadable listing fails closed.
 
 **I2 — Read back and compare; a 2xx is not the claim.** AIDP catalog creates
 are asynchronous: they return **202 Accepted** with an empty body and no
