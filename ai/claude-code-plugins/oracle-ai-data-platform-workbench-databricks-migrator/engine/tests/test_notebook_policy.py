@@ -2180,3 +2180,133 @@ CLEAN_CELLS_7 = [
 @pytest.mark.parametrize("source", CLEAN_CELLS_7, ids=[c[:40] for c in CLEAN_CELLS_7])
 def test_coverage_round2_adjacent_everyday_code_passes_the_gate(source):
     assert npol.scan_source(source, policy=REVIEW_POLICY) == []
+
+
+# Coverage round 3 (on 26a717b): a re-export back to the chain's own root, a DataFrameWriter /
+# DataFrameReader held in a variable (builder-call result, alias of it, streaming writer) and the
+# server modules; each gap cell verbatim plus the rest of its class.
+REVIEW_GAP_CELLS_5 = [
+    # V: os.path re-exports os; a segment that names the chain's own root re-roots the chain
+    ("import os.path as op\nop.os.system('id')", "NBP-OS-PROCESS", "os.system"),
+    ("import os.path as op\nop.os.environ['X']", "NBP-OS-ENVIRON", "os.environ"),
+    ("import os.path as op\nop.os.popen('id')", "NBP-OS-PROCESS", "os.popen"),
+    ("import os.path\nos.path.os.system('id')", "NBP-OS-PROCESS", "os.system"),
+    ("import os\nos.path.genericpath.os.system('id')", "NBP-OS-PROCESS", "os.system"),
+    ("import os\nos.path.os.system('id')", "NBP-OS-PROCESS", "os.system"),
+    ("from os.path import os as o\no.system('id')", "NBP-OS-PROCESS", "os.system"),
+    ("from os import path\npath.os.system('id')", "NBP-OS-PROCESS", "os.system"),
+    ("from os import path as p\np.os.environ['X']", "NBP-OS-ENVIRON", "os.environ"),
+    ("import glob\nglob.os.system('id')", "NBP-OS-PROCESS", "os.system"),
+    ("import posixpath\nposixpath.os.system('id')", "NBP-OS-PROCESS", "os.system"),
+    ("import tempfile\ntempfile._os.system('id')", "NBP-OS-PROCESS", "os.system"),
+    ("import random\nrandom._os.system('id')", "NBP-OS-PROCESS", "os.system"),
+    # W: a DataFrameWriter / DataFrameReader held in a variable (builder-call result, alias, streaming)
+    ("wr = df.write.mode('overwrite')\nwr.parquet('/etc/x')", "NBP-PATH-WRITE", "/etc/x"),
+    ("wr = df.write.mode('overwrite').option('x', 'y')\nwr.csv('/etc/x')", "NBP-PATH-WRITE", "/etc/x"),
+    ("wr = df.write.format('delta')\nwr.save('/etc/x')", "NBP-PATH-WRITE", "/etc/x"),
+    ("wr = df.coalesce(1).write\nwr.parquet('/etc/x')", "NBP-PATH-WRITE", "/etc/x"),
+    ("wr = df.write.mode('overwrite')\nwr.saveAsTable('otherc.s.t')", "NBP-TABLE-TARGET", "otherc.s.t"),
+    ("wr = df.write.mode('overwrite')\nwr.format('delta').saveAsTable('otherc.s.t')", "NBP-TABLE-TARGET",
+     "otherc.s.t"),
+    ("wr = df.write.mode('overwrite')\nwr.option('path', '/etc/x').save()", "NBP-PATH-WRITE", "/etc/x"),
+    ("wr = df.write.mode('overwrite')\nwr.parquet(dest)", "NBP-PATH-WRITE-DYNAMIC", "<dynamic>"),
+    ("wr = df.write.mode('overwrite')\nw2 = wr\nw2.parquet('/etc/x')", "NBP-PATH-WRITE", "/etc/x"),
+    ("wr = df.writeTo('otherc.s.t').using('delta')\nwr.createOrReplace()", "NBP-TABLE-TARGET", "otherc.s.t"),
+    ("rd = spark.read.format('csv')\nrd.load('/etc/passwd')", "NBP-OPEN-PATH", "/etc/passwd"),
+    ("wr = df.writeStream.format('delta')\nwr.option('path', '/etc/x').start()", "NBP-PATH-WRITE", "/etc/x"),
+    ("df.writeStream.format('delta').option('path', '/etc/x').start()", "NBP-PATH-WRITE", "/etc/x"),
+    ("df.writeStream.format('delta').start('/etc/x')", "NBP-PATH-WRITE", "/etc/x"),
+    ("df.writeStream.toTable('otherc.s.t')", "NBP-TABLE-TARGET", "otherc.s.t"),
+    ("df.writeStream.format('delta').option('checkpointLocation', '/etc/ck').start()", "NBP-PATH-WRITE", "/etc/ck"),
+    ("df.writeStream.options(checkpointLocation='/etc/ck').start()", "NBP-PATH-WRITE", "/etc/ck"),
+    ("df.writeStream.start(path_var)", "NBP-PATH-WRITE-DYNAMIC", "<dynamic>"),
+    # X: servers bind a listening socket; the dotted network modules are judged at every door
+    ("import http.server\nhttp.server.HTTPServer(('',0),h)", "NBP-IMPORT-NETWORK", "http.server"),
+    ("from http.server import HTTPServer", "NBP-IMPORT-NETWORK", "http.server"),
+    ("import http.server as hs", "NBP-IMPORT-NETWORK", "http.server"),
+    ("import http\nhttp.server.HTTPServer(('',0),h)", "NBP-IMPORT-NETWORK", "http.server"),
+    ("from http import server", "NBP-IMPORT-NETWORK", "http.server"),
+    ("import http\nhttp.client.HTTPConnection('h')", "NBP-IMPORT-NETWORK", "http.client"),
+    ("import wsgiref.simple_server as w\nw.make_server('', 0, app)", "NBP-IMPORT-NETWORK", "wsgiref.simple_server"),
+    ("from wsgiref.simple_server import make_server", "NBP-IMPORT-NETWORK", "wsgiref.simple_server"),
+    ("import wsgiref\nwsgiref.simple_server.make_server('', 0, app)", "NBP-IMPORT-NETWORK", "wsgiref.simple_server"),
+    ("import smtpd", "NBP-IMPORT-NETWORK", "smtpd"),
+    ("import flask", "NBP-IMPORT-NETWORK", "flask"),
+    ("from fastapi import FastAPI", "NBP-IMPORT-NETWORK", "fastapi"),
+    ("import uvicorn", "NBP-IMPORT-NETWORK", "uvicorn"),
+    ("import tornado.web", "NBP-IMPORT-NETWORK", "tornado"),
+]
+
+
+@pytest.mark.parametrize("source,rule,target", REVIEW_GAP_CELLS_5,
+                         ids=[c[1] + ":" + c[0][:30] for c in REVIEW_GAP_CELLS_5])
+def test_coverage_round3_gap_cells_are_refused(tmp_path, sandbox_env, source, rule, target):
+    _assert_refused(tmp_path, [source], rule, target)
+
+
+def test_coverage_round3_gap_cell_count():
+    assert len(REVIEW_GAP_CELLS_5) >= 40
+
+
+def test_writer_held_in_a_variable_is_followed_across_cells():
+    ctx = npol.ScanContext()
+
+    def scan(src):
+        return [(v.rule, v.target) for v in npol.scan_source(src, policy=REVIEW_POLICY, context=ctx)]
+
+    assert scan("wr = df.write.mode('overwrite').format('delta')") == []
+    assert scan("wr.save('/etc/x')") == [("NBP-PATH-WRITE", "/etc/x")]
+    assert scan("wr.saveAsTable('otherc.s.t')") == [("NBP-TABLE-TARGET", "otherc.s.t")]
+    assert scan("wr.save('oci://bucket@ns/sandbox/out')") == []
+    assert scan("w2 = wr") == []
+    assert scan("w2.parquet(dest)") == [("NBP-PATH-WRITE-DYNAMIC", "<dynamic>")]
+    ctx = npol.ScanContext()
+    assert scan("rd = spark.read.format('csv').option('header', True)") == []
+    assert scan("rd.load('/etc/passwd')") == [("NBP-OPEN-PATH", "/etc/passwd")]
+    assert scan("df = rd.load(src_path)") == []
+
+
+def test_allow_network_lifts_the_server_modules_at_every_door():
+    open_policy = SandboxPolicy(catalog="sbx", schema="mig", prefix="oci://bucket@ns/sandbox/", allow_network=True)
+    for src in ("import http.server", "from http.server import HTTPServer", "from http import server",
+                "import http\nhttp.server.HTTPServer(('', 0), h)", "import wsgiref.simple_server as w",
+                "import wsgiref\nwsgiref.simple_server.make_server('', 0, app)", "import flask"):
+        assert npol.scan_source(src, policy=open_policy) == [], src
+
+
+# Everyday code next to each round-3 class that must not become a false refusal.
+CLEAN_CELLS_8 = [
+    # V: os.path through an alias is everyday path code; every re-root shortens the chain and ends
+    "import os.path as op\np = op.join(base, 'x')\nprint(op.basename(p), op.sep)",
+    "import os\nprint(os.path.sep, os.path.basename(p))",
+    "from os import path\nprint(path.join('a', 'b'))",
+    "import os\np = os.path.os.path.join('a', 'b')",
+    # W: writers / readers held in a variable that stay inside the sandbox; builders with run-time arguments
+    "wr = df.write.mode('overwrite')\nwr.parquet('oci://bucket@ns/sandbox/out')",
+    "wr = df.write.mode('overwrite').format('delta')\nwr.save('oci://bucket@ns/sandbox/out')",
+    "wr = df.write.mode('overwrite')\nwr.format('delta').saveAsTable('sbx.mig.t')",
+    "wr = df.write.mode('overwrite')\nwr.option('compression', 'snappy').parquet('oci://bucket@ns/sandbox/out')",
+    "writer = df.write.mode('overwrite')\nwriter.format(fmt).save('oci://bucket@ns/sandbox/out')",
+    "w = df.write.mode('overwrite')\nw.partitionBy('d').parquet('oci://bucket@ns/sandbox/out')",
+    "wr = df.coalesce(1).write\nwr.mode('overwrite').csv('oci://bucket@ns/sandbox/out')",
+    "wr = df.write.mode('overwrite')\nwr.saveAsTable('sbx.mig.out')",
+    "rd = spark.read.format('csv').option('header', True)\ndf = rd.load(src_path)",
+    "rd = spark.read.format('csv')\ndf = rd.load('oci://bucket@ns/prod/in.csv')",
+    "q = df.writeStream.format('delta').option('checkpointLocation', 'oci://bucket@ns/sandbox/ck')"
+    ".start('oci://bucket@ns/sandbox/out')",
+    "df.writeStream.format('console').start()",
+    "df.writeStream.toTable('sbx.mig.events')",
+    "wr = df.writeStream.format('delta').outputMode('append')\n"
+    "wr.option('checkpointLocation', 'oci://bucket@ns/sandbox/ck').start('oci://bucket@ns/sandbox/out')",
+    "q = df.writeStream.foreachBatch(fn).start()\nq.awaitTermination()",
+    "import threading\nt = threading.Thread(target=run)\nt.start()",
+    # X: the harmless parents of the dotted network modules
+    "import http\nprint(http.HTTPStatus.OK)",
+    "from http import HTTPStatus",
+    "import wsgiref.util",
+]
+
+
+@pytest.mark.parametrize("source", CLEAN_CELLS_8, ids=[c[:40] for c in CLEAN_CELLS_8])
+def test_coverage_round3_adjacent_everyday_code_passes_the_gate(source):
+    assert npol.scan_source(source, policy=REVIEW_POLICY) == []

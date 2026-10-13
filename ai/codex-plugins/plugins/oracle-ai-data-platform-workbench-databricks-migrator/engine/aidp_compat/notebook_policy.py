@@ -182,7 +182,17 @@ _NETWORK_MODULES = frozenset({
     "urllib3", "httpx", "aiohttp", "ftplib", "smtplib", "pycurl", "telnetlib",
     "poplib", "imaplib", "nntplib", "websocket", "websockets", "grpc", "xmlrpc",
     "socketserver", "ssl", "asyncore", "asynchat",
+    # Servers bind a listening socket: the stdlib HTTP / WSGI / SMTP servers and
+    # the common Python web servers and app frameworks that start one.
+    "http.server", "wsgiref.simple_server", "smtpd",
+    "flask", "fastapi", "starlette", "uvicorn", "gunicorn", "hypercorn", "tornado", "werkzeug", "bottle",
+    "cherrypy", "waitress", "twisted", "sanic", "gradio", "streamlit", "dash", "zmq",
 })
+# The dotted entries above (``http.client``, ``http.server``, ``wsgiref.simple_server``):
+# ``import http`` is harmless (``http.HTTPStatus``) but the ``http.client`` /
+# ``http.server`` chain under it, ``from http import server`` and
+# ``import http.server`` reach the same module and are judged by the same rule.
+_NETWORK_SUBMODULES = frozenset(tuple(m.split(".")) for m in _NETWORK_MODULES if "." in m)
 _INDIRECT_MODULES = frozenset({"importlib", "builtins", "pkgutil", "zipimport", "imp", "faulthandler"})
 # gc.collect() is routine notebook hygiene; the object-graph walkers reach every live object.
 _GC_INDIRECT_ATTRS = frozenset({"get_objects", "get_referrers", "get_referents"})
@@ -353,9 +363,17 @@ _SHELL_MAGICS = frozenset({"sh", "bash", "sx", "system", "script", "pip", "conda
                            "perl", "ruby", "scala", "r", "fs", "env", "set_env", "killbgscripts"})
 _MAGIC_LINE_RE = re.compile(r"^\s*(%%?|!)\s*([A-Za-z_][\w.]*)?")
 _DBFS_WRITE_METHODS = frozenset({"rm", "mv", "cp", "put", "mkdirs"})
-_TABLE_WRITE_METHODS = frozenset({"saveAsTable", "insertInto", "writeTo"})
+_TABLE_WRITE_METHODS = frozenset({"saveAsTable", "insertInto", "writeTo", "toTable"})
 _PATH_WRITE_METHODS = frozenset({"parquet", "csv", "json", "orc", "text", "save"})
+# ``DataStreamWriter.start(path)`` is the streaming terminal; ``start`` is a path
+# write only under a ``writeStream`` chain (``thread.start()`` is everyday code).
+_STREAM_PATH_WRITE_METHODS = frozenset({"start"})
 _WRITER_OPTION_METHODS = frozenset({"option", "options"})
+# Writer options that name a location the write creates files under.
+_WRITER_PATH_OPTIONS = frozenset({"path", "checkpointLocation"})
+# ``df.write`` and ``df.writeStream`` are both writers: the path / table / option
+# rules apply under either entry (``writeTo`` is judged at its own call).
+_SPARK_WRITER_CHAIN = frozenset({"write", "writeStream"})
 _SQL_METHODS = frozenset({"sql"})
 # Local file READS through library readers. A LITERAL local-filesystem path
 # outside the sandbox prefix is refused (NBP-OPEN-PATH, like open()); a path
@@ -379,6 +397,17 @@ _LIB_READER_CALLS = frozenset({
 })
 _SPARK_READER_CHAIN = frozenset({"read", "readStream"})
 _SPARK_IO_CHAIN = _SPARK_READER_CHAIN | frozenset({"write", "writeStream", "writeTo"})
+# DataFrameReader / DataFrameWriter / DataFrameWriterV2 / DataStreamWriter builder
+# methods: ``df.write.mode(..).option(..)`` still names the writer, so a name bound
+# to such a chain (``wr = df.write.mode('overwrite')``, ``rd = spark.read.format('csv')``,
+# ``wr = df.coalesce(1).write``) is followed as an alias of it and the terminal call
+# on the name (``wr.parquet(p)``, ``wr.saveAsTable(t)``, ``rd.load(p)``) is judged
+# like the single-statement chain. A terminal (``parquet`` / ``save`` / ``load`` /
+# ``start`` / ``saveAsTable``) ends the builder: its result is a DataFrame / None.
+_SPARK_IO_BUILDER_METHODS = frozenset({
+    "mode", "format", "option", "options", "partitionBy", "bucketBy", "sortBy", "schema", "using",
+    "tableProperty", "partitionedBy", "clusterBy", "outputMode", "trigger", "queryName", "foreach", "foreachBatch",
+})
 _SPARK_PATH_READ_METHODS = frozenset({"parquet", "csv", "json", "orc", "text", "load", "textFile", "xml", "avro"})
 _SC_PATH_READ_METHODS = frozenset({"textFile", "wholeTextFiles", "binaryFiles", "binaryRecords", "sequenceFile",
                                    "hadoopFile", "newAPIHadoopFile", "pickleFile"})
@@ -1452,8 +1481,10 @@ class _PolicyScanner(ast.NodeVisitor):
                 if bound.get(name, 0) != 1:
                     continue
                 chain = _pure_chain(node.value)
-                if chain is not None and (len(chain) >= 2 or self.ctx.resolve(chain)[0] in _ALIASABLE_SINGLETONS):
-                    resolved = tuple(self.ctx.resolve(chain))
+                # Resolved first: ``w2 = wr`` where ``wr`` stands for ``df.write.mode(..)``, or
+                # ``p = op`` where ``op`` stands for ``os.path``, is an alias of the same chain.
+                resolved = tuple(self.ctx.resolve(chain)) if chain is not None else None
+                if resolved is not None and (len(resolved) >= 2 or resolved[0] in _ALIASABLE_SINGLETONS):
                     self.ctx.aliases[name] = resolved
                     if resolved[0] in _ALIASABLE_SINGLETONS:
                         self.ctx.tainted.add(name)
@@ -1465,6 +1496,12 @@ class _PolicyScanner(ast.NodeVisitor):
                         or _is_str_sequence(node.value) or self._fold_literal(node.value) is not None:
                     # a literal, f-string / concat, Path("x"), ["a", "b"], "/".join([..]) or os.path.join(..)
                     self.ctx.constants[name] = node.value
+                else:
+                    builder = self._spark_io_builder_chain(node.value)
+                    if builder is not None:
+                        # wr = df.write.mode('overwrite') / rd = spark.read.format('csv') /
+                        # wr = df.coalesce(1).write: the name is the reader / writer being built
+                        self.ctx.aliases[name] = tuple(builder)
                 if isinstance(node.value, ast.Call):
                     vchain = self._chain(node.value.func)
                     if vchain and (vchain[0] in _SPARK_ROOTS or any(p in _RDD_CHAIN_ATTRS for p in vchain)):
@@ -1492,6 +1529,21 @@ class _PolicyScanner(ast.NodeVisitor):
             return False
         chain = self._chain(node.func)
         return bool(chain) and chain[-1] in _WRITE_HANDLE_CTORS
+
+    def _spark_io_builder_chain(self, node: ast.AST) -> Optional[List[str]]:
+        """The chain when ``node`` is a Spark reader / writer still being built:
+        ``df.write.mode(..).option(..)``, ``df.coalesce(1).write``,
+        ``spark.read.format(..)``, ``df.writeTo(t).using(..)``, ``df.writeStream.format(..)``
+        (every segment after the ``read`` / ``write`` entry is a builder method); ``None``
+        for a terminal (``..load(p)`` / ``..parquet(p)`` / ``..start()`` yield a DataFrame /
+        None / a query, not the writer) and for anything that is not a Spark IO chain."""
+        if not isinstance(node, (ast.Call, ast.Attribute)):
+            return None
+        chain = self._chain(node)
+        for i, part in enumerate(chain[1:], start=1):
+            if part in _SPARK_IO_CHAIN:
+                return chain if all(p in _SPARK_IO_BUILDER_METHODS for p in chain[i + 1:]) else None
+        return None
 
     def _is_write_handle(self, arg: ast.AST) -> bool:
         """A writer argument that is not a path: a handle the notebook bound, an inline
@@ -1671,11 +1723,13 @@ class _PolicyScanner(ast.NodeVisitor):
                 target = ".".join(chain[:i + 1])
                 return RULE_DESERIALIZE, target, f"deserialisation via {target}", _REM_DESERIALIZE
             reroot = part.lstrip("_") if not _is_dunder(part) else part
-            if reroot in _REROOT_NAMES and reroot != root and not (root in _SPARK_ROOTS and reroot in _SPARK_ROOTS):
-                # shutil.os.system / pd.io.common.os.environ / self.spark._jvm, and the private
-                # re-exports tempfile._os / random._os: the chain is re-rooted at the module it
-                # names and the module rules apply from there (pyspark.sql.SparkSession is
-                # already judged by the Spark rules).
+            if reroot in _REROOT_NAMES and not (root in _SPARK_ROOTS and reroot in _SPARK_ROOTS):
+                # shutil.os.system / pd.io.common.os.environ / self.spark._jvm, the private
+                # re-exports tempfile._os / random._os, and a re-export back to the chain's own
+                # root (os.path.os.system, os.path.genericpath.os.environ, also through
+                # ``import os.path as op``): the chain is re-rooted at the module it names and
+                # the module rules apply from there (pyspark.sql.SparkSession is already judged
+                # by the Spark rules). The re-rooted chain is strictly shorter, so this ends.
                 return self._attr_rule([reroot] + list(chain[i + 1:]))
         # Module rules. One table for every entry point: a direct attribute
         # chain, an alias that stands for one (``from os import system``,
@@ -1732,6 +1786,12 @@ class _PolicyScanner(ast.NodeVisitor):
                 "Process and FFI modules are not available inside the sandbox; use ThreadPoolExecutor."
         if root == "asyncio" and chain[1] in _ASYNCIO_NETWORK_ATTRS and not self.policy.allow_network:
             return RULE_IMPORT_NETWORK, f"asyncio.{chain[1]}", f"network access via asyncio.{chain[1]}", \
+                self._import_remediation(RULE_IMPORT_NETWORK)
+        if (root, chain[1]) in _NETWORK_SUBMODULES and not self.policy.allow_network:
+            # import http; http.client.HTTPSConnection(..) / http.server.HTTPServer(..),
+            # import wsgiref; wsgiref.simple_server.make_server(..), from http import server
+            target = f"{root}.{chain[1]}"
+            return RULE_IMPORT_NETWORK, target, f"access to the network module {target}", \
                 self._import_remediation(RULE_IMPORT_NETWORK)
         if root in _PICKLE_MODULES and chain[1] not in _PICKLE_DUMP_ALLOW:
             # deny-by-default: everything but the dump side constructs objects from bytes
@@ -1791,9 +1851,8 @@ class _PolicyScanner(ast.NodeVisitor):
                       remediation=self._import_remediation(rule))
         else:
             chain = list(_import_chain(mod)) if mod else []       # from posix import system -> os.system
-            if mod == "http" and "client" in names and not self.policy.allow_network:
-                self._add(RULE_IMPORT_NETWORK, node, "import of prohibited module 'http.client'",
-                          target="http.client", remediation=self._import_remediation(RULE_IMPORT_NETWORK))
+            # (``from http import client`` / ``server``, ``from wsgiref import simple_server``
+            # are judged by the names loop below through _NETWORK_SUBMODULES in _attr_rule.)
             if chain == ["os"] and "*" in names:
                 self._add(RULE_OS_ENVIRON, node, "star import of os brings os.environ into the namespace",
                           target="os.*", remediation=_REM_ENV)
@@ -2333,14 +2392,16 @@ class _PolicyScanner(ast.NodeVisitor):
             return
         if len(chain) >= 3 and chain[-2] == "fs" and attr in _DBFS_WRITE_METHODS:
             self._check_dbfs(node, ".".join(chain[-3:]), attr)
-        elif attr in _TABLE_WRITE_METHODS and ("write" in chain or attr == "writeTo"):
+        elif attr in _TABLE_WRITE_METHODS and (any(p in _SPARK_WRITER_CHAIN for p in chain) or attr == "writeTo"):
             self._check_table_write(node, attr)
         elif attr in _SQL_METHODS and len(chain) >= 2:
             self._check_sql(node, ".".join(chain[-2:]))
-        elif attr in _PATH_WRITE_METHODS and "write" in chain:
-            self._check_path_write(node, attr)
-        elif attr in _WRITER_OPTION_METHODS and ("write" in chain or "writeTo" in chain):
-            self._check_writer_option(node, attr)
+        elif attr in _PATH_WRITE_METHODS and any(p in _SPARK_WRITER_CHAIN for p in chain):
+            self._check_path_write(node, attr, "writeStream" if "writeStream" in chain else "write")
+        elif attr in _STREAM_PATH_WRITE_METHODS and "writeStream" in chain:
+            self._check_path_write(node, attr, "writeStream")       # df.writeStream...start(path)
+        elif attr in _WRITER_OPTION_METHODS and (any(p in _SPARK_WRITER_CHAIN for p in chain) or "writeTo" in chain):
+            self._check_writer_option(node, attr, "writeStream" if "writeStream" in chain else "write")
         elif attr in _WRITER_OPTION_METHODS and any(part in _SPARK_READER_CHAIN for part in chain):
             self._check_reader_option(node, attr, ".".join(chain))
         elif attr in _FRAME_WRITER_ATTRS and not any(part in _SPARK_IO_CHAIN for part in chain[:-1]):
@@ -2862,20 +2923,23 @@ class _PolicyScanner(ast.NodeVisitor):
                       remediation=f"Write to {self.policy.catalog}.{self.policy.schema}.<table> "
                                   "(use the 2- or 3-part name).")
 
-    def _check_path_write(self, node: ast.Call, method: str):
+    def _check_path_write(self, node: ast.Call, method: str, entry: str = "write"):
         arg = _first_arg(node, ("path",))
         if arg is None:
-            return  # e.g. .save() with no path -> saveAsTable-style; option("path") is checked separately
-        self._check_path_write_target(node, arg, f".write.{method}()")
+            return  # e.g. .save() / .start() with no path -> table-style; option("path") is checked separately
+        self._check_path_write_target(node, arg, f".{entry}.{method}()")
 
-    def _check_writer_option(self, node: ast.Call, method: str) -> None:
+    def _check_writer_option(self, node: ast.Call, method: str, entry: str = "write") -> None:
+        """``.option("path" | "checkpointLocation", p)`` / ``.options(path=p, checkpointLocation=p)``:
+        a location the writer creates files under, judged like the terminal's path."""
         if method == "option":
-            if len(node.args) >= 2 and _literal_str(node.args[0]) == "path":
-                self._check_path_write_target(node, node.args[1], ".write.option('path')")
+            key = _literal_str(node.args[0]) if len(node.args) >= 2 else None
+            if key in _WRITER_PATH_OPTIONS:
+                self._check_path_write_target(node, node.args[1], f".{entry}.option({key!r})")
             return
         for k in node.keywords:
-            if k.arg == "path":
-                self._check_path_write_target(node, k.value, ".write.options(path=)")
+            if k.arg in _WRITER_PATH_OPTIONS:
+                self._check_path_write_target(node, k.value, f".{entry}.options({k.arg}=)")
 
     def _check_path_write_target(self, node: ast.Call, arg: ast.AST, call_name: str) -> None:
         lit = self._resolve_literal(arg)

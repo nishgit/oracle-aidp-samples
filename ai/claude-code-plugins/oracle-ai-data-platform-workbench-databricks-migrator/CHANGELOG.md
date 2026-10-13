@@ -216,6 +216,35 @@ All notable changes to this plugin are documented here. Format loosely follows [
   `format_exc` / `extract_stack` stay allowed. The ten gap cells are in the test suite
   verbatim with per-class refused and allowed cells; the new tests fail against the cfe1b79
   scanner, and the probe files (now 183 refused / 40 allowed cells) are green.
+- **Sandbox gate: coverage round 3 on 26a717b closed as classes** (an analyzer coverage test
+  found three gaps and no false refusals). (V) A re-export back to the chain's own root:
+  `os.path.os.system` / `os.path.genericpath.os.environ`, also through `import os.path as op`
+  (`op.os.system`, `op.os.environ`, `op.os.popen`), `from os import path` (`path.os.system`) and
+  `from os.path import os`; the re-rooting rule no longer skips a segment that names the root
+  module (`shutil.os`, `glob.os`, `posixpath.os`, `platform.os`, `tarfile.os` and the private
+  `tempfile._os` / `random._os` were already judged). (W) A `DataFrameWriter` / `DataFrameReader`
+  held in a variable: a name bound to a Spark IO builder chain (`wr = df.write.mode('overwrite')`,
+  `.option(..)` / `.format(..)` / `.partitionBy(..)`, `wr = df.coalesce(1).write`,
+  `rd = spark.read.format('csv')`, `wr = df.writeTo(t).using(..)`) or to such a name (`w2 = wr`)
+  is followed as the chain, in the same cell and across cells, so `wr.parquet('/etc/x')` /
+  `wr.csv` / `wr.save` / `wr.option('path', ..)` are `NBP-PATH-WRITE`, `wr.parquet(dest)` is
+  `NBP-PATH-WRITE-DYNAMIC`, `wr.saveAsTable('otherc.s.t')` is `NBP-TABLE-TARGET` and
+  `rd.load('/etc/passwd')` is `NBP-OPEN-PATH`; `writer.format(fmt_var).save(..)` on such a name is
+  no longer a false refusal. Structured-streaming writers are writers: `df.writeStream...start(p)`,
+  `.toTable(t)` and `.option('path' | 'checkpointLocation', p)` / `.options(..)` are judged like
+  `df.write` (`.start()` without a path and `thread.start()` are untouched). (X) Servers bind a
+  listening socket: `http.server`, `wsgiref.simple_server`, `smtpd` and the common Python web
+  servers / app frameworks (`flask`, `fastapi`, `starlette`, `uvicorn`, `gunicorn`, `hypercorn`,
+  `tornado`, `werkzeug`, `bottle`, `cherrypy`, `waitress`, `twisted`, `sanic`, `gradio`,
+  `streamlit`, `dash`, `zmq`) are `NBP-IMPORT-NETWORK` like `socketserver`; the dotted network
+  modules are judged as a class at every door: `import http.server`, `from http.server import
+  HTTPServer`, `from http import server` / `client`, `import wsgiref.simple_server as w`, and the
+  chain under a harmless parent import (`import http; http.client.HTTPSConnection(..)` /
+  `http.server.HTTPServer(..)`, `import wsgiref; wsgiref.simple_server.make_server(..)`);
+  `import http` / `http.HTTPStatus` / `wsgiref.util` stay allowed and
+  `AIDP_SANDBOX_ALLOW_NETWORK=1` lifts all of it. The three gap cells are in the test suite
+  verbatim with per-class refused and allowed cells; the new tests fail against the 26a717b
+  scanner, and the probe files (now 225 refused / 62 allowed cells) are green.
 - Python 3.9 floor: `cluster_lifecycle.py` and `fuse_package_analyzer.py` used PEP 604
   `X | None` annotations evaluated at import time; `from __future__ import annotations` added.
 - **Secrets shim is Vault-only by default** (`engine/aidp_compat/secrets.py`,

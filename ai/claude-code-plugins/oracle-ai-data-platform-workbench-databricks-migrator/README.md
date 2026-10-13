@@ -286,7 +286,14 @@ resolve `NBP-PATH-WRITE-DYNAMIC` (a `StringIO` / `BytesIO` / `ExcelWriter` handl
 bound is not a path); generic `wb.save(..)` / `model.save(..)` / `img.save(..)` judge a literal
 path only. `tempfile` creators with a literal `dir=` or an absolute `prefix=` outside the prefix
 (and `tempfile.tempdir =`) are `NBP-FS-PATH`; `faulthandler`, `traceback.walk_stack` /
-`walk_tb`, `capture_locals=True` and `Task.get_stack()` are frame dumps (`NBP-INDIRECT`). The gate
+`walk_tb`, `capture_locals=True` and `Task.get_stack()` are frame dumps (`NBP-INDIRECT`). A
+`DataFrameWriter` / `DataFrameReader` held in a variable (`wr = df.write.mode('overwrite')`,
+`w2 = wr`, `rd = spark.read.format('csv')`) is followed like the chain it was built from, also
+across cells; structured-streaming writers (`df.writeStream...start(p)` / `.toTable(t)` /
+`.option('checkpointLocation', p)`) are judged like `df.write`; a re-export back to the chain's own
+root (`os.path.os.system`, also via `import os.path as op`) is re-rooted like `shutil.os`; and
+`http.server` / `wsgiref.simple_server` / the Python web servers are network modules at every door
+(`import http; http.server.HTTPServer(..)` included). The gate
 matches these forms statically and is not a Python sandbox: a static AST gate over a full
 Python runtime is a mitigation layer, the platform-level control is the IAM scope of the
 cluster the notebook runs on, and the runtime assertions in `dbutils.fs.*`, `safe_io` and
