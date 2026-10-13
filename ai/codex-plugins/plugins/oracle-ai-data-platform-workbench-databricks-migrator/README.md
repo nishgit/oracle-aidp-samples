@@ -264,14 +264,23 @@ local path (`/etc/passwd`, `/dbfs/...`, `~`, `C:\`, `file://`) outside the prefi
 / `WITH .. SELECT` / `SHOW` / `DESCRIBE` / `EXPLAIN` / `CACHE` / `UNCACHE` / `REFRESH TABLE` /
 `CREATE TEMP VIEW`) and writes to tables inside the sandbox schema are accepted; the top-level
 verb is resolved behind a `WITH` CTE list (so `WITH x AS (..) INSERT INTO prod.t` is the write it
-is), `reflect(` / `java_method(` / `TRANSFORM .. USING` are refused anywhere in a statement, path
-tables (``text.`/etc/passwd` ``) and `COPY INTO .. FROM` sources on the local filesystem outside
-the prefix are refused, and `ADD JAR`, `CREATE FUNCTION`, `GRANT`, `SET` outside a short conf
-allowlist, SQL scripting, multi-statement texts and every other verb are `NBP-SQL-REFUSED`. While
-`dbutils.notebook.run` executes, a runtime SQL guard re-classifies the final text of every
-`spark.sql` / `selectExpr` / `filter` / `where` / `functions.expr` string before Spark sees it, and
-`spark.newSession()` / `getOrCreate()` / `getActiveSession()` are refused because a fresh session
-would not carry it.
+is), `reflect(` / `java_method(` / `try_reflect(` (plain or as a backtick-quoted function name) and
+`TRANSFORM .. USING` are refused anywhere in a statement, path tables (``<provider>.`<path>` `` for
+any provider, quoted or a provider class) and `COPY INTO .. FROM` sources on the local filesystem
+outside the prefix are refused, raw literals (`r'..'`) are lexed as Spark lexes them, the
+destination of `ALTER .. RENAME TO` is a write target, `spark.sql` keyword arguments are rendered
+into the statement as pyspark renders them, `IDENTIFIER(..)` is refused, network data sources
+(`USING jdbc` / `kafka` / `socket`, `spark.read.format("jdbc")`, `spark.read.jdbc`) are refused
+while the sandbox allows no network access, and `ADD JAR`, `CREATE FUNCTION`, `GRANT`, `SET` outside
+a short conf allowlist, SQL scripting, multi-statement texts and every other verb are
+`NBP-SQL-REFUSED`. The Python twins (`spark.table`, `spark.catalog.setCurrentCatalog` /
+`setCurrentDatabase`, `spark.conf.set`, `spark.catalog.createTable`, `sc.addFile`,
+`pyspark.sql.functions.reflect` / `java_method` / `call_function`) are judged by the same rules.
+While `dbutils.notebook.run` executes, a runtime SQL guard re-classifies the final text of every
+`spark.sql` (after keyword rendering) / `spark.table` / `selectExpr` / `filter` / `where` /
+`functions.expr` / `functions.reflect` / `java_method` / `call_function` call before Spark sees it,
+and `spark.newSession()` / `getOrCreate()` / `getActiveSession()` are refused because a fresh
+session would not carry it.
 A target that is a name bound once to a string literal earlier in the run is checked as that
 literal; any other non-literal target is refused unless its rule id is allowlisted, with two
 scope decisions that are allowed and recorded in the policy log instead: a reader path the gate

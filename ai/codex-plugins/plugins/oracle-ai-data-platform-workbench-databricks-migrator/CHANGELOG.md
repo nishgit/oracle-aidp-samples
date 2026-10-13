@@ -325,6 +325,40 @@ All notable changes to this plugin are documented here. Format loosely follows [
   not carry the guard. `%sql` cells reach the same classifier through `sql_magic`. The old "a
   `WITH` head is a read" assumption is gone from code, tests and docs; every refused case fails
   against the round-2 tree.
+- **Sandbox gate: SQL allowlist, adversarial round 2** (SEC-AIDP-SAMPLES-005). The round-1
+  allowlist still let through: a backtick-quoted function name (`` SELECT `reflect`('java.lang.Runtime', ..)
+  ``: the masker hid it), a quoted or class-named provider in a path table (`` `text`.`/outside/f` ``,
+  `` org.apache.spark.sql.execution.datasources.text.TextFileFormat.`/outside/f` ``: the rule was a list
+  of unquoted format names), a raw string literal (`r'\'` has no escape processing, so the rest of the
+  text was live SQL hidden inside what the masker took for one literal), `spark.sql` keyword arguments
+  and `IDENTIFIER(:t)` (pyspark renders `{name}` kwargs and binds `args=` after the guard ran), `ALTER
+  TABLE sbx.t RENAME TO prod.t` (the destination was never judged), `functions.reflect` / `java_method`
+  / `call_function("reflect", ..)` (a Java call with no SQL string), `spark.table("text.`/outside/f`")`,
+  `spark.catalog.setCurrentCatalog("prod")` + a 2-part `INSERT`, `spark.conf.set("spark.sql.extensions",
+  ..)`, `spark.catalog.createTable(.., path="/outside/f")`, `sc.addFile`, `USING jdbc` / `kafka` /
+  `socket` and `spark.read.format("jdbc")` with network access off, `spark.sql(**kw)` (static
+  fail-open), `DESCRIBE DETAIL '/outside/f'` and the `dbfs:` / `hdfs:` / `local:` schemes; it falsely
+  refused `TRIM(LEADING '/' FROM '/tmp/x')` and `(SELECT 1) UNION ALL (SELECT 2)`. Closed as classes:
+  the masker lexes `r'..'` / `R".."` raw literals without escape processing and the token scan resolves
+  backtick-quoted function names (`try_reflect` added); the path-table rule is structural (any provider
+  in front of a backtick identifier that is a path, in statements, write targets and run-time
+  fragments); `IDENTIFIER(` is `NBP-SQL-DYNAMIC`; a literal `{name}` template with literal keyword
+  values is rendered as pyspark renders it and classified, non-literal values make it a dynamic
+  statement, `*args` / `**kwargs` are `NBP-SQL-DYNAMIC`, and the runtime guard renders the final
+  values before classifying; `ALTER .. RENAME TO <name>` judges the destination; `COPY INTO .. FROM
+  '<path>'` is anchored on the `COPY` verb and a parenthesised query term is judged by the verb inside;
+  `DESCRIBE DETAIL` / `HISTORY '<path>'` are path reads and `dbfs:` / `hdfs:` / `local:` are local
+  schemes everywhere a local path is judged; `CREATE .. USING <provider>`, `spark.read` / `write.format`
+  / `using` / `jdbc` refuse network providers and dotted provider classes while
+  `AIDP_SANDBOX_ALLOW_NETWORK` is off (`NBP-IMPORT-NETWORK`; a provider the gate cannot resolve is
+  recorded as `unverified_format`); `pyspark.sql.functions.reflect` / `java_method` / `try_reflect` and
+  `call_function` by name are refused statically (import, attribute, call) and wrapped by the runtime
+  guard, as are `spark.table` / `DataFrameReader.table`; `spark.table` / `read.table` literals,
+  `spark.catalog.setCurrentCatalog` / `setCurrentDatabase` (the `USE` rule), `spark.conf.set` / `unset`
+  / `setConf` (the `SET` allowlist), `spark.catalog.createTable` / `createExternalTable` (name, `path=`,
+  `source=`) and `sc.addFile` are gated like their SQL forms. Tests: 100 refused cells, 61 allowed cells,
+  10 runtime-guard cases, a stub-pyspark test for the function / reader patches and six `%sql` cells;
+  96 of the refused cells pass the round-1 gate and 8 of the runtime cases reach the fake session there.
 - **Secrets shim is Vault-only by default** (`engine/aidp_compat/secrets.py`,
   SEC-AIDP-SAMPLES-006). `AIDP_SECRET_*` environment scanning and the JSON file fallback
   (now only via an explicit `AIDP_SECRETS_FILE`) happen only with

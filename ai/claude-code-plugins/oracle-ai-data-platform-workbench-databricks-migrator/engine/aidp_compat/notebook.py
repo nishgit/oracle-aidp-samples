@@ -12,15 +12,19 @@ notebook, cell, rule and remediation, and are recorded in the policy log.
 
 While the cells run, a runtime SQL guard (:class:`SqlRuntimeGuard`) is
 installed on the session's SQL entry points (``spark.sql`` / ``sqlContext.sql``
-on every session object found under the Spark root names, the ``pyspark``
-``SparkSession`` / ``SQLContext`` / ``DataFrame`` classes and
-``functions.expr``): every statement is re-classified by
-``notebook_policy.classify_sql`` on its FINAL text before Spark executes it,
-so a ``spark.sql`` statement with run-time fragments that the static gate
-could only judge by its literal head cannot smuggle a refused form past the
-gate. The guard is removed when ``run`` returns.
+and ``spark.table`` on every session object found under the Spark root names,
+the ``pyspark`` ``SparkSession`` / ``SQLContext`` / ``DataFrame`` /
+``DataFrameReader`` classes, ``functions.expr`` and the DataFrame-API Java
+calls ``functions.reflect`` / ``java_method`` / ``try_reflect`` /
+``call_function``): every statement is re-classified by
+``notebook_policy.classify_sql`` on its FINAL text (after pyspark's ``{name}``
+keyword substitution) before Spark executes it, so a ``spark.sql`` statement
+with run-time fragments that the static gate could only judge by its literal
+head cannot smuggle a refused form past the gate. The guard is removed when
+``run`` returns.
 """
 
+import functools
 import importlib
 import inspect
 import os
@@ -35,6 +39,8 @@ from aidp_compat.notebook_policy import (
     ScanContext,
     assert_sql_allowed,
     assert_sql_expression_allowed,
+    assert_sql_function_allowed,
+    assert_table_read_allowed,
     enforce_cell_policy,
     record_skipped_cell,
     require_policy,
@@ -53,8 +59,15 @@ _PYSPARK_FRAME_CLASSES = (
     ("pyspark.sql.classic.dataframe", "DataFrame"),
     ("pyspark.sql.connect.dataframe", "DataFrame"),
 )
+_PYSPARK_READER_CLASSES = (
+    ("pyspark.sql", "DataFrameReader"),
+    ("pyspark.sql.connect.readwriter", "DataFrameReader"),
+)
 _PYSPARK_FUNCTION_MODULES = ("pyspark.sql.functions", "pyspark.sql.connect.functions")
 _FRAME_EXPRESSION_METHODS = ("selectExpr", "filter", "where")
+# functions.<name>(..) entry points that call arbitrary Java with no SQL string.
+_JVM_FUNCTIONS = ("reflect", "java_method", "try_reflect")
+_CALL_FUNCTION = "call_function"
 
 
 def _import_optional(module_name: str):
@@ -71,23 +84,30 @@ class SqlRuntimeGuard:
     Patches, for the duration of a ``with`` block (or between :meth:`install`
     and :meth:`restore`):
 
-    * ``<obj>.sql`` on every session object bound in ``caller_globals`` under
-      a Spark root name (``spark``, ``sqlContext``, ...), both the instance
-      attribute and its class's own ``sql``;
-    * ``SparkSession.sql`` / ``SQLContext.sql`` of the importable ``pyspark``
-      classes (so ``SparkSession.sql(spark, q)`` and the ``sql()`` magic
-      helper that calls ``getOrCreate()`` internally are covered too);
-    * ``DataFrame.selectExpr`` / ``filter`` / ``where`` (string form) and
-      ``functions.expr`` of the importable ``pyspark`` modules, plus every
-      name in ``caller_globals`` bound to the original ``expr`` function.
+    * ``<obj>.sql`` and ``<obj>.table`` on every session object bound in
+      ``caller_globals`` under a Spark root name (``spark``, ``sqlContext``,
+      ...), both the instance attribute and its class's own method;
+    * ``SparkSession.sql`` / ``SQLContext.sql`` and ``DataFrameReader.table``
+      of the importable ``pyspark`` classes (so ``SparkSession.sql(spark, q)``
+      and the ``sql()`` magic helper that calls ``getOrCreate()`` internally
+      are covered too);
+    * ``DataFrame.selectExpr`` / ``filter`` / ``where`` (string form),
+      ``functions.expr`` and the Java-call functions ``functions.reflect`` /
+      ``java_method`` / ``try_reflect`` / ``call_function`` of the importable
+      ``pyspark`` modules, plus every name in ``caller_globals`` bound to one
+      of those original functions.
 
     Each wrapper runs :func:`~aidp_compat.notebook_policy.assert_sql_allowed`
-    (statements) or :func:`~aidp_compat.notebook_policy.assert_sql_expression_allowed`
-    (expressions) with the run's :class:`SandboxPolicy`; a refusal is written
-    to the policy log and raised as ``PolicyViolation`` before Spark sees the
-    text. Without ``pyspark`` the class patches are no-ops; the instance
-    patches work on any object with a callable ``sql`` (the tests drive them
-    with fakes). ``patched`` lists the entry points that were wrapped.
+    (statements, after the same ``{name}`` keyword substitution pyspark
+    performs), :func:`~aidp_compat.notebook_policy.assert_sql_expression_allowed`
+    (expressions), :func:`~aidp_compat.notebook_policy.assert_table_read_allowed`
+    (table names) or :func:`~aidp_compat.notebook_policy.assert_sql_function_allowed`
+    (function names) with the run's :class:`SandboxPolicy`; a refusal is
+    written to the policy log and raised as ``PolicyViolation`` before Spark
+    sees the text. Without ``pyspark`` the class patches are no-ops; the
+    instance patches work on any object with a callable ``sql`` / ``table``
+    (the tests drive them with fakes). ``patched`` lists the entry points that
+    were wrapped.
     """
 
     def __init__(self, policy: SandboxPolicy, caller_globals: Dict[str, Any], notebook_path: str = ""):
@@ -103,8 +123,21 @@ class SqlRuntimeGuard:
     # -- wrappers ----------------------------------------------------------
     def _check_statement(self, operation: str, args: tuple, kwargs: dict) -> None:
         statement = args[0] if args else kwargs.get("sqlQuery", kwargs.get("query"))
+        # pyspark renders every keyword other than args= into the statement's {name}
+        # fields before parsing: the final text is judged after that substitution.
+        template = {k: v for k, v in kwargs.items() if k not in ("sqlQuery", "query", "args")}
         assert_sql_allowed(statement, operation=operation, policy=self._policy,
-                           notebook_path=self._notebook_path, cell_index=self.cell_index)
+                           notebook_path=self._notebook_path, cell_index=self.cell_index,
+                           template_kwargs=template)
+
+    def _check_table(self, operation: str, args: tuple, kwargs: dict) -> None:
+        name = args[0] if args else kwargs.get("tableName")
+        assert_table_read_allowed(name, operation=operation, policy=self._policy,
+                                  notebook_path=self._notebook_path, cell_index=self.cell_index)
+
+    def _check_function(self, operation: str, name: Any) -> None:
+        assert_sql_function_allowed(name, operation=operation, policy=self._policy,
+                                    notebook_path=self._notebook_path, cell_index=self.cell_index)
 
     def _check_expression(self, operation: str, value: Any) -> None:
         if isinstance(value, str):
@@ -160,6 +193,41 @@ class SqlRuntimeGuard:
         guarded_expr.__wrapped__ = original
         return guarded_expr
 
+    def _wrap_table_bound(self, original, shown: str):
+        guard = self
+
+        def guarded_table(*args, **kwargs):
+            guard._check_table(shown, args, kwargs)
+            return original(*args, **kwargs)
+
+        guarded_table.__wrapped__ = original
+        return guarded_table
+
+    def _wrap_table_method(self, original, shown: str):
+        guard = self
+
+        def guarded_table(self_, *args, **kwargs):
+            guard._check_table(shown, args, kwargs)
+            return original(self_, *args, **kwargs)
+
+        guarded_table.__wrapped__ = original
+        return guarded_table
+
+    def _wrap_function(self, original, name: str, shown: str):
+        """``functions.reflect`` / ``java_method`` / ``try_reflect`` are refused outright;
+        ``call_function(funcName, ..)`` is judged by the name it is given."""
+        guard = self
+
+        def guarded_function(*args, **kwargs):
+            if name == _CALL_FUNCTION:
+                guard._check_function(shown, args[0] if args else kwargs.get("funcName"))
+            else:
+                guard._check_function(shown, name)
+            return original(*args, **kwargs)
+
+        guarded_function.__wrapped__ = original
+        return guarded_function
+
     # -- patch bookkeeping -------------------------------------------------
     def _patch(self, owner: Any, attr: str, replacement: Any, shown: str, mapping: bool = False) -> None:
         key = (id(owner), attr)
@@ -180,19 +248,25 @@ class SqlRuntimeGuard:
     def _guard_session_object(self, name: str, obj: Any) -> None:
         if obj is None or inspect.ismodule(obj):
             return
+        wrappers = (("sql", self._wrap_sql_bound, self._wrap_sql_method),
+                    ("table", self._wrap_table_bound, self._wrap_table_method))
         if inspect.isclass(obj):
-            fn = obj.__dict__.get("sql")
-            if callable(fn):
-                self._patch(obj, "sql", self._wrap_sql_method(fn, f"{name}.sql"), f"{name}.sql")
+            for attr, _bound_wrapper, method_wrapper in wrappers:
+                fn = obj.__dict__.get(attr)
+                if callable(fn):
+                    self._patch(obj, attr, method_wrapper(fn, f"{name}.{attr}"), f"{name}.{attr}")
             return
-        bound = getattr(obj, "sql", None)
-        if not callable(bound):
+        if not callable(getattr(obj, "sql", None)):
             return
-        self._patch(obj, "sql", self._wrap_sql_bound(bound, f"{name}.sql"), f"{name}.sql")
         cls = type(obj)
-        fn = cls.__dict__.get("sql")
-        if callable(fn):
-            self._patch(cls, "sql", self._wrap_sql_method(fn, f"{name}.sql"), f"{cls.__name__}.sql")
+        for attr, bound_wrapper, method_wrapper in wrappers:
+            bound = getattr(obj, attr, None)
+            if not callable(bound):
+                continue
+            self._patch(obj, attr, bound_wrapper(bound, f"{name}.{attr}"), f"{name}.{attr}")
+            fn = cls.__dict__.get(attr)
+            if callable(fn):
+                self._patch(cls, attr, method_wrapper(fn, f"{name}.{attr}"), f"{cls.__name__}.{attr}")
 
     def install(self) -> "SqlRuntimeGuard":
         # 1. session objects / classes bound in the executing namespace
@@ -206,11 +280,17 @@ class SqlRuntimeGuard:
         for module_name, class_name in _PYSPARK_SESSION_CLASSES:
             mod = _import_optional(module_name)
             cls = getattr(mod, class_name, None) if mod is not None else None
-            fn = cls.__dict__.get("sql") if inspect.isclass(cls) else None
+            if not inspect.isclass(cls):
+                continue
+            fn = cls.__dict__.get("sql")
             if callable(fn):
                 self._patch(cls, "sql", self._wrap_sql_method(fn, f"{class_name}.sql"),
                             f"{module_name}.{class_name}.sql")
-        # 3. DataFrame expression methods
+            fn = cls.__dict__.get("table")
+            if callable(fn):
+                self._patch(cls, "table", self._wrap_table_method(fn, f"{class_name}.table"),
+                            f"{module_name}.{class_name}.table")
+        # 3. DataFrame expression methods and DataFrameReader.table
         for module_name, class_name in _PYSPARK_FRAME_CLASSES:
             mod = _import_optional(module_name)
             cls = getattr(mod, class_name, None) if mod is not None else None
@@ -221,20 +301,41 @@ class SqlRuntimeGuard:
                 if callable(fn):
                     self._patch(cls, method, self._wrap_frame_method(fn, method, f"DataFrame.{method}"),
                                 f"{module_name}.{class_name}.{method}")
-        # 4. functions.expr, in the module and under every name the namespace bound it to
-        originals = []
+        for module_name, class_name in _PYSPARK_READER_CLASSES:
+            mod = _import_optional(module_name)
+            cls = getattr(mod, class_name, None) if mod is not None else None
+            fn = cls.__dict__.get("table") if inspect.isclass(cls) else None
+            if callable(fn):
+                self._patch(cls, "table", self._wrap_table_method(fn, f"{class_name}.table"),
+                            f"{module_name}.{class_name}.table")
+        # 4. functions.expr and the Java-call functions, in the module and under every
+        #    name the namespace bound them to (from pyspark.sql.functions import reflect)
+        originals: List[Tuple[Any, Any]] = []       # (original function, wrapper factory)
         for module_name in _PYSPARK_FUNCTION_MODULES:
             mod = _import_optional(module_name)
-            fn = getattr(mod, "expr", None) if mod is not None else None
+            if mod is None:
+                continue
+            fn = getattr(mod, "expr", None)
             if callable(fn):
-                originals.append(fn)
+                originals.append((fn, self._wrap_expr))
                 self._patch(mod, "expr", self._wrap_expr(fn, "functions.expr"), f"{module_name}.expr")
+            for fname in _JVM_FUNCTIONS + (_CALL_FUNCTION,):
+                fn = getattr(mod, fname, None)
+                if callable(fn):
+                    originals.append((fn, functools.partial(self._wrap_function_named, fname)))
+                    self._patch(mod, fname, self._wrap_function(fn, fname, f"functions.{fname}"),
+                                f"{module_name}.{fname}")
         if originals:
             for gname, gval in list(self._globals.items()):
-                if any(gval is fn for fn in originals):
-                    self._patch(self._globals, gname, self._wrap_expr(gval, f"{gname}()"), f"<namespace>.{gname}",
-                                mapping=True)
+                for fn, factory in originals:
+                    if gval is fn:
+                        self._patch(self._globals, gname, factory(gval, f"{gname}()"), f"<namespace>.{gname}",
+                                    mapping=True)
+                        break
         return self
+
+    def _wrap_function_named(self, name: str, original, shown: str):
+        return self._wrap_function(original, name, shown)
 
     def restore(self) -> None:
         for owner, attr, original, had_own, mapping in reversed(self._patches):
