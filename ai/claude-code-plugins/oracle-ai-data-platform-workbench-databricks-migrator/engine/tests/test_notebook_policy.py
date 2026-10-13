@@ -2432,7 +2432,11 @@ def test_pathlib_adjacent_everyday_code_passes_the_gate(source):
 # statement with run-time fragments is judged on its final text before Spark
 # executes it, and the static gate admits such a statement only while that
 # guard is active (ScanContext.runtime_sql_guard) and its literal head verb is
-# a read verb. Every cell below fails against the round-2 tree (1356a56).
+# a read verb. Every cell in SQL_REFUSED_CELLS is a NEW refusal: against the
+# round-2 tree (1356a56) it either runs or is refused under a different rule or
+# target. Cells the round-2 blocklist already refused with the same rule and
+# target live in SQL_REFUSED_CELLS_BASELINE_GUARDS below: they are regression
+# guards for the forms the old gate knew and prove nothing about this round.
 
 # The four statements named in the review, verbatim.
 SQL_REVIEWER_CELLS = [
@@ -2538,15 +2542,12 @@ SQL_REFUSED_CELLS = SQL_REVIEWER_CELLS + [
     ("spark.sql('ANALYZE TABLES IN prod COMPUTE STATISTICS')", "NBP-SQL-TARGET", "prod"),
     ("spark.sql('ANALYZE TABLES COMPUTE STATISTICS')", "NBP-SQL-TARGET", "ANALYZE TABLES COMPUTE STATISTICS"),
     ("spark.sql(\"COPY INTO prod.t FROM 'oci://b@ns/sbx/x' FILEFORMAT = CSV\")", "NBP-SQL-TARGET", "prod.t"),
-    ("spark.sql('CREATE TABLE prod.t SHALLOW CLONE sbx.t')", "NBP-SQL-TARGET", "prod.t"),
     ("spark.sql('REPLACE TABLE prod.t AS SELECT 1')", "NBP-SQL-TARGET", "prod.t"),
     ("spark.sql('MERGE WITH SCHEMA EVOLUTION INTO prod.t USING sbx.s ON 1 = 1 WHEN MATCHED THEN DELETE')",
      "NBP-SQL-TARGET", "prod.t"),
     ("spark.sql('CREATE MATERIALIZED VIEW prod.mv AS SELECT 1')", "NBP-SQL-TARGET", "prod.mv"),
     ("spark.sql('CREATE NAMESPACE prod')", "NBP-SQL-TARGET", "prod"),
-    ("spark.sql(\"ALTER TABLE sbx.t SET LOCATION 'oci://b@ns/prod/x'\")", "NBP-SQL-TARGET", "oci://b@ns/prod/x"),
     ("spark.sql('EXPLAIN INSERT INTO prod.t SELECT 1')", "NBP-SQL-TARGET", "prod.t"),
-    ("spark.sql('DROP VIEW tmp_v')", "NBP-SQL-TARGET", "tmp_v"),
     ("spark.sql('CREATE CATALOG evil')", "NBP-SQL-REFUSED", "CREATE CATALOG"),
     ("spark.sql('CREATE VOLUME sbx.v')", "NBP-SQL-REFUSED", "CREATE VOLUME"),
     ("spark.sql('DROP CATALOG prod')", "NBP-SQL-REFUSED", "DROP CATALOG"),
@@ -2559,9 +2560,7 @@ SQL_REFUSED_CELLS = SQL_REVIEWER_CELLS + [
     ("spark.sql('WITH x AS (SELECT 1) INSERT OVERWRITE TABLE prod.t SELECT * FROM x')", "NBP-SQL-TARGET", "prod.t"),
     ("spark.sql('WITH x AS (SELECT 1) ADD JAR x.jar')", "NBP-SQL-REFUSED", "ADD JAR"),
     ("spark.sql('WITH x AS (SELECT 1)')", "NBP-SQL-REFUSED", "WITH x AS (SELECT 1)"),
-    # -- comments and quoted text cannot steer the verdict either way
-    ("spark.sql('/* SELECT */ DROP TABLE prod.t')", "NBP-SQL-TARGET", "prod.t"),
-    ("spark.sql('-- SELECT\\nDROP TABLE prod.t')", "NBP-SQL-TARGET", "prod.t"),
+    # -- quoted text cannot steer the verdict (comment-led writes: see the baseline guards)
     ("spark.sql(\"SELECT '--' AS c FROM text.`/etc/passwd`\")", "NBP-OPEN-PATH", "/etc/passwd"),
     ("spark.sql(\"SELECT '/*' AS c, reflect('a', 'b')\")", "NBP-SQL-REFUSED", "reflect("),
     # -- Hive multi-insert and unknown verbs: not on the allowlist
@@ -2579,13 +2578,8 @@ SQL_REFUSED_CELLS = SQL_REVIEWER_CELLS + [
     ("spark.sql('SELECT * FROM sbx.t; ' + q)", "NBP-SQL-REFUSED", "<multiple statements>"),
     ("spark.sql(f'VALUES ({x}); DROP TABLE prod.t')", "NBP-SQL-REFUSED", "<multiple statements>"),
     ("spark.sql(f\"SELECT TRANSFORM(a) USING 'cat' FROM {t}\")", "NBP-SQL-REFUSED", "TRANSFORM ... USING"),
-    # -- dynamic statements whose literal head is not a read verb (with or without the guard)
+    # -- a dynamic WITH head is not a read verb either (other non-read heads: see the baseline guards)
     ("spark.sql(f'WITH x AS ({sub}) SELECT * FROM x')", "NBP-SQL-DYNAMIC", "<dynamic>"),
-    ("spark.sql('ADD JAR ' + jar)", "NBP-SQL-DYNAMIC", "<dynamic>"),
-    ("spark.sql('SET ' + conf)", "NBP-SQL-DYNAMIC", "<dynamic>"),
-    ("spark.sql(f'OPTIMIZE {t}')", "NBP-SQL-DYNAMIC", "<dynamic>"),
-    ("spark.sql(f'COPY INTO sbx.t FROM {src} FILEFORMAT = CSV')", "NBP-SQL-DYNAMIC", "<dynamic>"),
-    ("spark.sql(f'CREATE FUNCTION {f} AS {cls}')", "NBP-SQL-DYNAMIC", "<dynamic>"),
     # -- a fresh / fetched session object would not carry the runtime SQL guard
     ("spark.newSession().sql('SELECT 1')", "NBP-POLICY-TAMPER", "spark.newSession"),
     ("s2 = spark.newSession()", "NBP-POLICY-TAMPER", "spark.newSession"),
@@ -2599,8 +2593,29 @@ SQL_REFUSED_CELLS = SQL_REVIEWER_CELLS + [
 ]
 
 
-@pytest.mark.parametrize("source,rule,target", SQL_REFUSED_CELLS,
-                         ids=[c[1] + ":" + c[0][:40] for c in SQL_REFUSED_CELLS])
+# Regression guards: the round-2 tree (1356a56) ALREADY refused every cell below
+# with the same rule and target (verified by running this file against that
+# tree), so they prove nothing about the allowlist. They stay so that the
+# allowlist can never regress below the old blocklist: the write verbs it knew
+# on an out-of-sandbox target, comment-led writes, and dynamic statements whose
+# literal head was never a read verb.
+SQL_REFUSED_CELLS_BASELINE_GUARDS = [
+    ("spark.sql('CREATE TABLE prod.t SHALLOW CLONE sbx.t')", "NBP-SQL-TARGET", "prod.t"),
+    ("spark.sql(\"ALTER TABLE sbx.t SET LOCATION 'oci://b@ns/prod/x'\")", "NBP-SQL-TARGET", "oci://b@ns/prod/x"),
+    ("spark.sql('DROP VIEW tmp_v')", "NBP-SQL-TARGET", "tmp_v"),
+    ("spark.sql('/* SELECT */ DROP TABLE prod.t')", "NBP-SQL-TARGET", "prod.t"),
+    ("spark.sql('-- SELECT\\nDROP TABLE prod.t')", "NBP-SQL-TARGET", "prod.t"),
+    ("spark.sql('ADD JAR ' + jar)", "NBP-SQL-DYNAMIC", "<dynamic>"),
+    ("spark.sql('SET ' + conf)", "NBP-SQL-DYNAMIC", "<dynamic>"),
+    ("spark.sql(f'OPTIMIZE {t}')", "NBP-SQL-DYNAMIC", "<dynamic>"),
+    ("spark.sql(f'COPY INTO sbx.t FROM {src} FILEFORMAT = CSV')", "NBP-SQL-DYNAMIC", "<dynamic>"),
+    ("spark.sql(f'CREATE FUNCTION {f} AS {cls}')", "NBP-SQL-DYNAMIC", "<dynamic>"),
+    ("spark.sql(*ARGS)", "NBP-SQL-DYNAMIC", "<dynamic>"),       # from adversarial round 2
+]
+
+
+@pytest.mark.parametrize("source,rule,target", SQL_REFUSED_CELLS + SQL_REFUSED_CELLS_BASELINE_GUARDS,
+                         ids=[c[1] + ":" + c[0][:40] for c in SQL_REFUSED_CELLS + SQL_REFUSED_CELLS_BASELINE_GUARDS])
 def test_sql_allowlist_refuses_the_cell_before_it_runs(tmp_path, sandbox_env, source, rule, target):
     # Through dbutils.notebook.run, i.e. with the runtime SQL guard active: the
     # static verdict alone must refuse these, the guard is the second line.
@@ -2868,6 +2883,7 @@ RUNTIME_GUARD_CELLS = [
      "TRANSFORM ... USING"),
     (["SRC = \"'/etc/passwd'\"", "spark.sql(f'SELECT * FROM csv.`/etc/passwd`'.replace('x', 'y'))"],
      "NBP-SQL-DYNAMIC", "<dynamic>"),      # a call the gate cannot fold: refused statically, fail closed
+                                           # (so already at 1356a56: a regression guard, not a new refusal)
 ]
 
 
@@ -3137,9 +3153,12 @@ def test_sql_magic_read_and_in_sandbox_write_cells_pass(sandbox_env):
 
 # ── SQL allowlist, review round 3 / adversarial round 2 ────────────────
 # The reviewer's bypasses, closed as classes (sandbox: default.sbx, prefix
-# oci://b@ns/sbx/). Every cell below passed the round-1 allowlist (24b7a6c) and
-# the round-2 tree (1356a56); see the probe files and the proof-of-failure run in
-# the review record.
+# oci://b@ns/sbx/). Every cell below fails against the round-1 allowlist (24b7a6c)
+# and the round-2 tree (1356a56): nearly all pass those gates outright, the rest
+# are refused there under a different rule or target. The one round-2 probe the
+# round-2 tree already refused with the same verdict (spark.sql(*ARGS)) sits in
+# SQL_REFUSED_CELLS_BASELINE_GUARDS. See the probe files and the proof-of-failure
+# run in the review record.
 SQL_REFUSED_CELLS_R2 = [
     # -- the Java-call functions as backtick-quoted identifiers (the masker used to hide them) and try_reflect
     ("spark.sql(\"SELECT `reflect`('java.lang.Runtime', 'getRuntime')\")", "NBP-SQL-REFUSED", "reflect("),
@@ -3186,7 +3205,6 @@ SQL_REFUSED_CELLS_R2 = [
     ("spark.sql('SELECT * FROM {t}', **{'t': 'text.`/etc/passwd`'})", "NBP-SQL-DYNAMIC", "<dynamic>"),
     ("spark.sql(**{'sqlQuery': \"ADD JAR 'x.jar'\"})", "NBP-SQL-DYNAMIC", "<dynamic>"),
     ("KW = {'sqlQuery': \"ADD JAR 'x.jar'\"}\nspark.sql(**KW)", "NBP-SQL-DYNAMIC", "<dynamic>"),
-    ("spark.sql(*ARGS)", "NBP-SQL-DYNAMIC", "<dynamic>"),
     ("spark.sql('DROP TABLE {t}', t=tbl)", "NBP-SQL-DYNAMIC", "<dynamic>"),
     ("spark.sql('SELECT * FROM {t.__class__}', t='x')", "NBP-SQL-DYNAMIC", "<dynamic>"),
     # -- ALTER .. RENAME TO: the destination is a write target
@@ -3302,7 +3320,9 @@ def test_sql_round2_bypass_classes_are_refused_before_the_cell_runs(tmp_path, sa
 
 
 def test_sql_round2_refused_cell_count():
-    assert len(SQL_REFUSED_CELLS_R2) >= 100
+    # 100 probes closed in adversarial round 2; spark.sql(*ARGS) moved to the baseline guards
+    assert len(SQL_REFUSED_CELLS_R2) >= 99
+    assert len(SQL_REFUSED_CELLS_BASELINE_GUARDS) == 11
 
 
 # The reviewer's false refusals and the legitimate neighbours of every new rule.
@@ -3512,6 +3532,7 @@ RUNTIME_GUARD_CELLS_R2 = [
     (["P = str('/etc/passwd')", "spark.sql(f'SELECT * FROM text.`{P}`')"], "NBP-OPEN-PATH", "/etc/passwd"),
     (["FMT = str('text')", "spark.sql(f'SELECT * FROM `{FMT}`.`/etc/passwd`'.strip())"], "NBP-SQL-DYNAMIC",
      "<dynamic>"),                       # a call the gate cannot fold: refused statically, fail closed
+                                         # (so already at 1356a56: a regression guard, not a new refusal)
     (["W = str('reflect')", "spark.sql(f\"SELECT * FROM sbx.t WHERE a = r'\\\\' AND b = {W}('a', 'b')\")"],
      "NBP-SQL-REFUSED", "reflect("),
     (["T = str('text.`/etc/passwd`')", "spark.table(T)"], "NBP-OPEN-PATH", "/etc/passwd"),
@@ -3701,3 +3722,21 @@ def test_sql_magic_round2_legitimate_cells_pass(sandbox_env):
                     {"cell_type": "code", "source": ["%sql ALTER TABLE sbx.t RENAME TO sbx.t2"]}]}
     for cell in transform_sql_cells(nb)["cells"]:
         assert npol.scan_source("".join(cell["source"])) == []
+
+
+# ── source hygiene of the gate modules ──────────────────────────────────
+# A regression review found three `\`-newline continuations collapsed into a
+# run of spaces and a lost space in a module-level assignment (both accepted by
+# the parser, so no test caught them). No linter is configured for the plugin;
+# this keeps the two shapes out of the gate modules.
+def test_gate_module_sources_have_no_collapsed_continuations_or_lost_spaces():
+    import re
+    from aidp_compat import notebook as nbmod
+    collapsed = re.compile(r"\S {8,}(and|or|not|in|if|else) ")
+    lost_space = re.compile(r"^[A-Za-z_][A-Za-z0-9_]* =\S")
+    for mod in (npol, nbmod):
+        with open(mod.__file__, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+        bad = [(n, line) for n, line in enumerate(lines, 1)
+               if not line.lstrip().startswith("#") and (collapsed.search(line) or lost_space.match(line))]
+        assert bad == [], f"{os.path.basename(mod.__file__)}: collapsed continuation / lost space at {bad}"

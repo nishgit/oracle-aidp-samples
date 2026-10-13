@@ -2203,7 +2203,7 @@ def _literal_fragments(node: ast.AST, include_format_args: bool = True) -> List[
     return out
 
 
-_REM_ENV ="Pass values through dbutils.widgets / job parameters instead of reading the process environment."
+_REM_ENV = "Pass values through dbutils.widgets / job parameters instead of reading the process environment."
 _REM_PROC = "Shell/process execution is not available inside the sandbox."
 _REM_TAMPER = ("The policy, the compat shims and the interpreter modules are read-only for notebook code; "
                "change the sandbox through AIDP_SANDBOX_* / AIDP_NOTEBOOK_POLICY_ALLOW after review.")
@@ -3422,16 +3422,19 @@ class _PolicyScanner(ast.NodeVisitor):
         elif attr in _SPARK_TABLE_READ_ATTRS and (chain[0] in _SPARK_ROOTS
                                                   or any(p in _SPARK_READER_CHAIN for p in chain[:-1])):
             self._check_table_read(node, ".".join(chain))          # spark.table(..) / spark.read.table(..)
-        elif chain[0] in _SPARK_ROOTS and len(chain) >= 3 and chain[-2] == "catalog"                 and attr in _SPARK_CATALOG_USE_ATTRS:
+        elif chain[0] in _SPARK_ROOTS and len(chain) >= 3 and chain[-2] == "catalog" \
+                and attr in _SPARK_CATALOG_USE_ATTRS:
             self._check_catalog_use(node, ".".join(chain), attr)   # the USE rule
-        elif chain[0] in _SPARK_ROOTS and len(chain) >= 3 and chain[-2] == "catalog"                 and attr in _SPARK_CATALOG_CREATE_ATTRS:
+        elif chain[0] in _SPARK_ROOTS and len(chain) >= 3 and chain[-2] == "catalog" \
+                and attr in _SPARK_CATALOG_CREATE_ATTRS:
             self._check_catalog_create_table(node, ".".join(chain))     # CREATE TABLE .. USING .. LOCATION ..
         elif chain[0] in _SPARK_ROOTS and ((len(chain) >= 3 and chain[-2] == "conf" and attr in _SPARK_CONF_SET_ATTRS)
                                            or attr == "setConf"):
             self._check_conf_set(node, ".".join(chain))            # the SET rule
         elif attr in _SPARK_PROVIDER_METHODS and any(p in _SPARK_IO_CHAIN for p in chain[:-1]):
             self._check_provider(node, _first_arg(node, ("source", "provider")), ".".join(chain))
-        elif attr in _SPARK_NETWORK_IO_METHODS and any(p in _SPARK_IO_CHAIN for p in chain[:-1])                 and not self.policy.allow_network:
+        elif attr in _SPARK_NETWORK_IO_METHODS and any(p in _SPARK_IO_CHAIN for p in chain[:-1]) \
+                and not self.policy.allow_network:
             shown = ".".join(chain)
             self._add(RULE_IMPORT_NETWORK, node, f"{shown}() opens a network connection", target=shown,
                       remediation=_REM_NETWORK_SOURCE)

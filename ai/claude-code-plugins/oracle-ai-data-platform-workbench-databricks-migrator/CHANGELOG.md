@@ -307,8 +307,10 @@ All notable changes to this plugin are documented here. Format loosely follows [
   `unverified_sql_read`. `spark.newSession()`, `SparkSession.builder..getOrCreate()` and
   `getActiveSession()` are refused statically (`NBP-POLICY-TAMPER`) because a fresh session would
   not carry the guard. `%sql` cells reach the same classifier through `sql_magic`. The old "a
-  `WITH` head is a read" assumption is gone from code, tests and docs; every refused case fails
-  against the round-2 tree.
+  `WITH` head is a read" assumption is gone from code, tests and docs. Every NEW refusal fails
+  against the round-2 tree; the forms the round-2 blocklist already refused (its write verbs on an
+  out-of-sandbox target, comment-led writes, dynamic statements with a non-read literal head) are
+  kept in a separately labelled list as regression guards and claim nothing about this round.
 - **Sandbox gate: SQL allowlist, adversarial round 2** (SEC-AIDP-SAMPLES-005). The round-1
   allowlist still let through: a backtick-quoted function name (`` SELECT `reflect`('java.lang.Runtime', ..)
   ``: the masker hid it), a quoted or class-named provider in a path table (`` `text`.`/outside/f` ``,
@@ -340,9 +342,16 @@ All notable changes to this plugin are documented here. Format loosely follows [
   guard, as are `spark.table` / `DataFrameReader.table`; `spark.table` / `read.table` literals,
   `spark.catalog.setCurrentCatalog` / `setCurrentDatabase` (the `USE` rule), `spark.conf.set` / `unset`
   / `setConf` (the `SET` allowlist), `spark.catalog.createTable` / `createExternalTable` (name, `path=`,
-  `source=`) and `sc.addFile` are gated like their SQL forms. Tests: 100 refused cells, 61 allowed cells,
+  `source=`) and `sc.addFile` are gated like their SQL forms. Tests: 99 refused cells, 61 allowed cells,
   10 runtime-guard cases, a stub-pyspark test for the function / reader patches and six `%sql` cells;
   96 of the refused cells pass the round-1 gate and 8 of the runtime cases reach the fake session there.
+- **Sandbox gate: SQL allowlist, regression review** (SEC-AIDP-SAMPLES-005). The test record no
+  longer overstates its proof of failure: the eleven refused cells the round-2 blocklist already
+  refused with the same verdict live in a separately labelled regression-guard list, the two
+  runtime cases that fail closed statically are marked as such, and the two entries above read
+  accordingly. Three collapsed line continuations and a lost space in `notebook_policy.py`
+  (cosmetic: the parser accepted both) are restored, and a source-hygiene test keeps both shapes
+  out of the gate modules.
 - **Secrets shim is Vault-only by default** (`engine/aidp_compat/secrets.py`,
   SEC-AIDP-SAMPLES-006). `AIDP_SECRET_*` environment scanning and the JSON file fallback
   (now only via an explicit `AIDP_SECRETS_FILE`) happen only with
