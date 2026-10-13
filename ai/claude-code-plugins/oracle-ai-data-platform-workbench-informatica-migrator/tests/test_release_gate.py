@@ -149,12 +149,31 @@ def check_plugin_manifest() -> CheckResult:
 
 
 def _pyproject_version() -> str | None:
+    text = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     try:
         import tomllib
-    except ImportError:  # pragma: no cover - py<3.11 fallback
-        import tomli as tomllib  # type: ignore
-    data = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    return data.get("project", {}).get("version")
+    except ImportError:
+        # 3.9 and 3.10 -- the floor pyproject.toml advertises -- have no
+        # tomllib, and `tomli` is not a declared dependency, so the former
+        # `import tomli as tomllib` fallback raised ModuleNotFoundError there.
+        # Read the one key this gate needs the way _setup_py_version() does.
+        return _pyproject_version_from_text(text)
+    return tomllib.loads(text).get("project", {}).get("version")
+
+
+def _pyproject_version_from_text(text: str) -> str | None:
+    """``version = "..."`` inside the ``[project]`` table, without a TOML parser."""
+    in_project = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("["):
+            in_project = stripped == "[project]"
+            continue
+        if in_project:
+            m = re.match(r'version\s*=\s*["\']([^"\']+)["\']', stripped)
+            if m:
+                return m.group(1)
+    return None
 
 
 def _setup_py_version() -> str | None:
@@ -420,6 +439,28 @@ def test_release_gate(capsys):
         "Release gate: NO-GO. Failing criteria:\n"
         + "\n".join(f"- {r.name}: {r.detail}" for r in failed)
     )
+
+
+def test_pyproject_version_without_a_toml_parser(monkeypatch):
+    """The gate must run on the 3.9/3.10 floor, where neither tomllib nor
+    the undeclared tomli can be imported. Simulated here because the suite
+    runs on newer interpreters."""
+    import builtins
+    real_import = builtins.__import__
+
+    def no_toml(name, *args, **kwargs):
+        if name in ("tomllib", "tomli"):
+            raise ModuleNotFoundError(f"No module named {name!r}")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_toml)
+    fallback = _pyproject_version()
+    monkeypatch.undo()
+    assert fallback == _pyproject_version() == _setup_py_version()
+    # [tool.*] tables after [project] must not shadow the project version.
+    text = '[project]\nname = "x"\nversion = "1.2.3"\n[tool.poetry]\nversion = "9.9.9"\n'
+    assert _pyproject_version_from_text(text) == "1.2.3"
+    assert _pyproject_version_from_text('[tool.x]\nversion = "9"\n') is None
 
 
 def main() -> int:
