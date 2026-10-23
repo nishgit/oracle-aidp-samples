@@ -4,6 +4,15 @@ Release notes for the Oracle AI Data Platform (AIDP) Workbench Snowflake
 migrator Codex plugin, newest first. The format loosely follows
 [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Fixed
+- `snowflake-connector-python` is pinned below 5 (`>=4.7.0,<5`) in
+  `engine/requirements.txt` and in the commented fallback line of
+  `data-migration-scripts/requirements-aidp.txt`. Connector 5.x removed
+  `snowflake.connector.auth.pat` and `errors.NonRetryableTlsError`, so a fresh
+  install picked up 5.x and two connector tests failed on import.
+
 ## [0.29.0] — 2026-10-10
 
 ### Security
