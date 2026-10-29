@@ -128,7 +128,7 @@ A full sweep makes many API calls (sizes × shapes × ADs, three shapes per call
 
 - **Estimate** is the arithmetic sum of OCI's per-shape estimates at that exact size (and across ADs in multi-AD regions). It isn't necessarily launchable at the same time.
 - **Per-AD** (multi-AD regions) or **Per-family** (single-AD regions) shows where the total comes from.
-- **The `families:` header lists every family discovered in the region**, but only shapes whose limits fit a row's exact size count toward it. For example, fixed shapes such as `E2.1` rarely fit, and a shape that OCI rejects at that size shows as `invalid-cfg`. Run with `--detail` to see which families make up each total.
+- **The `families:` header lists every family discovered for that section in the selected ADs**, including families that don't fit every row. Only shapes whose limits fit a row's exact size count toward it. For example, fixed shapes such as `E2.1` rarely fit, and a shape that OCI rejects at that size shows as `invalid-cfg`. Run with `--detail` to see which families make up each total.
 - **Rows are alternative scenarios.** Don't add rows together.
 - **Fixed shapes appear only at their exact size.** A fixed shape, such as `VM.Standard.E2.1`, fits a row only when the row's OCPU count and memory match it exactly, so it usually doesn't appear in the sweep. Use `--show-shapes` to see fixed shapes, and the fit check (`--ocpus N --memory-gb M`) with their exact size to query them.
 
