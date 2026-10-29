@@ -2,47 +2,51 @@
 # Copyright (c) 2026 Oracle and/or its affiliates.
 # Licensed under the Universal Permissive License v1.0 as shown at
 # https://oss.oracle.com/licenses/upl/
-"""OCI compute capacity — ARM + AMD launchable-nodes report for any OCI region.
+"""OCI compute capacity — ARM + AMD capacity-estimate report for any OCI region.
 
-Answers: "How many VM nodes of size S could OCI launch right now in region R,
-for ARM (Ampere) and for AMD?" Useful when sizing Spark clusters for services
-where the node shape matters, such as OCI Data Flow, OCI Compute, or Oracle AI
-Data Platform clusters (ARM vs AMD).
+Answers: "How many VM nodes of size S does OCI estimate it can launch right now
+in region R, for ARM (Ampere) and for AMD?" Useful when sizing Spark clusters
+for services where the node shape matters, such as OCI Data Flow, OCI Compute,
+or Oracle AI Data Platform clusters (ARM vs AMD).
 
 Each number comes from OCI's CreateComputeCapacityReport API at one EXACT
 (shape, OCPUs, memory) configuration. It is a best-effort, point-in-time
-estimate of launchable instances for THAT configuration — not a hardware
-inventory, not a reservation, and not a launch guarantee.
+estimate for THAT configuration — not a hardware inventory, not a reservation,
+and not a launch guarantee.
 
-IMPORTANT — count visibility: depending on your tenancy's access level, OCI may
-return only the availability status (AVAILABLE / OUT_OF_HOST_CAPACITY) without
-a launchable count. External customer tenancies may therefore not see counts,
-while Oracle-internal tenancies typically do. When a count is not returned the
-report says so explicitly (marked with a dagger, "†") instead of guessing.
+Count visibility: depending on your tenancy's access level, OCI may return the
+availability status (AVAILABLE / OUT_OF_HOST_CAPACITY) without a count. The
+report then marks the value with a dagger ("†") instead of guessing.
 
-Region-generic: ADs, shape families and their limits are discovered at runtime.
-Multi-AD regions are probed in EVERY AD and consolidated (region total, per-AD
-in parentheses). --ad restricts to one AD.
+Region-generic: ADs, shape families, their limits and their processors are all
+discovered at runtime from ListShapes, so the report works in any region and
+picks up existing and future families with no code change. Multi-AD regions are
+probed in EVERY AD and consolidated (region total, per-AD in parentheses).
+--ad restricts to one AD.
 
-Shape families come from ListShapes, so existing and future ARM/AMD families
-are picked up automatically with no code change. Per-shape limits (min/max
-OCPU, min/max memory, min/max memory per OCPU) also come from ListShapes.
-Architecture is classified from the processor description ("Ampere" -> ARM,
-"AMD" -> AMD). Only standard VM shapes are probed; GPU, bare-metal and
-".Generic" placeholder shapes are skipped.
+OCPU vs vCPU depends on the processor (Oracle "OCPUs and vCPUs"):
+  Ampere Altra (A1)          1 OCPU = 1 vCPU
+  AmpereOne    (A2, A4)      1 OCPU = 2 vCPUs
+  x86          (AMD, Intel)  1 OCPU = 2 vCPUs
+ListShapes has no vCPU field, so the ratio is derived from each shape's
+processor description and shapes are GROUPED by it — every report row then has
+one true vCPU size. An unrecognized processor shows "?" rather than a guess.
+Only standard VM shapes are probed; GPU, bare-metal and ".Generic" placeholder
+shapes are skipped.
 
 Modes
 -----
 Default — ratio sweep: for each OCPU size, probe at memory = size x ratio
-  (defaults: ARM 1:8, AMD 1:16) and print launchable nodes per size.
+  (defaults: ARM 8 GB per OCPU, AMD 16 GB per OCPU).
 --ocpus N --memory-gb M — fit check for one explicit configuration.
---show-shapes — list the discovered shapes and their limits.
+--show-shapes — list the discovered shapes, their processors and limits.
 
 Usage
 -----
     python3 oci_capacity_report.py                        # profile's region
     python3 oci_capacity_report.py --region us-ashburn-1  # all ADs, consolidated
     python3 oci_capacity_report.py --region us-ashburn-1 --detail
+    python3 oci_capacity_report.py --region us-ashburn-1 --ad AD-2
     python3 oci_capacity_report.py --sizes 8,32 --arm-ratio 8 --amd-ratio 16
     python3 oci_capacity_report.py --ocpus 32 --memory-gb 512
     python3 oci_capacity_report.py --show-shapes
@@ -70,6 +74,7 @@ import configparser
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 from typing import Any
@@ -79,9 +84,6 @@ from typing import Any
 # tenancy, so it is configurable (--batch-size).
 DEFAULT_BATCH_SIZE = 3
 CLI_TIMEOUT_S = 180                  # one OCI CLI call; a hang becomes REQUEST_FAILED
-# OCI definition: 1 OCPU = 2 vCPU on x86 (AMD/Intel), 1 vCPU on Ampere ARM.
-# ListShapes exposes no vCPU field, so this is applied per architecture.
-VCPU_PER_OCPU = {"ARM": 1, "AMD": 2}
 DEFAULT_SIZES = (1, 2, 4, 8, 16, 32, 64)
 
 # Result statuses (OCI's availability-status values plus the script's own).
@@ -153,6 +155,28 @@ def _arch(shape: dict) -> str | None:
     return None
 
 
+def vcpu_per_ocpu(arch: str, processor: str) -> int | None:
+    """vCPUs per OCPU from the processor (Oracle "OCPUs and vCPUs").
+
+    Altra (A1) = 1; AmpereOne (A2, A4, incl. "AmpereOne-M") = 2; x86 = 2.
+    An unrecognized Ampere processor returns None so the report prints "?"
+    instead of applying a ratio that might be wrong for a new family.
+    """
+    if arch == "AMD":
+        return 2
+    p = re.sub(r"[^a-z]", "", (processor or "").lower())    # drop ®, ™, spaces
+    if "ampereone" in p:
+        return 2
+    if "altra" in p:
+        return 1
+    return None
+
+
+def group_key(shape: dict) -> tuple[str, int | None]:
+    """Report group: architecture + vCPUs per OCPU, so each row has one vCPU size."""
+    return (shape["arch"], shape["vpo"])
+
+
 def discover_shapes(profile: str, region: str, tenancy: str, ad: str) -> list[dict]:
     """Return ARM/AMD VM shapes offered in the AD, with limits from ListShapes."""
     data, err = _oci(["compute", "shape", "list", "--compartment-id", tenancy,
@@ -181,10 +205,11 @@ def discover_shapes(profile: str, region: str, tenancy: str, ad: str) -> list[di
         else:
             min_mem = max_mem = fixed_mem
             min_per = max_per = None   # implied by fixed ocpu+mem
+        proc = s.get("processor-description") or ""
         seen[s["shape"]] = {
-            "shape": s["shape"], "arch": arch,
+            "shape": s["shape"], "arch": arch, "proc": proc,
+            "vpo": vcpu_per_ocpu(arch, proc),
             "flexible": bool(s.get("is-flexible")),
-            "proc": s.get("processor-description") or "",
             "ocpus": fixed_oc, "mem": fixed_mem,
             "min_oc": min_oc, "max_oc": max_oc,
             "min_mem": min_mem, "max_mem": max_mem,
@@ -292,10 +317,10 @@ def probe(profile: str, region: str, tenancy: str, ad: str,
         if data is not None:
             results.update(_parse(batch, data))
             continue
-        to_retry = batch if len(batch) > 1 else []
         if len(batch) == 1:
             results.update(_solo_failure(batch[0], err))
-        for sp in to_retry:                        # isolate the bad one
+            continue
+        for sp in batch:                           # isolate the bad one
             d1, e1 = _send(profile, region, tenancy, ad, [sp])
             if d1 is not None:
                 results.update(_parse([sp], d1))
@@ -337,6 +362,24 @@ def _ad_short(ad: str) -> str:
     return "AD-" + tail.rsplit("-", 1)[-1] if "-AD-" in tail else tail
 
 
+def _vcpus(oc: float, vpo: int | None) -> str:
+    return "?" if vpo is None else f"{oc * vpo:g}"
+
+
+def _group_label(key: tuple[str, int | None]) -> str:
+    arch, vpo = key
+    return f"{arch} ({'? vCPU' if vpo is None else f'{vpo} vCPU'}/OCPU)"
+
+
+def _group_order(key: tuple[str, int | None]):
+    return (key[0] != "ARM", key[1] is None, key[1] or 0)
+
+
+def _groups(ads, shapes_by_ad) -> list[tuple[str, int | None]]:
+    """Report groups present in these ADs: ARM before AMD, then by vCPU/OCPU."""
+    return sorted({group_key(s) for ad in ads for s in shapes_by_ad[ad]}, key=_group_order)
+
+
 def _fmt_total(total: int, hidden: bool, incomplete: bool) -> str:
     """Counted total, plus markers: † = some AVAILABLE shape had no count
     (true value is higher), * = some probe gave no definite answer."""
@@ -361,24 +404,24 @@ def _cell_part(sh: dict, r: dict) -> str:
     return f"{name}={st}"
 
 
-def _collect(profile, region, tenancy, ads, shapes_by_ad, arch_specs, batch_size):
-    """arch_specs: {arch: [(oc, mem), ...]} -> per (arch, oc, mem, ad):
+def _collect(profile, region, tenancy, ads, shapes_by_ad, group_specs, batch_size):
+    """group_specs: {group: [(oc, mem), ...]} -> per (group, oc, mem, ad):
     {"total": int, "hidden": bool, "incomplete": bool, "any": bool, "parts": [str]}"""
     agg: dict[tuple, dict] = {}
     for ad in ads:
         shapes = shapes_by_ad[ad]
         specs, plan = [], {}
-        for arch, pairs in arch_specs.items():
+        for grp, pairs in group_specs.items():
             for oc, mem in pairs:
                 entries = []
-                for sh in (s for s in shapes if s["arch"] == arch):
+                for sh in (s for s in shapes if group_key(s) == grp):
                     ok, _why = fits(sh, oc, mem)
                     entries.append((sh, ok))
                     if ok:
                         specs.append((sh["shape"], oc, mem, sh["flexible"]))
-                plan[(arch, oc, mem)] = entries
+                plan[(grp, oc, mem)] = entries
         res = probe(profile, region, tenancy, ad, specs, batch_size) if specs else {}
-        for (arch, oc, mem), entries in plan.items():
+        for (grp, oc, mem), entries in plan.items():
             cell = {"total": 0, "hidden": False, "incomplete": False, "any": False, "parts": []}
             for sh, ok in entries:
                 if not ok:
@@ -392,7 +435,7 @@ def _collect(profile, region, tenancy, ads, shapes_by_ad, arch_specs, batch_size
                 elif r["status"] not in NOT_PROBEABLE:
                     cell["incomplete"] = True
                 cell["parts"].append(_cell_part(sh, r))
-            agg[(arch, oc, mem, ad)] = cell
+            agg[(grp, oc, mem, ad)] = cell
     return agg
 
 
@@ -402,31 +445,41 @@ def _limitations(hidden_seen: bool) -> None:
     print("  reservations or tenancy service limits/quotas (check those separately), and")
     print("  results can vary by tenancy.")
     if hidden_seen:
-        print(f"{DAGGER}  NOTE: OCI reported AVAILABLE but returned NO COUNT for some shapes. This")
-        print("   depends on your tenancy's access level: external customer tenancies may")
-        print("   not receive counts, while Oracle-internal tenancies typically do. Totals")
-        print(f"   marked {DAGGER} are lower bounds; the shape can launch, but how many is unknown.")
+        print(f"{DAGGER}  NOTE: OCI reported AVAILABLE but returned NO COUNT for some shapes.")
+        print("   Depending on your tenancy's access level, OCI may return availability")
+        print(f"   without a count. Totals marked {DAGGER} are lower bounds; the actual number")
+        print("   is unknown.")
+
+
+def _vcpu_note() -> None:
+    print("Sizes are in OCPUs (OCI's unit). vCPUs per OCPU depend on the processor:")
+    print("  Ampere Altra (A1) 1, AmpereOne (A2/A4) 2, x86 (AMD/Intel) 2. Each section")
+    print("  groups shapes with the same ratio. To compare sections, match rows by vCPU")
+    print("  and memory, not OCPU.")
 
 
 def sweep(profile, region, tenancy, ads, shapes_by_ad, ratios, sizes, detail,
           batch_size=DEFAULT_BATCH_SIZE) -> int:
-    """Ratio sweep. Returns the exit code (0, 2 or 3)."""
-    arch_specs = {arch: [(float(s), float(s * r)) for s in sizes] for arch, r in ratios.items()}
-    agg = _collect(profile, region, tenancy, ads, shapes_by_ad, arch_specs, batch_size)
+    """Ratio sweep. ratios: {arch: GB per OCPU}. Returns the exit code (0, 2 or 3)."""
+    groups = [g for g in _groups(ads, shapes_by_ad) if g[0] in ratios]
+    group_specs = {g: [(float(s), float(s * ratios[g[0]])) for s in sizes] for g in groups}
+    agg = _collect(profile, region, tenancy, ads, shapes_by_ad, group_specs, batch_size)
     incomplete_seen = hidden_seen = False
     multi = len(ads) > 1
-    for arch, ratio in ratios.items():
-        fams = sorted({_short(s["shape"]) for ad in ads for s in shapes_by_ad[ad] if s["arch"] == arch})
+    for grp in groups:
+        ratio = ratios[grp[0]]
+        fams = sorted({_short(s["shape"]) for ad in ads for s in shapes_by_ad[ad]
+                       if group_key(s) == grp})
         print()
-        print(f"=== {arch} @ 1 OCPU : {ratio:g} GB   (region total across {len(ads)} AD"
-              f"{'s' if multi else ''})   families: {', '.join(fams) or 'NONE'} ===")
-        print(f"{'OCPU/VM':>8} {'vCPU/VM':>8} {'RAM/VM(GB)':>11} {'Launchable':>13}   "
+        print(f"=== {_group_label(grp)} @ 1 OCPU : {ratio:g} GB   (region total across "
+              f"{len(ads)} AD{'s' if multi else ''})   families: {', '.join(fams)} ===")
+        print(f"{'OCPU/VM':>8} {'vCPU/VM':>8} {'RAM/VM(GB)':>11} {'Estimate':>13}   "
               f"{'Per-AD' if multi else 'Per-family'}")
         print("-" * 96)
-        for oc, mem in arch_specs[arch]:
+        for oc, mem in group_specs[grp]:
             total, hid, inc, any_ok, parts = 0, False, False, False, []
             for ad in ads:
-                c = agg[(arch, oc, mem, ad)]
+                c = agg[(grp, oc, mem, ad)]
                 total += c["total"]
                 hid |= c["hidden"]
                 inc |= c["incomplete"]
@@ -442,23 +495,20 @@ def sweep(profile, region, tenancy, ads, shapes_by_ad, ratios, sizes, detail,
                 tot = _fmt_total(total, hid, inc)
                 hidden_seen |= hid
                 incomplete_seen |= inc
-            vc = oc * VCPU_PER_OCPU[arch]
-            print(f"{oc:>8g} {vc:>8g} {mem:>11g} {tot:>13}   ({', '.join(parts)})")
+            print(f"{oc:>8g} {_vcpus(oc, grp[1]):>8} {mem:>11g} {tot:>13}   ({', '.join(parts)})")
             if detail and multi:
                 for ad in ads:
-                    c = agg[(arch, oc, mem, ad)]
+                    c = agg[(grp, oc, mem, ad)]
                     if c["any"]:
                         print(f"{'':>45}{_ad_short(ad)}: {', '.join(c['parts'])}")
     print()
-    print("Launchable = arithmetic sum of OCI's per-shape counts at that exact size"
-          + (", across all ADs." if multi else "."))
-    print("  Each count is OCI's figure for that shape+config+AD alone; the sum is NOT a")
-    print("  guaranteed simultaneous launch count. A single cluster usually lands in ONE AD —")
-    print("  for the largest single cluster, look at the per-AD figure, not the region total.")
+    print("Estimate = arithmetic sum of OCI's per-shape capacity estimates at that exact")
+    print("  size" + (", across all ADs." if multi else "."))
+    print("  Each estimate is for that shape+config+AD alone; the sum is NOT a")
+    print("  simultaneously launchable count, even within one AD. A cluster usually")
+    print("  lands in ONE AD, so the per-AD figure is the more relevant estimate.")
     print("Rows are alternative scenarios — do NOT add rows together.")
-    print("Sizes are in OCPUs (OCI's unit). 1 OCPU = 2 vCPU on AMD/Intel, 1 vCPU on Ampere ARM.")
-    print("  Comparing ARM vs AMD? Match rows by vCPU + RAM, not OCPU — e.g. ARM 32 OCPU")
-    print("  (32 vCPU/256 GB) is the same machine as AMD 16 OCPU (32 vCPU/256 GB).")
+    _vcpu_note()
     print("—  = no discovered family supports that size here")
     if incomplete_seen:
         print("*  = INCOMPLETE: some shapes returned no definite answer (run --detail).")
@@ -470,13 +520,10 @@ def fit_check(profile, region, tenancy, ads, shapes_by_ad, oc, mem,
               batch_size=DEFAULT_BATCH_SIZE) -> int:
     """One explicit configuration across every AD and shape. Returns the exit code."""
     print()
-    va, vd = oc * VCPU_PER_OCPU["ARM"], oc * VCPU_PER_OCPU["AMD"]
-    print(f"Target: {oc:g} OCPU x {mem:g} GB ({mem/oc:.2f} GB/OCPU)"
-          f"  ->  ARM {va:g} vCPU / AMD {vd:g} vCPU (same OCPU, NOT same vCPU)")
+    print(f"Target: {oc:g} OCPU x {mem:g} GB ({mem/oc:.2f} GB/OCPU)")
     incomplete = False
-    total = {"ARM": 0, "AMD": 0}
-    hidden = {"ARM": False, "AMD": False}
-    print(f"\n{'AD':<6} {'Shape':<26} {'Arch':<5} {'vCPU':>5} {'Status':<22} {'Launchable':>11}")
+    totals: dict[tuple, dict] = {}
+    print(f"\n{'AD':<6} {'Shape':<26} {'Arch':<5} {'vCPU':>5} {'Status':<22} {'Estimate':>11}")
     print("-" * 84)
     for ad in ads:
         specs, rows = [], []
@@ -489,34 +536,44 @@ def fit_check(profile, region, tenancy, ads, shapes_by_ad, oc, mem,
         for sh in rows:
             r = res[(sh["shape"], oc, mem)]
             st = r["status"]
+            t = totals.setdefault(group_key(sh), {"total": 0, "hidden": False})
             if st in COUNTED:
-                total[sh["arch"]] += r["count"]
+                t["total"] += r["count"]
                 cnt = f"{r['count']:,}"
             elif st == NO_COUNT:
-                hidden[sh["arch"]] = True
+                t["hidden"] = True
                 cnt = f"not returned{DAGGER}"
             elif st in NOT_PROBEABLE:
                 cnt = "—"
             else:
                 incomplete, cnt = True, "N/A"
             print(f"{_ad_short(ad):<6} {sh['shape']:<26} {sh['arch']:<5} "
-                  f"{oc * VCPU_PER_OCPU[sh['arch']]:>5g} {st:<22} {cnt:>11}")
+                  f"{_vcpus(oc, sh['vpo']):>5} {st:<22} {cnt:>11}")
     print()
-    arm_t = _fmt_total(total["ARM"], hidden["ARM"], False)
-    amd_t = _fmt_total(total["AMD"], hidden["AMD"], False)
-    print(f"Region total at {oc:g} OCPU x {mem:g} GB:  "
-          f"ARM {arm_t} ({va:g} vCPU)   AMD {amd_t} ({vd:g} vCPU)"
-          + ("" if not incomplete else "   (* incomplete — some shapes N/A)"))
-    # ARM and AMD totals above are different machines (vCPU differs). Point at the
-    # like-for-like runs instead of letting the reader compare them directly.
-    print("  Not like-for-like: 1 OCPU = 1 vCPU on ARM, 2 vCPU on AMD.")
-    print(f"  ARM at AMD's {vd:g} vCPU / {mem:g} GB:  --ocpus {oc * 2:g} --memory-gb {mem:g}")
-    if (oc / 2).is_integer():
-        print(f"  AMD at ARM's {va:g} vCPU / {mem:g} GB:  --ocpus {oc / 2:g} --memory-gb {mem:g}")
-    else:
-        print(f"  AMD at ARM's {va:g} vCPU: no equivalent (AMD vCPUs come in pairs, whole OCPUs only).")
+    print(f"Region total at {oc:g} OCPU x {mem:g} GB"
+          + ("   (* incomplete — some shapes N/A)" if incomplete else "") + ":")
+    for grp in sorted(totals, key=_group_order):
+        t = totals[grp]
+        print(f"  {_group_label(grp):<22} {_fmt_total(t['total'], t['hidden'], False):>10}"
+              f"   ({_vcpus(oc, grp[1])} vCPU per node)")
+    # Groups with different vCPUs per OCPU are different machine sizes at the
+    # same OCPU count. Point at the comparable runs instead of letting the
+    # reader compare the totals above directly.
+    ratios_present = sorted({g[1] for g in totals if g[1] is not None})
+    if len(ratios_present) > 1:
+        print("  Not comparable at the same OCPU count (vCPUs per OCPU differ). Same vCPUs:")
+        for vpo in ratios_present:
+            for other in ratios_present:
+                if other == vpo:
+                    continue
+                need = oc * vpo / other
+                label = f"{other}-vCPU/OCPU shapes at {oc * vpo:g} vCPU"
+                if need.is_integer():
+                    print(f"    {label}: --ocpus {need:g} --memory-gb {mem:g}")
+                else:
+                    print(f"    {label}: no whole-OCPU equivalent")
     print()
-    hidden_seen = hidden["ARM"] or hidden["AMD"]
+    hidden_seen = any(t["hidden"] for t in totals.values())
     _limitations(hidden_seen)
     return 2 if incomplete else (3 if hidden_seen else 0)
 
@@ -529,17 +586,29 @@ def _pos_finite(name: str, v: float) -> float:
     return v
 
 
+def resolve_ad(requested: str, all_ads: list[str]) -> str:
+    """Accept the full AD name or its short form (e.g. "AD-2", case-insensitive)."""
+    if requested in all_ads:
+        return requested
+    short = [ad for ad in all_ads if _ad_short(ad).lower() == requested.strip().lower()]
+    if len(short) == 1:
+        return short[0]
+    sys.exit(f"ERROR: --ad {requested!r} not found; use one of "
+             f"{', '.join(_ad_short(a) for a in all_ads)} (or the full AD name)")
+
+
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="OCI ARM/AMD launchable-nodes report")
+    ap = argparse.ArgumentParser(description="OCI ARM/AMD capacity-estimate report")
     ap.add_argument("--profile", default="DEFAULT")
     ap.add_argument("--region", default=None,
                     help="OCI region, e.g. us-ashburn-1 (default: the profile's region)")
     ap.add_argument("--ad", default=None,
-                    help="restrict to ONE availability domain (default: ALL ADs, consolidated)")
+                    help="restrict to ONE availability domain, e.g. AD-2 or the full "
+                         "AD name (default: ALL ADs, consolidated)")
     ap.add_argument("--tenancy-ocid", default=None,
                     help="ROOT tenancy OCID (default: from profile)")
-    ap.add_argument("--arm-ratio", type=float, default=8.0)
-    ap.add_argument("--amd-ratio", type=float, default=16.0)
+    ap.add_argument("--arm-ratio", type=float, default=8.0, help="GB of memory per OCPU, ARM")
+    ap.add_argument("--amd-ratio", type=float, default=16.0, help="GB of memory per OCPU, AMD")
     ap.add_argument("--sizes", default=",".join(map(str, DEFAULT_SIZES)))
     ap.add_argument("--ocpus", type=float)
     ap.add_argument("--memory-gb", type=float)
@@ -576,12 +645,7 @@ def main(argv: list[str] | None = None) -> int:
     all_ads = [x["name"] for x in ads_data.get("data", [])]
     if not all_ads:
         sys.exit(f"ERROR: no ADs in {region}")
-    if a.ad:
-        if a.ad not in all_ads:
-            sys.exit(f"ERROR: --ad {a.ad!r} not in {all_ads}")
-        ads = [a.ad]
-    else:
-        ads = all_ads
+    ads = [resolve_ad(a.ad, all_ads)] if a.ad else all_ads
 
     shapes_by_ad = {ad: discover_shapes(a.profile, region, tenancy, ad) for ad in ads}
     print(f"Region : {region}   ADs : {', '.join(_ad_short(x) for x in ads)}"
@@ -591,13 +655,15 @@ def main(argv: list[str] | None = None) -> int:
     if a.show_shapes:
         for ad in ads:
             print(f"\n[{_ad_short(ad)}]")
-            print(f"{'Shape':<26} {'Arch':<5} {'Flex':<5} {'OCPU':>11} {'Mem GB':>13} {'GB/OCPU':>9}  Processor")
+            print(f"{'Shape':<26} {'Arch':<5} {'vCPU/OCPU':>9} {'Flex':<5} {'OCPU':>11} "
+                  f"{'Mem GB':>13} {'GB/OCPU':>9}  Processor")
             for s in shapes_by_ad[ad]:
                 if s["flexible"]:
                     oc, mg, po = _rng(s["min_oc"], s["max_oc"]), _rng(s["min_mem"], s["max_mem"]), _rng(s["min_per_oc"], s["max_per_oc"])
                 else:
                     oc, mg, po = _g(s["ocpus"]), _g(s["mem"]), "fixed"
-                print(f"{s['shape']:<26} {s['arch']:<5} {str(s['flexible']):<5} {oc:>11} {mg:>13} {po:>9}  {s['proc'][:40]}")
+                print(f"{s['shape']:<26} {s['arch']:<5} {_g(s['vpo']):>9} {str(s['flexible']):<5} "
+                      f"{oc:>11} {mg:>13} {po:>9}  {s['proc'][:40]}")
         return 0
 
     if a.ocpus is not None:

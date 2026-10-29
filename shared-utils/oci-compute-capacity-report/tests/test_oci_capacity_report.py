@@ -18,9 +18,18 @@ _spec.loader.exec_module(ocr)
 
 AD1, AD2 = "xxxx:EXAMPLE-AD-1", "xxxx:EXAMPLE-AD-2"
 
+# Processor descriptions as ListShapes returns them.
+ALTRA = "3.0 GHz Ampere® Altra™"
+AMPEREONE = "3.0 GHz Ampere® AmpereOne™ (Siryn™)"
+AMPEREONE_M = "3.6 GHz Ampere® AmpereOne-M™ (Banshee 12™)"
+GENOA = "2.3 GHz AMD EPYC™ 9J14 (Genoa)"
 
-def flex(shape, arch, min_oc=1, max_oc=64, min_mem=1, max_mem=1024, min_per=1, max_per=64):
-    return {"shape": shape, "arch": arch, "flexible": True, "proc": "", "ocpus": None,
+
+def flex(shape, arch, proc=None, min_oc=1, max_oc=64, min_mem=1, max_mem=1024,
+         min_per=1, max_per=64):
+    proc = proc or (ALTRA if arch == "ARM" else GENOA)
+    return {"shape": shape, "arch": arch, "proc": proc,
+            "vpo": ocr.vcpu_per_ocpu(arch, proc), "flexible": True, "ocpus": None,
             "mem": None, "min_oc": min_oc, "max_oc": max_oc, "min_mem": min_mem,
             "max_mem": max_mem, "min_per_oc": min_per, "max_per_oc": max_per}
 
@@ -33,8 +42,8 @@ def report(*rows):
 
 
 class FakeOCI:
-    """Stands in for ocr._oci. `answers[(ad, shape)]` = (status, count) or an
-    exception string (the CLI error text) for that shape."""
+    """Stands in for ocr._oci. `answers[(ad, shape)]` = (status, count) or a CLI
+    error string for that shape."""
 
     def __init__(self, answers, fail_batches_containing=()):
         self.answers = answers
@@ -56,6 +65,20 @@ class FakeOCI:
                     return None, "InvalidParameter: one config in the batch is invalid"
                 return None, ans
         return report(*[(s, *self.answers[(ad, s)]) for s in shapes]), None
+
+
+# ---------------------------------------------------------------- vCPU per OCPU
+
+@pytest.mark.parametrize("arch,proc,expected", [
+    ("ARM", ALTRA, 1),                  # A1
+    ("ARM", AMPEREONE, 2),              # A2
+    ("ARM", AMPEREONE_M, 2),            # A4
+    ("ARM", "AmpereOne-M", 2),          # A4.Ax (short description)
+    ("ARM", "Ampere FutureChip", None), # unknown family: never guess
+    ("AMD", GENOA, 2),
+])
+def test_vcpu_per_ocpu_follows_processor(arch, proc, expected):
+    assert ocr.vcpu_per_ocpu(arch, proc) == expected
 
 
 # ---------------------------------------------------------------- fits()
@@ -136,57 +159,98 @@ def test_cli_timeout_becomes_request_failed(monkeypatch):
 
 # ---------------------------------------------------------------- sweep / fit check
 
-SHAPES = {AD1: [flex("VM.Standard.A1.Flex", "ARM"), flex("VM.Standard.E5.Flex", "AMD")],
-          AD2: [flex("VM.Standard.A1.Flex", "ARM"), flex("VM.Standard.E5.Flex", "AMD")]}
+A1, A2, A4, E5 = "VM.Standard.A1.Flex", "VM.Standard.A2.Flex", "VM.Standard.A4.Flex", "VM.Standard.E5.Flex"
+SHAPES = {AD1: [flex(A1, "ARM"), flex(E5, "AMD")],
+          AD2: [flex(A1, "ARM"), flex(E5, "AMD")]}
 
 
-def _run_sweep(monkeypatch, capsys, answers):
+def _run_sweep(monkeypatch, capsys, answers, shapes=SHAPES, sizes=(8,)):
     monkeypatch.setattr(ocr, "_oci", FakeOCI(answers))
-    code = ocr.sweep("p", "r", "t", [AD1, AD2], SHAPES, {"ARM": 8, "AMD": 16}, [8], False)
+    ads = list(shapes)
+    code = ocr.sweep("p", "r", "t", ads, shapes, {"ARM": 8, "AMD": 16}, list(sizes), False)
     return code, capsys.readouterr().out
 
 
 def test_sweep_all_counts_exit_0(monkeypatch, capsys):
-    ans = {(ad, s): ("AVAILABLE", 10) for ad in (AD1, AD2)
-           for s in ("VM.Standard.A1.Flex", "VM.Standard.E5.Flex")}
+    ans = {(ad, s): ("AVAILABLE", 10) for ad in (AD1, AD2) for s in (A1, E5)}
     code, out = _run_sweep(monkeypatch, capsys, ans)
     assert code == 0
     assert "20   (AD-1=10, AD-2=10)" in out
     assert "Limitations:" in out and "NO COUNT" not in out
+    assert "simultaneously launchable" in out and "same machine" not in out
 
 
 def test_sweep_hidden_counts_are_flagged_not_guessed(monkeypatch, capsys):
-    ans = {(ad, s): ("AVAILABLE", None) for ad in (AD1, AD2)
-           for s in ("VM.Standard.A1.Flex", "VM.Standard.E5.Flex")}
-    ans[(AD1, "VM.Standard.E5.Flex")] = ("AVAILABLE", 4)
+    ans = {(ad, s): ("AVAILABLE", None) for ad in (AD1, AD2) for s in (A1, E5)}
+    ans[(AD1, E5)] = ("AVAILABLE", 4)
     code, out = _run_sweep(monkeypatch, capsys, ans)
     assert code == 3
     assert f"avail{ocr.DAGGER}" in out                 # ARM: no counts at all
     assert f"4+{ocr.DAGGER}" in out                    # AMD: partial count = lower bound
-    assert "external customer tenancies may" in out
+    assert "OCI may return availability" in out
     assert "INCOMPLETE" not in out
 
 
 def test_sweep_failure_is_incomplete_exit_2(monkeypatch, capsys):
-    ans = {(ad, s): ("AVAILABLE", 1) for ad in (AD1, AD2)
-           for s in ("VM.Standard.A1.Flex", "VM.Standard.E5.Flex")}
-    ans[(AD2, "VM.Standard.A1.Flex")] = "ServiceError: 500"
+    ans = {(ad, s): ("AVAILABLE", 1) for ad in (AD1, AD2) for s in (A1, E5)}
+    ans[(AD2, A1)] = "ServiceError: 500"
     code, out = _run_sweep(monkeypatch, capsys, ans)
     assert code == 2 and "INCOMPLETE" in out
 
 
-def test_fit_check_reports_hidden_count(monkeypatch, capsys):
-    ans = {(AD1, "VM.Standard.A1.Flex"): ("AVAILABLE", None),
-           (AD1, "VM.Standard.E5.Flex"): ("OUT_OF_HOST_CAPACITY", None)}
+def test_sweep_separates_altra_and_ampereone(monkeypatch, capsys):
+    """A1 (1 vCPU/OCPU) and A2/A4 (2 vCPU/OCPU) must never share a row."""
+    shapes = {AD1: [flex(A1, "ARM", ALTRA), flex(A2, "ARM", AMPEREONE),
+                    flex(A4, "ARM", AMPEREONE_M, max_oc=45), flex(E5, "AMD")]}
+    ans = {(AD1, A1): ("AVAILABLE", 100), (AD1, A2): ("AVAILABLE", 7),
+           (AD1, A4): ("AVAILABLE", 5), (AD1, E5): ("AVAILABLE", 50)}
+    code, out = _run_sweep(monkeypatch, capsys, ans, shapes, sizes=(32,))
+    assert code == 0
+    a1_sec = out.split("=== ARM (1 vCPU/OCPU)")[1].split("===")[1]
+    a24_sec = out.split("=== ARM (2 vCPU/OCPU)")[1].split("===")[1]
+    assert "families: A1" in out and "families: A2, A4" in out
+    # 32 OCPU: A1 row = 32 vCPU; A2/A4 row = 64 vCPU, and their counts stay apart.
+    assert "      32       32         256           100   (A1=100)" in out
+    assert "      32       64         256            12   (A2=7, A4=5)" in out
+    assert "A2" not in a1_sec and "A1=" not in a24_sec
+
+
+def test_fit_check_vcpu_per_shape_and_comparables(monkeypatch, capsys):
+    shapes = [flex(A1, "ARM", ALTRA), flex(A2, "ARM", AMPEREONE), flex(E5, "AMD")]
+    ans = {(AD1, A1): ("AVAILABLE", 9), (AD1, A2): ("AVAILABLE", None),
+           (AD1, E5): ("OUT_OF_HOST_CAPACITY", None)}
     monkeypatch.setattr(ocr, "_oci", FakeOCI(ans))
-    code = ocr.fit_check("p", "r", "t", [AD1], {AD1: SHAPES[AD1]}, 8, 64)
+    code = ocr.fit_check("p", "r", "t", [AD1], {AD1: shapes}, 8, 64)
     out = capsys.readouterr().out
     assert code == 3
+    assert "VM.Standard.A1.Flex        ARM       8 AVAILABLE" in out
+    assert "VM.Standard.A2.Flex        ARM      16 AVAILABLE_NO_COUNT" in out
     assert f"not returned{ocr.DAGGER}" in out
-    assert "ARM 16 vCPU" in out or "AMD 16 vCPU" in out
+    assert "ARM (1 vCPU/OCPU)" in out and "(8 vCPU per node)" in out
+    assert "ARM (2 vCPU/OCPU)" in out and "(16 vCPU per node)" in out
+    assert "2-vCPU/OCPU shapes at 8 vCPU: --ocpus 4 --memory-gb 64" in out
+    assert "1-vCPU/OCPU shapes at 16 vCPU: --ocpus 16 --memory-gb 64" in out
 
 
-# ---------------------------------------------------------------- config
+def test_unknown_processor_shows_question_mark(monkeypatch, capsys):
+    shapes = {AD1: [flex("VM.Standard.A9.Flex", "ARM", "Ampere FutureChip")]}
+    code, out = _run_sweep(monkeypatch, capsys, {(AD1, "VM.Standard.A9.Flex"): ("AVAILABLE", 3)},
+                           shapes)
+    assert code == 0
+    assert "ARM (? vCPU/OCPU)" in out
+    assert "       8        ?          64             3" in out
+
+
+# ---------------------------------------------------------------- AD and config
+
+def test_resolve_ad_accepts_short_or_full_name():
+    ads = ["xxxx:US-EXAMPLE-AD-1", "xxxx:US-EXAMPLE-AD-2"]
+    assert ocr.resolve_ad("AD-2", ads) == ads[1]
+    assert ocr.resolve_ad("ad-1", ads) == ads[0]
+    assert ocr.resolve_ad(ads[1], ads) == ads[1]
+    with pytest.raises(SystemExit):
+        ocr.resolve_ad("AD-3", ads)
+
 
 def test_region_defaults_to_profile(monkeypatch, tmp_path):
     cfg = tmp_path / "config"
