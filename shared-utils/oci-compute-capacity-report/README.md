@@ -27,7 +27,7 @@ Read these before you rely on, or share, the numbers:
 - **Sums are arithmetic, not a placeable cluster size.** Each estimate covers one shape, one configuration, and one AD on its own. Shape families can share hosts, so you can't necessarily launch the sum at the same time, even within one AD.
 - **The report doesn't consider capacity reservations or your service limits and quotas.** Check your tenancy limits separately (for example, with `oci limits resource-availability get` or the **Limits, Quotas and Usage** page in the Console). A launch succeeds only when both capacity and your limits allow it.
 - **Results can vary by tenancy.** Allocation policies and placement constraints can make the same query return different results in different tenancies.
-- **Only standard VM shapes are covered.** The script skips GPU, bare metal, and `.Generic` shapes, and doesn't request burstable or preemptible capacity.
+- **Only non-GPU ARM and AMD VM shapes are covered**, both standard and DenseIO. The script skips GPU, bare metal, Intel, and `.Generic` shapes, and doesn't request burstable or preemptible capacity.
 
 ### When you share results
 
@@ -203,7 +203,7 @@ A tenancy that receives the status only (exit code `3`):
 ## How it works
 
 1. The script lists the region's availability domains (`oci iam availability-domain list`).
-2. For each AD, it lists the VM shapes, their processors, and their published OCPU and memory limits (`oci compute shape list`). It classifies Ampere shapes as ARM and AMD shapes as AMD, derives vCPUs per OCPU from the processor, and skips GPU, bare metal, and `.Generic` shapes.
+2. For each AD, it lists the VM shapes, their processors, and their published OCPU and memory limits (`oci compute shape list`). It keeps non-GPU ARM and AMD VM shapes (standard and DenseIO), classifying Ampere shapes as ARM and AMD shapes as AMD, and derives vCPUs per OCPU from the processor. It skips GPU, bare metal, Intel, and `.Generic` shapes.
 3. For each size, it keeps only the shapes whose limits allow that configuration.
 4. It calls `oci compute compute-capacity-report create` with up to three shapes per request. If the API rejects a request because one configuration is invalid, the script retries each shape on its own so that the other shapes still return results.
 5. It sums the estimates per group, per AD, and per region, and prints the report.

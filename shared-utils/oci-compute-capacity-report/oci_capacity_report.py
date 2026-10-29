@@ -31,8 +31,8 @@ OCPU vs vCPU depends on the processor (Oracle "OCPUs and vCPUs"):
 ListShapes has no vCPU field, so the ratio is derived from each shape's
 processor description and shapes are GROUPED by it — every report row then has
 one true vCPU size. An unrecognized processor shows "?" rather than a guess.
-Only standard VM shapes are probed; GPU, bare-metal and ".Generic" placeholder
-shapes are skipped.
+Only non-GPU ARM and AMD VM shapes are probed (standard and DenseIO); GPU,
+bare-metal, Intel and ".Generic" placeholder shapes are skipped.
 
 Modes
 -----
