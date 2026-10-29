@@ -5,7 +5,7 @@
 Use it before you size a Spark cluster or a compute fleet, for example:
 
 - **OCI Data Flow, OCI Compute, or Kubernetes node pools**, where you choose the exact shape (A1, A2, E4, E5, ...) for each node.
-- **Oracle AI Data Platform (AIDP) Workbench clusters.** AIDP doesn't ask you to pick a specific shape family, but the report still shows whether ARM or AMD capacity at a given node size is plentiful or scarce in the region.
+- **Oracle AI Data Platform (AIDP) Workbench clusters.** AIDP lets you choose a compute family, such as ARM or AMD, rather than a specific OCI shape, and its clusters don't necessarily use every shape family in this report. Use the figures as a regional capacity-planning signal for AIDP, not as the capacity available to AIDP clusters.
 
 > [!IMPORTANT]
 > **OCI may return availability without a count.** Depending on your tenancy's access level, OCI can return only the availability status (`AVAILABLE` or `OUT_OF_HOST_CAPACITY`) and leave the count empty. The report then marks the value with **†** and prints a note. It never guesses a number. Read [Limitations](#limitations) before you share results.
@@ -31,7 +31,12 @@ Read these before you rely on, or share, the numbers:
 
 ### When you share results
 
-Include the limitations with the numbers. For example, paste this note with the output:
+Include the limitations with the numbers, and keep these points in mind:
+
+- **AD names are tenancy-specific.** OCI [randomizes availability domains by tenancy](https://docs.oracle.com/en-us/iaas/Content/General/Concepts/regions.htm), so `AD-1` in one tenancy isn't necessarily the same data center as `AD-1` in another. The report prints short AD names, so compare per-AD figures only within one tenancy.
+- **Treat the output as point-in-time operational data** for internal planning, or for sharing with the customer it concerns. Don't publish it.
+
+For example, paste this note with the output:
 
 > Capacity figures come from the OCI compute capacity report: a best-effort, point-in-time estimate, not a reservation or launch guarantee. Per-shape estimates are summed arithmetically and aren't necessarily launchable at the same time. They don't account for capacity reservations or our tenancy service limits. Values marked † were reported as available without a count; the actual number is unknown.
 
@@ -123,6 +128,7 @@ A full sweep makes many API calls (sizes × shapes × ADs, three shapes per call
 
 - **Estimate** is the arithmetic sum of OCI's per-shape estimates at that exact size (and across ADs in multi-AD regions). It isn't necessarily launchable at the same time.
 - **Per-AD** (multi-AD regions) or **Per-family** (single-AD regions) shows where the total comes from.
+- **The `families:` header lists every family discovered in the region**, but only shapes whose limits fit a row's exact size count toward it. For example, fixed shapes such as `E2.1` rarely fit, and a shape that OCI rejects at that size shows as `invalid-cfg`. Run with `--detail` to see which families make up each total.
 - **Rows are alternative scenarios.** Don't add rows together.
 - **Fixed shapes appear only at their exact size.** A fixed shape, such as `VM.Standard.E2.1`, fits a row only when the row's OCPU count and memory match it exactly, so it usually doesn't appear in the sweep. Use `--show-shapes` to see fixed shapes, and the fit check (`--ocpus N --memory-gb M`) with their exact size to query them.
 
