@@ -50,6 +50,7 @@ Usage
     python3 oci_capacity_report.py --sizes 8,32 --arm-ratio 8 --amd-ratio 16
     python3 oci_capacity_report.py --ocpus 32 --memory-gb 512
     python3 oci_capacity_report.py --show-shapes
+    python3 oci_capacity_report.py --profile <session-profile> --auth security_token
 
 Exit codes
 ----------
@@ -63,7 +64,8 @@ Exit codes
 Requirements
 ------------
 - `oci` CLI on PATH (https://docs.oracle.com/iaas/Content/API/SDKDocs/cliinstall.htm)
-- `~/.oci/config` (or $OCI_CLI_CONFIG_FILE) with the chosen profile
+- `~/.oci/config` (or $OCI_CLI_CONFIG_FILE) with the chosen profile; API key by
+  default, or a session token with --auth security_token (or $OCI_CLI_AUTH)
 - IAM:  Allow group <your-group> to manage compute-capacity-reports in tenancy
         Allow group <your-group> to inspect instance-family in tenancy   (ListShapes)
 """
@@ -77,6 +79,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from typing import Any
 
 # Shape entries sent per capacity-report request. 3 is a conservative value
@@ -84,7 +87,12 @@ from typing import Any
 # tenancy, so it is configurable (--batch-size).
 DEFAULT_BATCH_SIZE = 3
 CLI_TIMEOUT_S = 180                  # one OCI CLI call; a hang becomes REQUEST_FAILED
+THROTTLE_RETRIES = 3                 # retries for a throttled (HTTP 429) call
+THROTTLE_BACKOFF_S = 2               # first backoff; doubles on each retry
 DEFAULT_SIZES = (1, 2, 4, 8, 16, 32, 64)
+# OCI CLI auth method passed as `--auth` (set from --auth in main). None keeps
+# the CLI default: API key, or whatever $OCI_CLI_AUTH selects.
+AUTH: str | None = None
 
 # Result statuses (OCI's availability-status values plus the script's own).
 COUNTED = {"AVAILABLE", "OUT_OF_HOST_CAPACITY"}           # definite, with a count
@@ -124,21 +132,38 @@ def _region_from_profile(profile: str) -> str:
     return sec["region"]
 
 
+def _is_throttled(err: str) -> bool:
+    return "TooManyRequests" in err or '"status": 429' in err
+
+
 def _oci(args: list[str], profile: str, region: str) -> tuple[Any, str | None]:
+    """Run one OCI CLI command; returns (parsed JSON, None) or (None, error text).
+
+    A throttled call (HTTP 429 / TooManyRequests) is retried with exponential
+    backoff up to THROTTLE_RETRIES times; any other failure is returned as-is.
+    """
     cmd = ["oci", *args, "--config-file", _config_path(),
            "--profile", profile, "--region", region, "--output", "json"]
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=CLI_TIMEOUT_S)
-    except subprocess.TimeoutExpired:
-        return None, f"OCI CLI call timed out after {CLI_TIMEOUT_S}s"
-    except FileNotFoundError:
-        sys.exit("ERROR: `oci` CLI not found on PATH")
-    if r.returncode != 0:
-        return None, (r.stderr or r.stdout).strip()[:400]
-    try:
-        return json.loads(r.stdout), None
-    except json.JSONDecodeError:
-        return None, f"unparseable response: {r.stdout[:200]}"
+    if AUTH:
+        cmd += ["--auth", AUTH]
+    for attempt in range(THROTTLE_RETRIES + 1):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=CLI_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            return None, f"OCI CLI call timed out after {CLI_TIMEOUT_S}s"
+        except FileNotFoundError:
+            sys.exit("ERROR: `oci` CLI not found on PATH")
+        if r.returncode == 0:
+            try:
+                return json.loads(r.stdout), None
+            except json.JSONDecodeError:
+                return None, f"unparseable response: {r.stdout[:200]}"
+        err = (r.stderr or r.stdout).strip()
+        if attempt < THROTTLE_RETRIES and _is_throttled(err):
+            time.sleep(THROTTLE_BACKOFF_S * 2 ** attempt)
+            continue
+        return None, err[:400]
+    return None, "unreachable"
 
 
 # ------------------------------------------------------- shape discovery
@@ -600,6 +625,9 @@ def resolve_ad(requested: str, all_ads: list[str]) -> str:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="OCI ARM/AMD capacity-estimate report")
     ap.add_argument("--profile", default="DEFAULT")
+    ap.add_argument("--auth", default=None,
+                    help="OCI CLI auth method passed as --auth, e.g. security_token for a "
+                         "session-token profile (default: the CLI default or $OCI_CLI_AUTH)")
     ap.add_argument("--region", default=None,
                     help="OCI region, e.g. us-ashburn-1 (default: the profile's region)")
     ap.add_argument("--ad", default=None,
@@ -619,6 +647,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--show-shapes", action="store_true",
                     help="print discovered ARM/AMD shapes + limits per AD and exit")
     a = ap.parse_args(argv)
+    global AUTH
+    AUTH = a.auth
 
     if (a.ocpus is None) != (a.memory_gb is None):
         sys.exit("ERROR: --ocpus and --memory-gb must be used together")

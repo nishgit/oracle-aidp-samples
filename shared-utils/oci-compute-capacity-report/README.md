@@ -39,7 +39,7 @@ Include the limitations with the numbers. For example, paste this note with the 
 
 - **Python 3.8 or later.** The script uses only the standard library.
 - **The OCI CLI** on your `PATH`. See [Installing the CLI](https://docs.oracle.com/iaas/Content/API/SDKDocs/cliinstall.htm).
-- **An OCI CLI configuration file** (`~/.oci/config`, or the path in `$OCI_CLI_CONFIG_FILE`) with a profile that uses API key authentication.
+- **An OCI CLI configuration file** (`~/.oci/config`, or the path in `$OCI_CLI_CONFIG_FILE`) with a profile that uses API key authentication or a session token. For a session-token profile (created with `oci session authenticate`), pass `--auth security_token`, or set `OCI_CLI_AUTH=security_token`.
 - **A subscription to the region** you query.
 - **IAM policies** for the group that runs the report:
 
@@ -94,12 +94,21 @@ Restrict the report to one AD. Use the short name that the report prints, such a
 python3 oci_capacity_report.py --region us-ashburn-1 --ad AD-2
 ```
 
+Use a session-token profile instead of an API key:
+
+```bash
+python3 oci_capacity_report.py --profile <session-profile> --auth security_token
+```
+
+A full sweep makes many API calls (sizes × shapes × ADs, three shapes per call). If OCI throttles a call (HTTP 429), the script retries it up to three times with increasing waits. To make fewer calls on a busy tenancy, narrow `--sizes` or use `--ad`.
+
 ### Options
 
 | Option | Default | Description |
 |---|---|---|
 | `--region` | The profile's region | OCI region to query, such as `us-ashburn-1`. |
 | `--profile` | `DEFAULT` | Profile in the OCI CLI configuration file. |
+| `--auth` | CLI default | OCI CLI authentication method, passed as `--auth`. Use `security_token` for a session-token profile. `$OCI_CLI_AUTH` also works. |
 | `--ad` | All ADs | Restrict the report to one availability domain, such as `AD-2` (or the full AD name). |
 | `--sizes` | `1,2,4,8,16,32,64` | OCPU sizes to sweep. |
 | `--arm-ratio` | `8` | GB of memory per OCPU for ARM rows. |
@@ -115,6 +124,7 @@ python3 oci_capacity_report.py --region us-ashburn-1 --ad AD-2
 - **Estimate** is the arithmetic sum of OCI's per-shape estimates at that exact size (and across ADs in multi-AD regions). It isn't necessarily launchable at the same time.
 - **Per-AD** (multi-AD regions) or **Per-family** (single-AD regions) shows where the total comes from.
 - **Rows are alternative scenarios.** Don't add rows together.
+- **Fixed shapes appear only at their exact size.** A fixed shape, such as `VM.Standard.E2.1`, fits a row only when the row's OCPU count and memory match it exactly, so it usually doesn't appear in the sweep. Use `--show-shapes` to see fixed shapes, and the fit check (`--ocpus N --memory-gb M`) with their exact size to query them.
 
 | Marker or status | Meaning |
 |---|---|
@@ -212,7 +222,7 @@ The script is read-only. It doesn't create instances, reservations, or any other
 
 ## Run the tests
 
-The tests mock the OCI CLI, so they run without OCI access:
+The tests mock the OCI CLI, so they run without OCI access. The files in `tests/fixtures/` keep the OCI CLI's exact output format: real `shape list` rows, and a capacity-report response with illustrative counts.
 
 ```bash
 python3 -m pip install pytest

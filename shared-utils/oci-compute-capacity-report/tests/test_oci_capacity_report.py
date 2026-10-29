@@ -122,6 +122,48 @@ def test_parse_duplicate_rows_are_ambiguous():
     assert ocr._parse([("A", 1, 8, True)], data)[("A", 1, 8)]["status"] == "AMBIGUOUS"
 
 
+# ---------------------------------------------------------------- real CLI output
+# Fixtures keep the OCI CLI's exact field spellings (kebab-case such as
+# min-in-g-bs next to min-per-ocpu-in-gbs). shape_list.json holds real
+# `oci compute shape list` rows (public shape limits only). capacity_report.json
+# has the real response structure with illustrative counts.
+
+FIXTURES = pathlib.Path(__file__).resolve().parent / "fixtures"
+
+
+def _fixture(name):
+    return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
+
+
+def test_discover_shapes_from_real_shape_list(monkeypatch):
+    monkeypatch.setattr(ocr, "_oci", lambda args, p, r: (_fixture("shape_list.json"), None))
+    found = {s["shape"]: s for s in ocr.discover_shapes("p", "r", "t", AD1)}
+    # Kept: non-GPU ARM and AMD VM shapes. Skipped: Intel, GPU, bare metal, .Generic.
+    assert set(found) == {"VM.Standard.A1.Flex", "VM.Standard.A2.Flex", "VM.Standard.A4.Flex",
+                          "VM.Standard.A4.Ax.Flex", "VM.Standard.E5.Flex", "VM.Standard.E2.1"}
+    a1 = found["VM.Standard.A1.Flex"]
+    assert (a1["arch"], a1["vpo"], a1["flexible"]) == ("ARM", 1, True)
+    assert (a1["min_oc"], a1["max_oc"], a1["min_mem"], a1["max_mem"]) == (1, 80, 1, 512)
+    assert (a1["min_per_oc"], a1["max_per_oc"]) == (1, 64)
+    assert {found[s]["vpo"] for s in ("VM.Standard.A2.Flex", "VM.Standard.A4.Flex",
+                                      "VM.Standard.A4.Ax.Flex")} == {2}
+    assert (found["VM.Standard.E5.Flex"]["arch"], found["VM.Standard.E5.Flex"]["vpo"]) == ("AMD", 2)
+    e21 = found["VM.Standard.E2.1"]                      # fixed shape: null options
+    assert e21["flexible"] is False
+    assert (e21["min_oc"], e21["max_oc"], e21["min_mem"], e21["max_mem"]) == (1, 1, 8, 8)
+    assert ocr.fits(e21, 1, 8) == (True, "") and ocr.fits(e21, 2, 16)[0] is False
+
+
+def test_parse_real_capacity_report_structure():
+    batch = [("VM.Standard.A1.Flex", 8.0, 64.0, True), ("VM.Standard.A2.Flex", 8.0, 64.0, True),
+             ("VM.Standard.E5.Flex", 8.0, 128.0, True)]
+    out = ocr._parse(batch, _fixture("capacity_report.json"))
+    assert {k[0]: (v["status"], v["count"]) for k, v in out.items()} == {
+        "VM.Standard.A1.Flex": ("AVAILABLE", 120),
+        "VM.Standard.A2.Flex": ("AVAILABLE", 7),
+        "VM.Standard.E5.Flex": ("AVAILABLE", 45)}
+
+
 # ---------------------------------------------------------------- probe()
 
 def test_probe_isolates_invalid_config_and_keeps_others(monkeypatch):
@@ -147,6 +189,58 @@ def test_probe_respects_batch_size(monkeypatch):
     monkeypatch.setattr(ocr, "_oci", fake)
     ocr.probe("p", "r", "t", AD1, [(s, 1, 8, True) for s in "ABCDE"], batch_size=2)
     assert [len(shapes) for _ad, shapes in fake.calls] == [2, 2, 1]
+
+
+class _Run:
+    """Fake subprocess.run: returns queued (returncode, stdout, stderr) results."""
+
+    def __init__(self, *results):
+        self.results = list(results)
+        self.cmds = []
+
+    def __call__(self, cmd, **kw):
+        self.cmds.append(cmd)
+        rc, out, err = self.results.pop(0)
+        return ocr.subprocess.CompletedProcess(cmd, rc, out, err)
+
+
+THROTTLED = 'ServiceError: {"code": "TooManyRequests", "status": 429}'
+
+
+def test_auth_is_passed_to_the_cli(monkeypatch):
+    run = _Run((0, "{}", ""), (0, "{}", ""))
+    monkeypatch.setattr(ocr.subprocess, "run", run)
+    monkeypatch.setattr(ocr, "AUTH", None)
+    ocr._oci(["compute", "x"], "p", "r")
+    assert "--auth" not in run.cmds[0]
+    monkeypatch.setattr(ocr, "AUTH", "security_token")
+    ocr._oci(["compute", "x"], "p", "r")
+    assert run.cmds[1][-2:] == ["--auth", "security_token"]
+
+
+def test_throttled_call_is_retried_then_succeeds(monkeypatch):
+    run = _Run((1, "", THROTTLED), (1, "", THROTTLED), (0, '{"ok": 1}', ""))
+    sleeps = []
+    monkeypatch.setattr(ocr.subprocess, "run", run)
+    monkeypatch.setattr(ocr.time, "sleep", sleeps.append)
+    assert ocr._oci(["compute", "x"], "p", "r") == ({"ok": 1}, None)
+    assert sleeps == [2, 4]
+
+
+def test_throttling_gives_up_after_retries(monkeypatch):
+    run = _Run(*[(1, "", THROTTLED)] * (ocr.THROTTLE_RETRIES + 1))
+    monkeypatch.setattr(ocr.subprocess, "run", run)
+    monkeypatch.setattr(ocr.time, "sleep", lambda s: None)
+    data, err = ocr._oci(["compute", "x"], "p", "r")
+    assert data is None and "TooManyRequests" in err
+    assert len(run.cmds) == ocr.THROTTLE_RETRIES + 1
+
+
+def test_other_errors_are_not_retried(monkeypatch):
+    run = _Run((1, "", "ServiceError: NotAuthorizedOrNotFound"))
+    monkeypatch.setattr(ocr.subprocess, "run", run)
+    data, err = ocr._oci(["compute", "x"], "p", "r")
+    assert data is None and len(run.cmds) == 1
 
 
 def test_cli_timeout_becomes_request_failed(monkeypatch):
@@ -254,15 +348,15 @@ def test_resolve_ad_accepts_short_or_full_name():
 
 def test_region_defaults_to_profile(monkeypatch, tmp_path):
     cfg = tmp_path / "config"
-    cfg.write_text("[DEFAULT]\ntenancy=ocid1.tenancy.oc1..example\nregion=us-ashburn-1\n")
+    cfg.write_text("[DEFAULT]\ntenancy=TENANCY_PLACEHOLDER\nregion=us-ashburn-1\n")
     monkeypatch.setenv("OCI_CLI_CONFIG_FILE", str(cfg))
     assert ocr._region_from_profile("DEFAULT") == "us-ashburn-1"
-    assert ocr._tenancy_from_profile("DEFAULT") == "ocid1.tenancy.oc1..example"
+    assert ocr._tenancy_from_profile("DEFAULT") == "TENANCY_PLACEHOLDER"
 
 
 def test_missing_region_is_a_setup_error(monkeypatch, tmp_path):
     cfg = tmp_path / "config"
-    cfg.write_text("[DEFAULT]\ntenancy=ocid1.tenancy.oc1..example\n")
+    cfg.write_text("[DEFAULT]\ntenancy=TENANCY_PLACEHOLDER\n")
     monkeypatch.setenv("OCI_CLI_CONFIG_FILE", str(cfg))
     with pytest.raises(SystemExit):
         ocr._region_from_profile("DEFAULT")
